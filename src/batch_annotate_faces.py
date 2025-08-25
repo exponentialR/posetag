@@ -1,11 +1,12 @@
 """
 Batch-launch the face annotator so you don't have to call it manually per shot.
 
-Usage examples:
+Usage:
   python -m src.batch_annotate_faces
   python -m src.batch_annotate_faces --shots-dir boards/shots
   python -m src.batch_annotate_faces --object-filter connection_plate_white
   python -m src.batch_annotate_faces --force
+  python -m src.batch_annotate_faces --calib calib_color.yaml
 
 It picks the latest shot per (object, face_key) and runs:
   python -m src.annotate_face_shot --shot <..._raw.png>
@@ -14,11 +15,50 @@ from __future__ import annotations
 import argparse, json, re, subprocess, sys
 from pathlib import Path
 from collections import defaultdict
+from datetime import datetime
 
 RE_TS = re.compile(r"_(\d{8}_\d{6})_raw\.png$")
+repo_root = Path(__file__).resolve().parents[1]
+
+
+def newest_by_face(shots_dir: Path, object_filter: str | None):
+    """Return dict[(object, face_key)] -> Path to newest *_raw.png."""
+    latest = {}
+    for p in shots_dir.glob("*_raw.png"):
+        meta = Path(str(p).replace("_raw.png", "_meta.json"))
+        if not meta.exists():
+            continue
+        try:
+            m = json.loads(meta.read_text())
+            obj = m["object"]
+            face_yaml = m.get("face_yaml")
+            if not face_yaml:
+                continue
+            face_key = Path(face_yaml).stem  # e.g. connection_plate_white_sideA
+        except Exception:
+            continue
+        if object_filter and object_filter not in obj:
+            continue
+        # timestamp from filename suffix …_YYYYmmdd_HHMMSS_raw.png
+        try:
+            ts_str = p.stem.split("_")[-2] + "_" + p.stem.split("_")[-1]  # crude but robust
+            dt = datetime.strptime(ts_str, "%Y%m%d_%H%M%S")
+        except Exception:
+            dt = datetime.fromtimestamp(p.stat().st_mtime)
+        key = (obj, face_key)
+        prev = latest.get(key)
+        if prev is None or dt > prev[0]:
+            latest[key] = (dt, p)
+    return {k: v[1] for k, v in latest.items()}
+
+
+def out_yaml_path(obj: str, face_key: str) -> Path:
+    return (repo_root / "objects" / obj / "faces" / f"{face_key}_T_board_object.yaml")
+
 
 def repo_root_from_here() -> Path:
     return Path(__file__).resolve().parents[1]
+
 
 def load_meta_for_shot(raw_png: Path) -> dict | None:
     meta = raw_png.with_name(raw_png.name.replace("_raw.png", "_meta.json"))
@@ -29,12 +69,14 @@ def load_meta_for_shot(raw_png: Path) -> dict | None:
     except Exception:
         return None
 
+
 def face_key_from_meta(meta: dict) -> str | None:
     # face key = basename of face_yaml without extension
     fy = meta.get("face_yaml")
     if not fy:
         return None
     return Path(fy).stem
+
 
 def shot_timestamp(raw_png: Path, meta: dict | None) -> str:
     # Prefer meta timestamp; fallback to filename pattern
@@ -44,16 +86,27 @@ def shot_timestamp(raw_png: Path, meta: dict | None) -> str:
     m = RE_TS.search(raw_png.name)
     return m.group(1) if m else "00000000_000000"
 
+
 def build_out_yaml(repo_root: Path, object_name: str, face_key: str) -> Path:
-    return repo_root / "objects" / object_name / "faces" / f"{face_key}_T_board_object.yaml"
+    return repo_root / "objects" / "faces" / face_key / f"{face_key}_T_board_object.yaml"
+
 
 def main():
-    ap = argparse.ArgumentParser("Batch launcher for annotate_face_shot")
-    ap.add_argument("--shots-dir", default=None, help="Default: <repo>/boards/shots")
-    ap.add_argument("--object-filter", default=None,
-                    help="Substring to keep only objects whose name contains this (case-insensitive).")
-    ap.add_argument("--force", action="store_true", help="Re-annotate even if output YAML already exists.")
-    ap.add_argument("--dry-run", action="store_true", help="List what would run, but don't launch.")
+    repo_root = Path(__file__).resolve().parents[1]
+    ap = argparse.ArgumentParser("Batch annotate faces using the newest shot per face")
+    ap.add_argument("--shots_dir", "--shots-dir", dest="shots_dir",
+                    default=str(repo_root / "boards" / "shots"),
+                    help="Directory with *_raw.png shots (default: boards/shots)")
+    ap.add_argument("--calib", default="calib_color.yaml",
+                    help="ChArUco calib for distortion (used by annotate_face_shot)")
+    ap.add_argument("--object-filter", default=None, help="Substring to filter object names")
+    ap.add_argument("--force", action="store_true", help="Re-annotate even if output YAML exists")
+    ap.add_argument("--dry_run", action="store_true", help="List what would run, then exit")
+    # argparse additions
+    ap.add_argument("--pts_type", "--pts-type", choices=["quad", "any"], default="quad",
+                    help="Pass-through to annotate_face_shot (--pts_type). Default: quad."
+                    )
+
     args = ap.parse_args()
 
     repo_root = repo_root_from_here()
@@ -62,7 +115,7 @@ def main():
         sys.exit(f"[!] Shots dir not found: {shots_dir}")
 
     # Collect candidate shots and group by (object, face_key)
-    groups: dict[tuple[str,str], list[tuple[str, Path]]] = defaultdict(list)
+    groups: dict[tuple[str, str], list[tuple[str, Path]]] = defaultdict(list)
     for raw_png in sorted(shots_dir.glob("*_raw.png")):
         meta = load_meta_for_shot(raw_png)
         if not meta:
@@ -80,7 +133,7 @@ def main():
         sys.exit("[!] No eligible shots found (are your *_meta.json files present and face-registered?).")
 
     # Pick latest shot per face
-    picks: list[tuple[str,str,Path,str]] = []  # (object, face_key, shot_path, ts)
+    picks: list[tuple[str, str, Path, str]] = []  # (object, face_key, shot_path, ts)
     for (obj, face_key), items in groups.items():
         ts, shot = sorted(items, key=lambda x: x[0])[-1]  # latest
         picks.append((obj, face_key, shot, ts))
@@ -110,8 +163,16 @@ def main():
     # Launch annotator per shot
     for obj, face_key, shot, ts, out_yaml in to_run:
         print(f"\n[>] Annotating: {obj} / {face_key}  ({shot})")
-        cmd = [sys.executable, "-m", "src.annotate_face_shot", "--shot", str(shot)]
+        cmd = [
+            sys.executable, "-m", "src.annotate_face_shot",
+            "--shot", str(shot),
+            "--calib", args.calib,
+            "--pts_type", args.pts_type,
+        ]
         ret = subprocess.run(cmd)
+        if ret.returncode == 99:
+            print("[i] Quit-all requested by user. Stopping batch.")
+            sys.exit(99)
         if ret.returncode != 0:
             print(f"[!] Annotator exited with code {ret.returncode} for {shot}")
         else:
@@ -119,6 +180,7 @@ def main():
                 print(f"[✓] Wrote {out_yaml}")
             else:
                 print(f"[?] Completed, but {out_yaml} not found (check console output).")
+
 
 if __name__ == "__main__":
     main()
