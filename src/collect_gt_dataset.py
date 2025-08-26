@@ -32,7 +32,6 @@ import numpy as np
 import cv2
 import yaml
 import math
-
 os.environ.setdefault("OMP_NUM_THREADS", "1")
 os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
 os.environ.setdefault("MKL_NUM_THREADS", "1")
@@ -47,7 +46,6 @@ from utils.annotation_utils import (
     detect_tags, load_board, se3, inv_se3
 )
 
-
 try:
     cv2.ocl.setUseOpenCL(False)
     cv2.setNumThreads(1)
@@ -55,7 +53,15 @@ except Exception:
     pass
 
 
-from utils.annotation_utils import load_keypoints_fuzzy, choose_face_key
+from utils.annotation_utils import load_keypoints_fuzzy
+from utils.gt_pose_utils import rotation_to_quat
+
+try:
+    from scipy.spatial.transform import Rotation as Rot
+    def to_quat(R): return Rot.from_matrix(R).as_quat()  # [x,y,z,w]
+except Exception:
+    def to_quat(R): return rotation_to_quat(R)
+
 
 
 EXIT_QUIT_ALL = 99
@@ -85,14 +91,34 @@ def _pad_to(img: np.ndarray | None, h: int, w: int) -> np.ndarray:
     out[: img.shape[0], : img.shape[1]] = img
     return out
 
-def _text_panel(lines: List[str], width: int = 380, height: int = 720) -> np.ndarray:
+def _text_panel(lines: List[str], width: int = 640, height: int = 480) -> np.ndarray:
     img = np.zeros((height, width, 3), np.uint8)
-    y = 24
+    # header bar
+    img = _label_strip(img, "Status / Legend")
+    y = 40
     for ln in lines:
-        cv2.putText(img, ln, (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (0,255,255), 1, cv2.LINE_AA)
-        y += 20
+        cv2.putText(img, ln, (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.52, (0,255,255), 1, cv2.LINE_AA)
+        y += 22
         if y > height - 8: break
     return img
+
+def _resize_to(img: np.ndarray | None, h: int, w: int) -> np.ndarray:
+    if img is None:
+        return np.zeros((h, w, 3), np.uint8)
+    H, W = img.shape[:2]
+    interp = cv2.INTER_AREA if (H > h or W > w) else cv2.INTER_LINEAR
+    return cv2.resize(img, (w, h), interpolation=interp)
+
+def _label_strip(img: np.ndarray, text: str,
+                 bar_h: int = 26,
+                 bg=(0, 0, 0),
+                 fg=(0, 255, 255)) -> np.ndarray:
+    """Add a top title bar with text to an image."""
+    vis = img.copy()
+    cv2.rectangle(vis, (0, 0), (vis.shape[1], bar_h), bg, -1)
+    cv2.putText(vis, text, (8, int(bar_h*0.75)),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, fg, 2, cv2.LINE_AA)
+    return vis
 
 def _hstack(left: np.ndarray, mid: np.ndarray | None, right: np.ndarray | None) -> np.ndarray:
     H = max(left.shape[0], 0 if mid is None else mid.shape[0], 0 if right is None else right.shape[0])
@@ -101,8 +127,14 @@ def _hstack(left: np.ndarray, mid: np.ndarray | None, right: np.ndarray | None) 
     Wr = right.shape[1] if right is not None else 380
     return np.hstack([_pad_to(left, H, Wl), _pad_to(mid, H, Wm), _pad_to(right, H, Wr)])
 
-def _show_dash(left: np.ndarray, mid: np.ndarray | None, right: np.ndarray | None, win: str = "Dash"):
-    strip = _hstack(left, mid, right)
+def _show_dash(left: np.ndarray | None, mid: np.ndarray | None, right: np.ndarray | None,
+               win: str = "Dash", tile_h: int = 480, tile_w: int = 640):
+    L = _resize_to(left, tile_h, tile_w)
+    M = _resize_to(mid,  tile_h, tile_w)
+    R = _resize_to(right, tile_h, tile_w)
+    L = _label_strip(L, "Annotation")
+    M = _label_strip(M, "Reprojection / Tag debug")
+    strip = np.hstack([L, M, R])
     cv2.imshow(win, strip)
 
 def _quit_all():
@@ -413,7 +445,8 @@ def estimate_poses_multi(
                     2)
 
         num_tags = len(common) if common else (1 if fe.origin_id in det_by_id else 0)
-        score = face_quality(num_tags, bbox_xywh)
+        score_area = 0.0 if not bbox_xywh else float(bbox_xywh[2] * bbox_xywh[3])
+        score = (num_tags * 1_000.0) + score_area
 
         # pack results (store 4x4 lists for JSON cleanliness)
         results[face_key] = {
@@ -423,6 +456,8 @@ def estimate_poses_multi(
             "tag_used": int(tag_used),
             "num_tags_visible": int(num_tags),
             "score": float(score),
+            "score_tags": int(num_tags),
+            "score_area_px": int(score_area),
             "T_cam_board": {"matrix": T_cam_board.tolist()},
             "T_cam_object": {"matrix": T_cam_obj.tolist()},
             "bbox_xywh": bbox_xywh,
@@ -446,12 +481,14 @@ def save_frame(
     results: Dict[str, dict],
     reproj_img: Optional[np.ndarray],
     save_depth: bool,
+    dataset_name: str,
 ):
     ensure_dir(out_dir / "frames")
     name = f"{idx:06d}_{int(ts*1000):013d}"
     img_path = out_dir / "frames" / f"{name}.png"
     meta_path = out_dir / "frames" / f"{name}.json"
     reproj_path = out_dir / "frames" / f"{name}_reproj.png"
+    log_path = out_dir / f"{dataset_name}.jsonl"
     cv2.imwrite(str(img_path), bgr)
 
     pretty = {}
@@ -463,6 +500,8 @@ def save_frame(
         pr["translation_m"] = [float(t[0]), float(t[1]), float(t[2])]
         pr["rpy_deg"] = [float(roll), float(pitch), float(yaw)]
         pretty[obj] = pr
+        q_xyzw = to_quat(R)
+        pr["quat_xyzw"] = [float(q) for q in q_xyzw]
 
     if reproj_img is not None:
         cv2.imwrite(str(reproj_path), reproj_img)
@@ -478,8 +517,20 @@ def save_frame(
             "distortion_coefficients": None if intr.dist is None else intr.dist.reshape(-1).tolist(),
         },
         "tag_family": family,
-        "poses": pretty,  # <--- per OBJECT, best face only, readable fields added
+        "poses": pretty,
     }
+    log_entry = {
+        "idx": idx,
+        "timestamp_sec": float(ts),
+        "image": img_path.name,
+        "reproj_image": (reproj_path.name if reproj_img is not None else None),
+        "depth": (f"{name}_depth.npy" if (save_depth and depth is not None) else None),
+        "tag_family": family,
+        "objects": sorted(list(pretty.keys())),   # objects saved in this frame
+    }
+    with open(log_path, "a", encoding="utf-8") as lf:
+        lf.write(json.dumps(log_entry) + "\n")
+
     meta_path.write_text(json.dumps(meta, indent=2))
 
 # ------------------------------- Main loop -----------------------------------
@@ -538,6 +589,7 @@ def main():
 
     src.start()
     cv2.namedWindow("Dash", cv2.WINDOW_NORMAL | cv2.WINDOW_KEEPRATIO)
+    cv2.resizeWindow("Dash", 1920, 480)
 
     idx = 0
     paused = False
@@ -547,13 +599,16 @@ def main():
     last_bgr = None
     last_depth = None
     last_ts = None
+    capture_msg, capture_msg_until = "", 0.0
     pts3d_by_face: Dict[str, np.ndarray] = {}
+
     try:
         for fk, fe in faces.items():
             pts3d_dict, faces_map, _, _ = load_keypoints_fuzzy(fe.object_name, repo_root)
             if fk in faces_map:
                 names = faces_map[fk]
                 pts3d_by_face[fk] = np.vstack([pts3d_dict[n] for n in names]).astype(np.float32)
+        last_results = None
         while True:
             results: Dict[str, dict] = {}
             if not paused:
@@ -572,36 +627,54 @@ def main():
                 anno, reproj, results = estimate_poses_multi(bgr, intr, args.family, faces, pts3d_by_face)
                 last_anno, last_reproj = anno, reproj
                 last_bgr, last_depth, last_ts = bgr, depth, ts
+                last_results = results
             else:
                 if last_anno is None:
                     H, W = intr.height, intr.width
                     last_anno = np.zeros((H, W, 3), np.uint8)
                 if last_reproj is None:
                     last_reproj = np.zeros_like(last_anno)
+                if last_results is not None:
+                    results = last_results
             best_by_object= {}
             for fk, r in results.items():
                 obj = r["object"]
                 if (obj not in best_by_object) or (r["score"] > best_by_object[obj]["score"]):
                     best_by_object[obj] = r
 
-            # right panel text
-            lines = ["GT Capture",
-                     f"session: {args.session}",
-                     f"faces visible: {len(results)}",
-                     "",
-                     "Keys: ENTER/y/s=accept, r/n/BACK=reject",
-                     "      ESC/q=abort  Q/X=quit-all",
-                     "      SPACE/p=cont/pause  h=help"]
+            lines = [
+                "GT Capture",
+                f"session: {args.session}",
+                f"faces visible: {len(results)}",
+                "",
+                "Panels:",
+                "  Left  = Annotation (axes, bbox, labels)",
+                "  Middle= Reprojection / tag debug",
+                "  Right = Status, legend, capture feedback",
+                "",
+                "Keys: ENTER/y/s=accept, r/n/BACK=reject",
+                "      ESC/q=abort  Q/X=quit-all",
+                "      SPACE/p=cont/pause  h=help",
+                "",
+            ]
             if show_help:
                 for obj, r in best_by_object.items():
                     M = np.array(r["T_cam_object"]["matrix"], float)
                     R, t = M[:3, :3], M[:3, 3]
                     roll, pitch, yaw = rpy_from_R(R)
                     lines.append(f"- {obj} [{r['face_key']}]")
-                    lines.append(f"   t (m): [{t[0]:.3f}, {t[1]:.3f}, {t[2]:.3f}]")
-                    lines.append(f"   rpy° : [{roll:.1f}, {pitch:.1f}, {yaw:.1f}]  score={r['score']:.0f}")
-            panel_h = (last_anno.shape[0] if last_anno is not None else intr.height)
-            right = _text_panel(lines, width=380, height=panel_h)
+                    lines.append(f"   t (m): [{t[0]:.3f}, {t[1]:.3f}, {t[2]:.3f}]  | dist={np.linalg.norm(t):.3f} m")
+                    lines.append(f"   rpy deg : [{roll:.1f}, {pitch:.1f}, {yaw:.1f}]")
+                    lines.append(f"   tag_used: {r['tag_used']}  face: {r['face_key']}")
+                    lines.append(
+                        f"   score: {int(r['score'])}  (tags={r['score_tags']}, area={r['score_area_px']:,} px)")
+                    lines.append("")
+
+            now = time.time()
+            if capture_msg and now < capture_msg_until:
+                lines.append(f"*** {capture_msg} ***")
+
+            right = _text_panel(lines, width=640, height=480)
             _show_dash(last_anno, last_reproj, right)
 
             # decide
@@ -614,18 +687,23 @@ def main():
 
 
             if k in (13, ord('y'), ord('s')) and (last_bgr is not None):
-                # save *only* the best pose per object
-                save_frame(out_dir, idx, last_ts, last_bgr, last_depth, intr, args.family,
+                saved_idx = idx
+                save_frame(out_dir, saved_idx, last_ts, last_bgr, last_depth, intr, args.family,
                            results=best_by_object,  # <--- note: best only
                            reproj_img=last_reproj,
-                           save_depth=args.save_depth)
+                           save_depth=args.save_depth, dataset_name=args.session)
+                capture_msg = f"Frame #{saved_idx:03d} captured [OK]"
+                capture_msg_until = time.time() + 2.0
                 idx += 1
 
             if args.continuous and not paused and (last_bgr is not None):
+                saved_idx = idx
                 save_frame(out_dir, idx, last_ts, last_bgr, last_depth, intr, args.family,
                            results=best_by_object,  # <-- best only, same as ENTER
                            reproj_img=last_reproj,
-                           save_depth=args.save_depth)
+                           save_depth=args.save_depth, dataset_name=args.session)
+                capture_msg = f"Frame #{saved_idx:03d} captured [OK]"
+                capture_msg_until = time.time() + 2.0
                 idx += 1
 
             if args.max_frames and idx >= args.max_frames:
