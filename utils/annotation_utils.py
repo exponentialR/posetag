@@ -5,11 +5,38 @@ import cv2, yaml
 import re, json, glob
 from pathlib import Path
 
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+
+# at top of file (after the Detector import)
 try:
     from pupil_apriltags import Detector
 except Exception as e:
     raise SystemExit("Please install pupil-apriltags: pip install pupil-apriltags") from e
+_DET_CACHE = {}
 
+
+def _get_detector(family: str, nthreads: int = 1,
+                  quad_decimate: float = 1.0, refine_edges: bool = True) -> Detector:
+    key = (family, nthreads, quad_decimate, refine_edges)
+    det = _DET_CACHE.get(key)
+    if det is None:
+        det = Detector(families=family,
+                       nthreads=nthreads,
+                       quad_decimate=quad_decimate,
+                       refine_edges=refine_edges)
+        _DET_CACHE[key] = det
+    return det
+
+def detect_tags(image_gray, fx, fy, cx, cy, tag_size_m, family="tag36h11"):
+    # Ensure C-contiguous uint8 for the C++ side
+    img = np.ascontiguousarray(image_gray, dtype=np.uint8)
+    det = _get_detector(family, nthreads=1, quad_decimate=1.0, refine_edges=True)
+    return det.detect(img,
+                      estimate_tag_pose=True,
+                      camera_params=(fx, fy, cx, cy),
+                      tag_size=tag_size_m)
 
 def _draw_prompt(img, face_key, clicked_pts, rms=None):
     vis = img.copy()
@@ -128,10 +155,10 @@ def load_board(board_yaml_path: Path):
     tb[origin] = np.eye(4, dtype=float)
     return origin, tag_size_m, tb
 
-def detect_tags(image_gray, fx, fy, cx, cy, tag_size_m, family="tag36h11"):
-    det = Detector(families=family, nthreads=4, quad_decimate=1.0, refine_edges=True)
-    return det.detect(image_gray, estimate_tag_pose=True,
-                      camera_params=(fx, fy, cx, cy), tag_size=tag_size_m)
+# def detect_tags(image_gray, fx, fy, cx, cy, tag_size_m, family="tag36h11"):
+#     det = Detector(families=family, nthreads=4, quad_decimate=1.0, refine_edges=True)
+#     return det.detect(image_gray, estimate_tag_pose=True,
+#                       camera_params=(fx, fy, cx, cy), tag_size=tag_size_m)
 
 def choose_face_key(face_yaml_path: str) -> str:
     # face key = YAML basename without extension
