@@ -389,6 +389,7 @@ def estimate_poses_multi(
 
     # Detect tags once per unique tag size (so mixed boards are supported)
     tag_sizes = sorted({f.tag_size_m for f in faces.values()})
+    print(f'Tag sizes in scene: {tag_sizes}')
     det_by_id: Dict[int, object] = {}
     for tag_size in tag_sizes:
         dets = detect_tags(gray, intr.fx, intr.fy, intr.cx, intr.cy, tag_size, family=family)
