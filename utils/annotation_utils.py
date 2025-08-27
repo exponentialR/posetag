@@ -155,10 +155,7 @@ def load_board(board_yaml_path: Path):
     tb[origin] = np.eye(4, dtype=float)
     return origin, tag_size_m, tb
 
-# def detect_tags(image_gray, fx, fy, cx, cy, tag_size_m, family="tag36h11"):
-#     det = Detector(families=family, nthreads=4, quad_decimate=1.0, refine_edges=True)
-#     return det.detect(image_gray, estimate_tag_pose=True,
-#                       camera_params=(fx, fy, cx, cy), tag_size=tag_size_m)
+
 
 def choose_face_key(face_yaml_path: str) -> str:
     # face key = YAML basename without extension
