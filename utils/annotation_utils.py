@@ -125,10 +125,41 @@ def rz(yaw_rad):
     R = np.array([[c,-s,0],[s,c,0],[0,0,1]], float)
     return R
 
-def load_meta(meta_path: Path):
-    with open(meta_path, "r") as f: m = json.load(f)
-    for k in ("object","face_yaml","camera"):
-        if k not in m: raise ValueError(f"meta missing '{k}'")
+def load_meta(path: str | Path, strict: bool = True) -> dict:
+    """
+    Load metadata JSON saved alongside a shot.
+
+    If strict=True (default), enforce legacy required keys.
+    If strict=False, accept newer schemas (object_full/object_base) and
+    normalize to include:
+        - object_base (always)
+        - object      (back-compat alias of object_base)
+        - side        (if derivable)
+    """
+    p = Path(path)
+    with p.open("r") as f:
+        m = json.load(f)
+
+    if strict:
+        required = ["object", "camera", "timestamp"]
+        for k in required:
+            if k not in m:
+                raise ValueError(f"meta missing '{k}'")
+        return m
+
+    # Prefer object_base; fall back to legacy object or object_full parsing
+    obj_base = m.get("object_base")
+    if not obj_base:
+        obj_base = m.get("object")
+    if not obj_base and m.get("object_full"):
+        from utils.capture_utils import parse_base_and_side
+        obj_base, side_infer = parse_base_and_side(m["object_full"])
+        m.setdefault("side", side_infer)
+
+    if obj_base:
+        m.setdefault("object_base", obj_base)
+        m.setdefault("object", obj_base)  # back-compat alias for older callers
+
     return m
 
 def load_keypoints(obj_name: str, repo_root: Path):
