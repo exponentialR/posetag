@@ -6,8 +6,10 @@ import pyrealsense2 as rs
 from pathlib import Path
 from typing import List, Dict, Tuple, Optional, Set
 import csv
+import yaml, logging
 
 SIDE_RE = re.compile(r"^(?P<base>.+?)_side(?P<side>[A-Za-z]+)$")
+log = logging.getLogger("gtat")
 
 def _append_manifest(manifest_path: str, meta: dict):
     """
@@ -43,15 +45,15 @@ def _append_manifest(manifest_path: str, meta: dict):
         w.writerow(row)
 
 
-def _resolve_yaml_path(repo_root, p: str) -> str | None:
+def _resolve_yaml_path(project_root, p: str) -> str | None:
     if not p:
         return None
     p = p.replace("\\", "/")  # tolerate Windows entries
     cand = Path(p)
     if not cand.is_absolute():
-        cand = repo_root / cand
+        cand = project_root / cand
     if not cand.exists():
-        alt = repo_root / "boards" / cand.name  # fallback by basename
+        alt = project_root / "boards" / cand.name  # fallback by basename
         if alt.exists():
             cand = alt
     return str(cand)
@@ -238,13 +240,13 @@ def make_info_panel(h: int, w: int, state: dict, gallery_on: bool=True) -> np.nd
 # ---------- registry helpers ----------
 def load_registry(path: str) -> Dict:
     if not os.path.exists(path):
-        print(f"[!] tag registry not found: {path}")
+        log.warning(f"[!] tag registry not found: {path}")
         return {"version": 1, "tags": {}}
     reg = yaml.safe_load(open(path, "r")) or {}
     reg.setdefault("tags", {})
     return reg
 
-def faces_for_object(object_name: str, registry: Dict, repo_root) -> List[Dict]:
+def faces_for_object(object_name: str, registry: Dict, project_root) -> List[Dict]:
     """Return list of face entries for the *full* object name.
        Each entry: dict(yaml, object, tag_ids=set(...))"""
     by_yaml = {}
@@ -256,9 +258,9 @@ def faces_for_object(object_name: str, registry: Dict, repo_root) -> List[Dict]:
                 continue
             if obj != object_name:
                 continue
-            yml = _resolve_yaml_path(repo_root, yml_raw)
+            yml = _resolve_yaml_path(project_root, yml_raw)
             if not yml:
-                print(f"[!] Could not resolve yaml path: {yml_raw}")
+                log.warning(f"[!] Could not resolve yaml path: {yml_raw}")
                 continue
             by_yaml.setdefault(yml, {"object": obj, "tag_ids": set()})
             by_yaml[yml]["tag_ids"].add(int(tid))
@@ -280,7 +282,7 @@ def faces_for_object(object_name: str, registry: Dict, repo_root) -> List[Dict]:
                 "tag_ids": sorted(list(info["tag_ids"]))
             })
         except Exception as e:
-            print(f"[!] Could not read {yml}: {e}")
+            log.warning(f"[!] Could not read {yml}: {e}")
     return faces
 
 def parse_base_and_side(name: str) -> Tuple[str, Optional[str]]:

@@ -26,7 +26,7 @@ What’s new (rev)
 Saving layout
 -------------
 Default: by object and side
-    boards/shots/<object_base>/side<SideLetter>/
+    <project_root>/shots/<object_base>/side<SideLetter>/
       <object_base>_side<SideLetter>_<YYYYMMDD_HHMMSS>_{raw,ann}.png
       <object_base>_side<SideLetter>_<YYYYMMDD_HHMMSS>_meta.json
 
@@ -45,6 +45,7 @@ Keys (main preview)
 
 CLI highlights
 --------------
+  --project_root PATH     Root folder for data (shots/boards/datasets)
   --calib PATH            Camera intrinsics YAML (fx, fy, cx, cy, dist)
   --object_name NAME      Base or full face name
   --width/--height/--fps  Stream settings (e.g., 640×480 @ 30 fps)
@@ -57,8 +58,7 @@ CLI highlights
 
 
 from __future__ import annotations
-import argparse, os, sys, json, time, datetime, re
-import yaml
+import argparse, os, json, time
 import numpy as np
 import cv2
 import pyrealsense2 as rs
@@ -71,6 +71,8 @@ from utils.capture_utils import (
     load_registry, unique_bases, faces_for_base, faces_for_object,
     parse_base_and_side, ensure_dir, timestamp, _append_manifest
 )
+from utils.project_config import resolve_project_root, ensure_project_dirs
+from utils.logger import init_project_logger
 
 try:
     from pupil_apriltags import Detector
@@ -139,6 +141,7 @@ def best_face_by_overlap(faces: List[Dict], det_ids: Set[int], prev_idx: int|Non
 # ---------- main ----------
 def main():
     ap = argparse.ArgumentParser("Capture wide shots per face for later annotation")
+    ap.add_argument("--project_root", default=None, type=Path, help="Root for boards/shots/objects/datasets (default: $GTAT_PROJECT or current directory)" )
     ap.add_argument("--calib", default="calib_color.yaml")
     ap.add_argument("--registry", default=None,
                     help="Path to boards/tag_registry.yaml (defaults to repo_root/boards/tag_registry.yaml)")
@@ -159,54 +162,84 @@ def main():
     ap.add_argument("--raw_dir", default=None, help="when layout=split_type: raw images dir")
     ap.add_argument("--ann_dir", default=None, help="when layout=split_type: annotated images dir")
     ap.add_argument("--meta_dir", default=None, help="when layout=split_type: JSON metadata dir")
-    ap.add_argument("--manifest", default="boards/shots/manifest.csv", help="optional CSV file to append per-capture rows")
-
+    ap.add_argument("--manifest", default=None, help="optional CSV file to append per-capture rows")
+    ap.add_argument("--log_file", default=None,
+                         help="override log path (default: <project_root>/logs/capture_isc_face.log)")
+    ap.add_argument("--log_level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"],
+                         help="log verbosity")
+    ap.add_argument("--log_console", action="store_true", help="also echo logs to stderr")
     args = ap.parse_args()
+
+    # resolve project root
+    project_root = resolve_project_root(args.project_root)
+    ensure_project_dirs(project_root)
 
     calib_path = Path(args.calib)
     if not calib_path.exists():
-        alt = repo_root / "calib_color.yaml"
+        alt = project_root / "calib_color.yaml"
         if alt.exists():
             args.calib = str(alt)
 
     if args.registry is None:
-        cand = repo_root / "boards" / "tag_registry.yaml"
+        cand = project_root / "boards" / "tag_registry.yaml"
         args.registry = str(cand)
     else:
         rp = Path(args.registry)
         if not rp.exists():
-            cand = repo_root / args.registry
+            cand = project_root / args.registry
             if cand.exists():
                 args.registry = str(cand)
 
     if args.out_dir is None:
-        args.out_dir = str(repo_root / "boards" / "shots")
+        args.out_dir = str(project_root / "shots")
+
+    logs_dir = project_root / "logs"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    if args.log_file:
+        lp = Path(args.log_file)
+        log_path = lp if lp.is_absolute() else (logs_dir / lp)
+    else:
+        log_path = logs_dir / "capture_isc_face.log"
+
 
     # -- layout initialisation ---
-    print(f"[i] Layout: {args.layout}")
+    logger = init_project_logger(log_path, level=args.log_level, console=args.log_console)
+    logger.info("Layout: %s", args.layout)
 
     if args.layout == "split_type":
+        base = Path(args.out_dir)
         # Fill defaults safely
-        args.raw_dir = args.raw_dir or str(Path(args.out_dir) / "images")
-        args.ann_dir = args.ann_dir or str(Path(args.out_dir) / "images")
-        args.meta_dir = args.meta_dir or str(Path(args.out_dir) / "meta")
+        args.raw_dir = args.raw_dir or str(base / "images")
+        args.ann_dir = args.ann_dir or str(base/ "ann")
+        args.meta_dir = args.meta_dir or str(base / "meta")
 
         for d in (args.raw_dir, args.ann_dir, args.meta_dir):
             if d:
                 os.makedirs(d, exist_ok=True)
-            print(f"[i] Split dirs -> raw={args.raw_dir}, ann={args.ann_dir}, meta={args.meta_dir}")
+        logger.info(f"[i] Split dirs -> raw={args.raw_dir}, ann={args.ann_dir}, meta={args.meta_dir}")
     else:
         os.makedirs(args.out_dir, exist_ok=True)
 
-    print(f"[i] Using calib: {args.calib}")
-    print(f"[i] Using registry: {args.registry}")
-    print(f"[i] Shots will be saved to: {args.out_dir}")
-
-
+    logger.info("Using project root: %s", project_root)
+    logger.info("Using calib: %s", args.calib)
+    logger.info("Using registry: %s", args.registry)
+    logger.info("Shots will be saved to: %s", args.out_dir)
 
     (fx, fy, cx, cy), K = load_calib(args.calib)
     reg = load_registry(args.registry)
     ensure_dir(args.out_dir)
+    legacy = (repo_root / "boards" / "shots").resolve()
+    if Path(args.out_dir).resolve() == legacy:
+        logger.warning("[warn] boards/shots is deprecated; prefer a project-root shots/ "
+              "(pass --project_root /path/to/my_project).")
+
+    if args.manifest is None:
+        args.manifest = str((project_root / "shots" / "manifest.csv").resolve())
+    else:
+        mp = Path(args.manifest)
+        if not mp.is_absolute():
+            args.manifest = str((project_root / args.manifest).resolve())
+    Path(args.manifest).parent.mkdir(parents=True, exist_ok=True)
 
     det = Detector(families=args.family, nthreads=4, quad_decimate=1.0, refine_edges=True)
 
@@ -236,7 +269,7 @@ def main():
     if cli_obj:
         base, side = parse_base_and_side(cli_obj)
         state["object_base"] = base
-        state["faces"] = faces_for_base(base, reg, repo_root) if side is None else faces_for_object(cli_obj, reg, repo_root)
+        state["faces"] = (faces_for_base(base, reg, project_root) if side is None else faces_for_object(cli_obj, reg, project_root))
         state["auto_side"] = (side is None)
         state["face_idx"] = 0
 
@@ -341,7 +374,7 @@ def main():
                     base = bases[pick_sel] if bases else None
                     if base:
                         state["object_base"] = base
-                        state["faces"] = faces_for_base(base, reg, repo_root)
+                        state["faces"] = faces_for_base(base, reg, project_root)
                         state["face_idx"] = 0
                         state["auto_side"] = True
                     mode = 'preview'
@@ -414,6 +447,7 @@ def main():
                     raw_path = str(Path(args.raw_dir) / f"{file_stub}_raw.png")
                     ann_path = str(Path(args.ann_dir) / f"{file_stub}_ann.png")
                     meta_path = str(Path(args.meta_dir) / f"{file_stub}_meta.json")
+                # print(f"[i] save_root={Path(raw_path).parent}")
 
                 cv2.imwrite(raw_path, c)
                 cv2.imwrite(ann_path, vis)
@@ -440,11 +474,12 @@ def main():
                 }
                 with open(meta_path, "w") as f:
                     json.dump(meta, f, indent=2)
-                print(f"[+] Saved {raw_path}")
-                print(f"[+] Saved {ann_path}")
-                print(f"[+] Saved {meta_path}")
+                logger.info(f"[+] Saved {raw_path}")
+                logger.info(f"[+] Saved {ann_path}")
+                logger.info(f"[+] Saved {meta_path}")
                 if args.manifest:
                     _append_manifest(args.manifest, meta)
+                    logger.debug(f"[i] Appended manifest {args.manifest}")
 
                 # thumbnail
                 try:
