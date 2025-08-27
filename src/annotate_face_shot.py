@@ -18,7 +18,7 @@ import numpy as np
 import cv2, yaml
 from pathlib import Path
 import itertools
-from utils.annotation_utils import load_meta, detect_tags, load_board, se3, inv_se3, load_keypoints_fuzzy, choose_face_key, _draw_prompt
+from utils.annotation_utils import load_meta, detect_tags, load_board, se3, inv_se3, load_keypoints_fuzzy, choose_face_key
 EXIT_QUIT_ALL = 99
 
 def _flush_keys(duration_ms: int = 100):
@@ -209,7 +209,6 @@ def collect_quad_editor(image_bgr, mid_img: np.ndarray | None, right_img: np.nda
             dragging_idx = None
             draw_left()
 
-    # cv2.namedWindow("Dash", cv2.WINDOW_AUTOSIZE)
     cv2.setMouseCallback("Dash", on_mouse)
     draw_left()
 
