@@ -27,6 +27,7 @@ from __future__ import annotations
 import argparse, json, os, sys, time
 from dataclasses import dataclass
 from pathlib import Path
+from random import choices
 from typing import Dict, List, Tuple, Optional
 import numpy as np
 import cv2
@@ -376,29 +377,34 @@ def estimate_poses_multi(
     family: str,
     faces: Dict[str, FaceEntry],
     pts3d_by_face: Dict[str, np.ndarray],
+    axes_mode: str = "both",
 ) -> Tuple[np.ndarray, np.ndarray, Dict[str, dict]]:
     """
     Returns:
       anno_vis (left panel), reproj_vis (mid panel), and a dict results keyed by face_key.
-      Each result has: object, face_key, tags_used, T_cam_board, T_cam_object (4x4 lists).
+      Each result has: object, face_key, tags_used, T_cam_board, T_cam_object (4x4 lists),
+      bbox_xywh, bbox_source ('face_kps' or 'fallback_tag'), score breakdown.
     """
     gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
     gray = np.ascontiguousarray(gray)
     K = np.array([[intr.fx,0,intr.cx],[0,intr.fy,intr.cy],[0,0,1]], float)
     dist = intr.dist if intr.dist is not None else np.zeros((1,5), float)
 
-    # Detect tags once per unique tag size (so mixed boards are supported)
+    # Detect tags once per unique tag size (mixed boards supported)
     tag_sizes = sorted({f.tag_size_m for f in faces.values()})
-    print(f'Tag sizes in scene: {tag_sizes}')
     det_by_id: Dict[int, object] = {}
     for tag_size in tag_sizes:
         dets = detect_tags(gray, intr.fx, intr.fy, intr.cx, intr.cy, tag_size, family=family)
         for d in dets:
-            det_by_id[int(d.tag_id)] = d  # latest wins (they all share same 2D corners)
+            det_by_id[int(d.tag_id)] = d  # last one wins
 
     anno = bgr.copy()
     reproj = bgr.copy()
     results: Dict[str, dict] = {}
+
+    # tuning knobs for fallback bbox
+    FALLBACK_SCALE = 3.0  # side length = 3x tag size
+    MIN_AREA = 6000       # px^2 threshold under which we'll switch to fallback
 
     # For each face board that has any visible tag, recover T_cam_board then T_cam_object
     for face_key, fe in faces.items():
@@ -406,16 +412,22 @@ def estimate_poses_multi(
         common = [tid for tid in fe.T_board_tag.keys() if tid in det_by_id]
         if not common and (fe.origin_id not in det_by_id):
             continue
-        if fe.origin_id in det_by_id and det_by_id[fe.origin_id].pose_R is not None:
+
+        # Build T_cam_tag and T_cam_board for whichever tag we use
+        if fe.origin_id in det_by_id and getattr(det_by_id[fe.origin_id], "pose_R", None) is not None:
             d = det_by_id[fe.origin_id]
-            T_cam_board = se3(d.pose_R.astype(float), d.pose_t.reshape(3).astype(float))
+            T_cam_tag   = se3(d.pose_R.astype(float), d.pose_t.reshape(3).astype(float))
+            T_cam_board = T_cam_tag  # origin tag = identity in board frame
             tag_used = fe.origin_id
         else:
             tag_used = max(common, key=lambda tid: getattr(det_by_id[tid], "decision_margin", 0.0))
             d = det_by_id[tag_used]
-            T_cam_tag = se3(d.pose_R.astype(float), d.pose_t.reshape(3).astype(float))
+            T_cam_tag   = se3(d.pose_R.astype(float), d.pose_t.reshape(3).astype(float))
             T_cam_board = T_cam_tag @ inv_se3(fe.T_board_tag[tag_used])
+
         T_cam_obj = T_cam_board @ fe.T_board_object
+
+        # reprojection debug dots on the board
         try:
             pts3d = np.array([[0,0,0],[0.03,0,0],[0,0.03,0],[0,0,0.03]], np.float32)
             uv = project_points(pts3d, T_cam_board, K, dist)
@@ -424,10 +436,18 @@ def estimate_poses_multi(
         except Exception:
             pass
 
+        # --- BBOX from face keypoints (if present) ---
         bbox_xywh = None
+        bbox_source = None
+        score_area = 0.0
+
         if face_key in pts3d_by_face:
-            uv = project_points(pts3d_by_face[face_key], T_cam_obj, K, dist)  # (4,2)
-            x0, y0 = uv.min(axis=0);
+            uv = project_points(pts3d_by_face[face_key], T_cam_obj, K, dist)  # (N,2)
+            # Visualize the points that drive the bbox (cyan)
+            for (u, v) in uv:
+                cv2.circle(anno, (int(u), int(v)), 2, (255, 255, 0), -1)
+
+            x0, y0 = uv.min(axis=0)
             x1, y1 = uv.max(axis=0)
             H, W = bgr.shape[:2]
             x0 = max(0.0, min(W - 1.0, float(x0)))
@@ -435,21 +455,50 @@ def estimate_poses_multi(
             x1 = max(0.0, min(W - 1.0, float(x1)))
             y1 = max(0.0, min(H - 1.0, float(y1)))
             bbox_xywh = [x0, y0, max(0.0, x1 - x0), max(0.0, y1 - y0)]
-            # quick overlay
+            score_area = bbox_xywh[2] * bbox_xywh[3]
+            bbox_source = "face_kps"
+            # draw primary bbox in yellow
             cv2.rectangle(anno, (int(x0), int(y0)), (int(x1), int(y1)), (0, 255, 255), 2)
 
-        # overlay
+        # --- Fallback bbox: inflate a square around the chosen tag ---
+        if (bbox_xywh is None) or (score_area < MIN_AREA):
+            s   = float(fe.tag_size_m) * FALLBACK_SCALE
+            hlf = 0.5 * s
+            # tag-plane square, centered at tag
+            square3d = np.array([[-hlf, -hlf, 0],
+                                 [ hlf, -hlf, 0],
+                                 [ hlf,  hlf, 0],
+                                 [-hlf,  hlf, 0]], np.float32)
+            uv_tag = project_points(square3d, T_cam_tag, K, dist)
+            x0, y0 = uv_tag.min(axis=0)
+            x1, y1 = uv_tag.max(axis=0)
+            H, W = bgr.shape[:2]
+            x0 = max(0.0, min(W - 1.0, float(x0)))
+            y0 = max(0.0, min(H - 1.0, float(y0)))
+            x1 = max(0.0, min(W - 1.0, float(x1)))
+            y1 = max(0.0, min(H - 1.0, float(y1)))
+            bbox_xywh = [x0, y0, max(0.0, x1 - x0), max(0.0, y1 - y0)]
+            score_area = bbox_xywh[2] * bbox_xywh[3]
+            bbox_source = "fallback_tag"
+            # draw fallback bbox in magenta
+            cv2.rectangle(anno, (int(x0), int(y0)), (int(x1), int(y1)), (255, 0, 255), 2)
+
+        # Axes overlay (board/object) according to mode
+        if axes_mode in ("both", "board"):
+            draw_axes(anno, T_cam_board, K, dist, scale=0.06)
+        if axes_mode in ("both", "object"):
+            draw_axes(anno, T_cam_obj, K, dist, scale=0.04)
+
+        # label
         label = f"{fe.object_name}/{fe.face_key}"
-        draw_axes(anno, T_cam_board, K, dist, scale=0.06)
-        draw_axes(anno, T_cam_obj, K, dist, scale=0.04)
-        cv2.putText(anno, label, (12, 24 + 18 * (hash(face_key) % 20)), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255),
-                    2)
+        cv2.putText(anno, label, (12, 24 + 18 * (hash(face_key) % 20)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 2)
 
+        # scoring: prefer more tags; tie-break with bbox area
         num_tags = len(common) if common else (1 if fe.origin_id in det_by_id else 0)
-        score_area = 0.0 if not bbox_xywh else float(bbox_xywh[2] * bbox_xywh[3])
-        score = (num_tags * 1_000.0) + score_area
+        score = (num_tags * 1_000.0) + float(score_area)
 
-        # pack results (store 4x4 lists for JSON cleanliness)
+        # pack results
         results[face_key] = {
             "object": fe.object_name,
             "face_key": fe.face_key,
@@ -459,9 +508,10 @@ def estimate_poses_multi(
             "score": float(score),
             "score_tags": int(num_tags),
             "score_area_px": int(score_area),
+            "bbox_xywh": bbox_xywh,
+            "bbox_source": bbox_source,  # <-- new
             "T_cam_board": {"matrix": T_cam_board.tolist()},
             "T_cam_object": {"matrix": T_cam_obj.tolist()},
-            "bbox_xywh": bbox_xywh,
         }
 
     return anno, reproj, results
@@ -554,6 +604,7 @@ def main():
     ap.add_argument("--rs_fps", type=int, default=30, help="FPS for live mode")
     ap.add_argument("--save_depth", action="store_true",
                     help="If present, save aligned depth as .npy per frame")
+    ap.add_argument("--axes", choices=["both","board","object","none"], default="both", help="Which axes to draw on the left: both(default), board only, or object only, or none")
 
     args = ap.parse_args()
 
@@ -625,7 +676,7 @@ def main():
                              f"Start with --rs_w {intr.width} --rs_h {intr.height} or fix the calibration.")
 
                 # estimate poses
-                anno, reproj, results = estimate_poses_multi(bgr, intr, args.family, faces, pts3d_by_face)
+                anno, reproj, results = estimate_poses_multi(bgr, intr, args.family, faces, pts3d_by_face, axes_mode=args.axes)
                 last_anno, last_reproj = anno, reproj
                 last_bgr, last_depth, last_ts = bgr, depth, ts
                 last_results = results
@@ -669,6 +720,9 @@ def main():
                     lines.append(f"   tag_used: {r['tag_used']}  face: {r['face_key']}")
                     lines.append(
                         f"   score: {int(r['score'])}  (tags={r['score_tags']}, area={r['score_area_px']:,} px)")
+                    lines.append(f"   board: {Path(r['board_yaml']).name}")
+                    lines.append(f"   tag_size_m: {faces[r['face_key']].tag_size_m:.3f}")
+
                     lines.append("")
 
             now = time.time()

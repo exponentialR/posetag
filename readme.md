@@ -81,27 +81,70 @@ Outputs:
 
 ---
 
+
+
 ### 3) Capture “face shots” for annotation
 
 ```bash
 python -m src.capture_isc_face \
   --calib calib_color.yaml \
   --width 640 --height 480 --fps 30
+# Optional UI sizing
+#   --panel_w 560         # centre info panel width
+#   --recent_w 480        # right "Last saved" panel width
+# Optional saving layout / manifest
+#   --layout {flat,by_object,by_object_side,split_type}   # default: by_object_side
+#   --manifest boards/shots/manifest.csv                  # append one row per save
 ```
 
-Workflow:
+**Workflow (no terminal prompts while preview runs):**
 
-* Enter object name (`connection_plate_white_sideA`, etc.)
-* Select face index
-* Live preview; **ENTER** to save
+* Press **`o`** to open the **in-window object picker**; navigate with **↑/↓/W/S/K/J**, **Enter** to select, **Esc** to cancel.
+* You may also start with `--object_name`:
 
-Outputs:
+  * Base only: `--object_name connection_plate_white` → **side auto-deduced** from live detections via `boards/tag_registry.yaml`.
+  * Full face: `--object_name connection_plate_white_sideA` → fixed side.
+* **ENTER** saves a shot. If expected tags are missing, **double-press ENTER within 3 s** to force.
+
+**Keys**
+
+* **ENTER** – save (double-press to force if validation fails)
+* **o** – object picker (in-window)
+* **a** – toggle **auto side/face** (works when an object base is chosen)
+* **f** – cycle faces **when auto is OFF**
+* **g** – toggle gallery/“Last saved” panels
+* **h** – help overlay
+* **q / Esc** – quit
+
+**Panels & window**
+
+* Left: 640×480 live feed with detections (unchanged resolution).
+* Centre: **Info** (object/side, seen vs expected IDs, validation, recent thumbnails, instructions).
+* Right: **Last saved** annotated image (blank when off).
+* The top-level window is **resizable**; use `--panel_w` / `--recent_w` to make side panels roomier.
+
+**Outputs (default layout: `by_object_side`)**
 
 ```
-boards/shots/<object_face>_<face_key>_<YYYYMMDD_HHMMSS>_raw.png
-boards/shots/<object_face>_<face_key>_<YYYYMMDD_HHMMSS>_ann.png
-boards/shots/<object_face>_<face_key>_<YYYYMMDD_HHMMSS>_meta.json
+boards/shots/
+  <object_base>/
+    side<SideLetter>/
+      <object_base>_side<SideLetter>_<YYYYMMDD_HHMMSS>_raw.png
+      <object_base>_side<SideLetter>_<YYYYMMDD_HHMMSS>_ann.png
+      <object_base>_side<SideLetter>_<YYYYMMDD_HHMMSS>_meta.json
 ```
+
+* `*_meta.json` includes camera intrinsics, detected/expected IDs, face YAML, and save paths.
+
+**Alternative layouts (optional)**
+
+* `--layout flat` → everything in `boards/shots/`
+* `--layout by_object` → `boards/shots/<object_base>/...`
+* `--layout split_type` → separate folders; use `--raw_dir`, `--ann_dir`, `--meta_dir`
+
+**Manifest (optional)**
+
+* `--manifest boards/shots/manifest.csv` appends one row per save (paths, object/side, tags, OK flag, intrinsics).
 
 ---
 
