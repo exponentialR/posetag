@@ -107,7 +107,6 @@ _PILL = {
     "info": ((229,238,249), (70,95,160)),
 }
 
-# ---- UI layout (tweak here) -----------------------------------
 UI_H        = 720
 UI_W_LEFT   = 820   # was 860
 UI_W_MID    = 520   # was 380  ← Faces list wider
@@ -129,14 +128,12 @@ def _measure(text: str, scale=0.5, thk=1, font=cv2.FONT_HERSHEY_SIMPLEX):
 def _ellipsize_end(text: str, max_w: int, scale=0.5, thk=1):
     if _measure(text, scale, thk) <= max_w:
         return text
-    # keep as many chars as fit, then add "..."
     base = text
     while base and _measure(base + "...", scale, thk) > max_w:
         base = base[:-1]
     return (base + "...") if base else "..."
 
 def _ellipsize_middle(text: str, max_w: int, scale=0.5, thk=1):
-    # good for very long tokens like /home/user/.../file.yaml
     if _measure(text, scale, thk) <= max_w:
         return text
     left, right = 0, 0
@@ -144,7 +141,6 @@ def _ellipsize_middle(text: str, max_w: int, scale=0.5, thk=1):
         cand = text[:left] + "..." + text[len(text)-right:]
         if _measure(cand, scale, thk) <= max_w or (left + right) >= len(text):
             return cand if cand else "..."
-        # grow ends alternately
         if (left <= right) and (left < len(text)):
             left += 1
         elif right < len(text):
@@ -285,7 +281,6 @@ def _index_faces(project_root: Path, manifest: Path) -> List[dict]:
 
 def _browse_and_annotate(project_root: Path, manifest: Path, args):
     cv2.namedWindow("Annotate", cv2.WINDOW_NORMAL)
-    # cv2.resizeWindow("Annotate", UI_WIN_W, UI_WIN_H)
 
     items = _index_faces(project_root, manifest)
     if not items:
@@ -823,8 +818,7 @@ def annotate_single_shot(project_root: Path, shot_raw_path: Path, *,
     obj, side_letter = _infer_object_and_side(shot_raw_path, meta_json, row)
     face_key = Path(face_yaml_path).stem
 
-    # Image IO paths
-    # Prefer meta.image.path_ann if present, else manifest path_ann, else derive next to raw
+
     img_ann = (meta_json.get("image") or {}).get("path_ann") or (
         row.path_ann if row and row.path_ann else str(shot_raw_path).replace("_raw.png", "_ann.png"))
     img_ann = Path(img_ann)
@@ -974,7 +968,6 @@ def annotate_single_shot(project_root: Path, shot_raw_path: Path, *,
 
 
 # -------------------------- Batch helper --------------------------
-
 def _latest_per_face(rows: List[ShotRow], object_filter: Optional[str], side: Optional[str]) -> List[ShotRow]:
     # key = (object_base, side, face_yaml)
     latest: Dict[Tuple[str, str, str], ShotRow] = {}
