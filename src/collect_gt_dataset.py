@@ -33,6 +33,14 @@ Project layout (inputs/outputs)
     <session>.jsonl           # rolling capture log
   logs/collect_gt_dataset.log # run log
 
+
+Face sources
+------------
+Faces are loaded from faces/face_manifest.csv when present (preferred),
+falling back to scanning faces/*/*_T_board_object.yaml. Tag size comes
+from the board YAML; a mismatch vs manifest is warned and board value wins.
+...
+
 Usage examples
 --------------
   # RealSense live (RGB + depth if available)
@@ -61,6 +69,11 @@ from pathlib import Path
 from typing import Dict, List, Tuple, Optional
 import numpy as np
 import cv2, yaml
+
+
+import csv
+import logging
+log: logging.Logger
 
 os.environ.setdefault("OMP_NUM_THREADS", "1")
 os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
@@ -333,32 +346,123 @@ class FaceEntry:
     tag_size_m: float
     T_board_tag: Dict[int, np.ndarray]  # tag_id -> 4x4
 
+
+# --- Registry using manifest (fallback: scan faces/*) ------------------------
+
+def _scan_faces_yaml(project_root: Path) -> List[Path]:
+    return list((project_root / "faces").glob("*/*/*_T_board_object.yaml"))
+
 def load_face_registry(project_root: Path) -> Dict[str, FaceEntry]:
     """
-    Scan faces/**/<face_key>_T_board_object.yaml and build a registry: face_key -> FaceEntry
+    Build registry from faces/face_manifest.csv when present; otherwise scan faces/*.
     """
     reg: Dict[str, FaceEntry] = {}
-    for y in project_root.glob("faces/**/_T_board_object.yaml"):
-        data = yaml.safe_load(open(y, "r"))
-        obj = data["object"]
-        face_key = data["face_key"]
-        board_yaml = Path(data["board_yaml"])
-        if not board_yaml.is_absolute():
-            board_yaml = (project_root / board_yaml).resolve()
-        T_bo = np.array(data["T_board_object"]["matrix"], float)
-        origin_id, tag_size_m, T_board_tag = load_board(board_yaml)
-        reg[face_key] = FaceEntry(
-            object_name=obj,
-            face_key=face_key,
-            board_yaml=board_yaml,
-            T_board_object=T_bo,
-            origin_id=int(origin_id),
-            tag_size_m=float(tag_size_m),
-            T_board_tag=T_board_tag,
-        )
+    manifest_rows = _read_faces_manifest(project_root)
+
+    yaml_paths: List[Tuple[str, Optional[float], Path, Optional[Path]]] = []  # (face_key, tag_size_m_hint, yaml_path, board_yaml_from_manifest)
+
+    if manifest_rows:
+        for r in manifest_rows:
+            if not r.yaml_path.exists():
+                log.warning("[faces-manifest] YAML missing on disk, skipping: %s", r.yaml_path)
+                continue
+            yaml_paths.append((r.face_key, r.tag_size_m, r.yaml_path, r.board_yaml))
+    else:
+        # Fallback scan
+        for y in _scan_faces_yaml(project_root):
+            face_key = y.stem.replace("_T_board_object","")
+            yaml_paths.append((face_key, None, y, None))
+
+    if not yaml_paths:
+        raise SystemExit("[!] No faces found. Run annotate_shots to create face YAMLs / manifest.")
+
+    for face_key, tag_hint, ypath, board_yaml_from_manifest in yaml_paths:
+        try:
+            data = yaml.safe_load(open(ypath, "r"))
+            obj = data["object"]
+            face_key_file = data.get("face_key", face_key)
+            if face_key_file != face_key:
+                face_key = face_key_file  # prefer explicit
+
+            # Board file: prefer YAML’s field; fallback to manifest-provided
+            board_yaml = data.get("board_yaml")
+            board_yaml = Path(board_yaml) if board_yaml else board_yaml_from_manifest
+            if board_yaml is None:
+                log.warning("[faces] %s has no board_yaml; skipping", ypath)
+                continue
+            if not Path(board_yaml).is_absolute():
+                board_yaml = (project_root / board_yaml).resolve()
+
+            T_bo = np.array(data["T_board_object"]["matrix"], float)
+
+            # Truth from board file (also gives the tag dictionary)
+            origin_id, tag_size_m_board, T_board_tag = load_board(board_yaml)
+
+            # Optional consistency check with manifest hint
+            if (tag_hint is not None) and (abs(float(tag_hint) - float(tag_size_m_board)) > 1e-9):
+                log.warning("[faces] tag_size mismatch for %s: manifest=%.6f, board=%.6f (using board)",
+                            face_key, float(tag_hint), float(tag_size_m_board))
+
+            reg[face_key] = FaceEntry(
+                object_name=obj,
+                face_key=face_key,
+                board_yaml=board_yaml,
+                T_board_object=T_bo,
+                origin_id=int(origin_id),
+                tag_size_m=float(tag_size_m_board),
+                T_board_tag=T_board_tag,
+            )
+        except Exception as e:
+            log.warning("[faces] Skip bad YAML %s: %s", ypath, e)
+
     if not reg:
-        raise SystemExit("[!] No faces registered. Run annotate_shots.py first.")
+        raise SystemExit("[!] Found no valid faces after reading manifest/scan.")
     return reg
+
+# --- faces/face_manifest.csv -------------------------------------------------
+@dataclass
+class FaceManifestRow:
+    timestamp: str
+    object: str
+    side: str
+    face_key: str
+    yaml_path: Path
+    board_yaml: Path
+    image: Optional[str]
+    rms_px: Optional[float]
+    tag_size_m: Optional[float]
+
+def _faces_manifest_path(project_root: Path) -> Path:
+    return project_root / "faces" / "face_manifest.csv"
+
+def _read_faces_manifest(project_root: Path) -> List[FaceManifestRow]:
+    p = _faces_manifest_path(project_root)
+    rows: List[FaceManifestRow] = []
+    if not p.exists():
+        log.warning("[faces-manifest] Not found: %s (will fall back to scanning faces/*)", p)
+        return rows
+
+    with p.open("r", newline="", encoding="utf-8") as f:
+        r = csv.DictReader(f)
+        for d in r:
+            try:
+                obj = (d.get("object") or d.get("object_base") or "").strip()
+                side = (d.get("side") or "").strip().upper()
+                face_key = (d.get("face_key") or "").strip()
+                yaml_path = (project_root / d["yaml_path"]).resolve() if not Path(d["yaml_path"]).is_absolute() else Path(d["yaml_path"])
+                board_yaml = (project_root / d["board_yaml"]).resolve() if not Path(d["board_yaml"]).is_absolute() else Path(d["board_yaml"])
+                rms_px = float(d["rms_px"]) if d.get("rms_px") not in (None, "", "None") else None
+                tag_sz = float(d["tag_size_m"]) if d.get("tag_size_m") not in (None, "", "None") else None
+                rows.append(FaceManifestRow(
+                    timestamp=d.get("timestamp",""),
+                    object=obj, side=side, face_key=face_key,
+                    yaml_path=yaml_path, board_yaml=board_yaml,
+                    image=d.get("image") or None, rms_px=rms_px, tag_size_m=tag_sz
+                ))
+            except Exception as e:
+                log.warning("[faces-manifest] Skip bad row: %s (%s)", d, e)
+    return rows
+
 
 # ------------------------------ Projections ----------------------------------
 
@@ -385,11 +489,17 @@ def estimate_poses_multi(
     family: str,
     faces: Dict[str, FaceEntry],
     pts3d_by_face: Dict[str, np.ndarray],
+    pts3d_by_object: Dict[str, np.ndarray],
     check_tag_scale: bool,
     auto_correct_scale: bool,
     scale_tol: float,
     axes_mode: str = "both",
+    bbox_mode: str = "auto",
+    bbox_tag_mult: float = 5.0,
+    bbox_pad_frac: float = 0.06,
+    bbox_min_area: int = 12000,
 ) -> Tuple[np.ndarray, np.ndarray, Dict[str, dict]]:
+
     """
     Returns:
       anno_vis (left panel), reproj_vis (mid panel), and dict results[face_key] with:
@@ -413,8 +523,18 @@ def estimate_poses_multi(
     reproj = bgr.copy()
     results: Dict[str, dict] = {}
 
-    FALLBACK_SCALE = 3.0
-    MIN_AREA = 6000
+    H, W = bgr.shape[:2]
+
+    def _box_from_uv(uv: np.ndarray, W: int, H: int) -> Tuple[List[float], float]:
+        x0, y0 = uv.min(axis=0)
+        x1, y1 = uv.max(axis=0)
+        x0 = max(0.0, min(W - 1.0, float(x0)))
+        y0 = max(0.0, min(H - 1.0, float(y0)))
+        x1 = max(0.0, min(W - 1.0, float(x1)))
+        y1 = max(0.0, min(H - 1.0, float(y1)))
+        w = max(0.0, x1 - x0);
+        h = max(0.0, y1 - y0)
+        return [x0, y0, w, h], (w * h)
 
     for face_key, fe in faces.items():
         common = [tid for tid in fe.T_board_tag.keys() if tid in det_by_id]
@@ -457,35 +577,53 @@ def estimate_poses_multi(
         except Exception:
             pass
 
-        # BBOX from face keypoints (if present)
-        bbox_xywh = None; bbox_source = None; score_area = 0.0
-        if face_key in pts3d_by_face:
-            uv = project_points(pts3d_by_face[face_key], T_cam_obj, K, dist)
-            for (u, v) in uv:
-                cv2.circle(anno, (int(u), int(v)), 2, (255, 255, 0), -1)
-            x0, y0 = uv.min(axis=0); x1, y1 = uv.max(axis=0)
-            H, W = bgr.shape[:2]
-            x0 = max(0.0, min(W - 1.0, float(x0))); y0 = max(0.0, min(H - 1.0, float(y0)))
-            x1 = max(0.0, min(W - 1.0, float(x1))); y1 = max(0.0, min(H - 1.0, float(y1)))
-            bbox_xywh = [x0, y0, max(0.0, x1 - x0), max(0.0, y1 - y0)]
-            score_area = bbox_xywh[2] * bbox_xywh[3]
-            bbox_source = "face_kps"
-            cv2.rectangle(anno, (int(x0), int(y0)), (int(x1), int(y1)), (0, 255, 255), 2)
+        # --- candidate bboxes ---
+        candidates = []
 
-        # Fallback bbox around the used tag if too small or missing
-        if (bbox_xywh is None) or (score_area < MIN_AREA):
-            s_tag = float(fe.tag_size_m) * FALLBACK_SCALE
-            hlf = 0.5 * s_tag
-            square3d = np.array([[-hlf, -hlf, 0],[ hlf, -hlf, 0],[ hlf,  hlf, 0],[-hlf,  hlf, 0]], np.float32)
+        # Face-only bbox (4 named face corners)
+        if bbox_mode in ("face", "auto") and face_key in pts3d_by_face:
+            uv_face = project_points(pts3d_by_face[face_key], T_cam_obj, K, dist)
+            # visualize the points that drive the bbox
+            for (u, v) in uv_face:
+                cv2.circle(anno, (int(u), int(v)), 2, (255, 255, 0), -1)
+            box_face, area_face = _box_from_uv(uv_face, W, H)
+            candidates.append(("face_kps", box_face, area_face))
+
+        # Object-wide bbox (all object keypoints)
+        if bbox_mode in ("object", "auto") and fe.object_name in pts3d_by_object:
+            uv_obj = project_points(pts3d_by_object[fe.object_name], T_cam_obj, K, dist)
+            box_obj, area_obj = _box_from_uv(uv_obj, W, H)
+            candidates.append(("object_kps", box_obj, area_obj))
+
+        bbox_source, bbox_xywh, score_area = None, None, 0.0
+        if candidates:
+            # pick the larger area (covers more of the object)
+            bbox_source, bbox_xywh, score_area = max(candidates, key=lambda t: t[2])
+
+        # Fallback around the used tag if too small or missing
+        if (bbox_xywh is None) or (score_area < bbox_min_area):
+            side_len = float(fe.tag_size_m) * float(bbox_tag_mult)  # <-- uses CLI flag
+            hlf = 0.5 * side_len
+            square3d = np.array(
+                [[-hlf, -hlf, 0], [hlf, -hlf, 0], [hlf, hlf, 0], [-hlf, hlf, 0]], np.float32
+            )
             uv_tag = project_points(square3d, T_cam_tag, K, dist)
-            x0, y0 = uv_tag.min(axis=0); x1, y1 = uv_tag.max(axis=0)
-            H, W = bgr.shape[:2]
-            x0 = max(0.0, min(W - 1.0, float(x0))); y0 = max(0.0, min(H - 1.0, float(y0)))
-            x1 = max(0.0, min(W - 1.0, float(x1))); y1 = max(0.0, min(H - 1.0, float(y1)))
+            bbox_xywh, score_area = _box_from_uv(uv_tag, W, H)
+            bbox_source = "fallback_tag"
+
+        # Pad the final bbox a bit (fraction of its size)
+        if bbox_xywh is not None:
+            x0, y0, w, h = bbox_xywh
+            padw = w * float(bbox_pad_frac)
+            padh = h * float(bbox_pad_frac)
+            x0 = max(0.0, x0 - padw);
+            y0 = max(0.0, y0 - padh)
+            x1 = min(W - 1.0, x0 + w + 2 * padw);
+            y1 = min(H - 1.0, y0 + h + 2 * padh)
             bbox_xywh = [x0, y0, max(0.0, x1 - x0), max(0.0, y1 - y0)]
             score_area = bbox_xywh[2] * bbox_xywh[3]
-            bbox_source = "fallback_tag"
-            cv2.rectangle(anno, (int(x0), int(y0)), (int(x1), int(y1)), (255, 0, 255), 2)
+            # draw once, after selecting & padding
+            cv2.rectangle(anno, (int(x0), int(y0)), (int(x0 + bbox_xywh[2]), int(y0 + bbox_xywh[3])), (0, 255, 255), 2)
 
         # Axes overlay
         if axes_mode in ("both", "board"):  draw_axes(anno, T_cam_board, K, dist, scale=0.06)
@@ -595,14 +733,17 @@ def save_frame(
 def main():
     project_root = resolve_project_root(None)
     ensure_project_dirs(project_root)
+    # Logger
+    global log
+    log = init_project_logger(project_root / "logs" / "collect_gt_dataset.log",
+                              level="INFO", console=True)
 
     parser = argparse.ArgumentParser("Collect multi-object/multi-face GT dataset with review UI")
     parser.add_argument("--mode", choices=["live","bag","video"], required=True)
     parser.add_argument("--bag", type=str, help="Path to RealSense .bag (for mode=bag)")
     parser.add_argument("--video", type=str, help="Path to a video file (for mode=video)")
     parser.add_argument("--session", required=True, help="Dataset session name (folder under datasets/)")
-    parser.add_argument("--dataset_root", type=str, default=None,
-                        help="Root for datasets (default: <project_root>/datasets)")
+    parser.add_argument("--dataset_root", type=str, default=str(project_root / "datasets"))
     parser.add_argument("--calib", default="calib_color.yaml", help="Calibration YAML (fx,fy,cx,cy,dist)")
     parser.add_argument("--family", default="tag36h11")
     parser.add_argument("--continuous", action="store_true",
@@ -622,13 +763,16 @@ def main():
                         help="If |s-1|>tol, divide T_cam_board translation by s")
     parser.add_argument("--scale-tol", type=float, default=0.02,
                         help="Relative tolerance (default 0.02 = 2%)")
+    parser.add_argument("--bbox-mode", choices=["auto", "face", "object"], default="auto",
+                        help="Which 3D points drive the bbox: 'face' (4 corners), 'object' (all kps), or 'auto' (larger).")
+    parser.add_argument("--bbox-tag-mult", type=float, default=5.0,
+                        help="Multiplier for fallback tag-square (default 5.0; was hardcoded 3.0).")
+    parser.add_argument("--bbox-min-area", type=int, default=12000,
+                        help="If bbox area < this, use tag fallback (default 12000 px^2).")
+    parser.add_argument("--bbox-pad-frac", type=float, default=0.06,
+                        help="Pad final bbox by this fraction of its size (default 6%).")
 
     args = parser.parse_args()
-
-    # Logger
-    global log
-    log = init_project_logger(project_root / "logs" / "collect_gt_dataset.log",
-                              level="INFO", console=True)
 
     # Intrinsics
     calib_path = project_root / args.calib
@@ -665,9 +809,15 @@ def main():
 
     # Preload face keypoints for bbox projection
     pts3d_by_face: Dict[str, np.ndarray] = {}
+    pts3d_by_object: Dict[str, np.ndarray] = {}
+    _kpcache: Dict[str, tuple[dict, dict]] = {}
     for fk, fe in faces.items():
         try:
-            pts3d_dict, faces_map, _, _ = load_keypoints_fuzzy(fe.object_name, project_root)
+            if fe.object_name not in _kpcache:
+                pts3d_dict, faces_map, _, _ = load_keypoints_fuzzy(fe.object_name, project_root)
+                _kpcache[fe.object_name] = (pts3d_dict, faces_map)
+                pts3d_by_object[fe.object_name] = np.vstack([v for v in pts3d_dict.values()]).astype(np.float32)
+            pts3d_dict, faces_map = _kpcache[fe.object_name]
             if fk in faces_map:
                 names = faces_map[fk]
                 pts3d_by_face[fk] = np.vstack([pts3d_dict[n] for n in names]).astype(np.float32)
@@ -726,12 +876,19 @@ def main():
 
                 # estimate poses
                 anno, reproj, results = estimate_poses_multi(
-                    bgr, intr, args.family, faces, pts3d_by_face,
+                    bgr, intr, args.family, faces,
+                    pts3d_by_face=pts3d_by_face,
+                    pts3d_by_object=pts3d_by_object,
                     check_tag_scale=args.check_tag_scale,
                     auto_correct_scale=args.auto_correct_scale,
                     scale_tol=args.scale_tol,
                     axes_mode=args.axes,
+                    bbox_mode=args.bbox_mode,
+                    bbox_tag_mult=args.bbox_tag_mult,
+                    bbox_pad_frac=args.bbox_pad_frac,
+                    bbox_min_area=args.bbox_min_area,
                 )
+
                 last_anno, last_reproj = anno, reproj
                 last_bgr, last_depth, last_ts = bgr, depth, ts
                 last_results = results
