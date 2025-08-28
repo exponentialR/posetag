@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """
 annotate_shots.py
 =================
@@ -7,19 +6,25 @@ Interactive face annotator (single & batch) for the local project layout.
 What it does
 ------------
 Given a raw image and an AprilTag board definition, this tool:
-1) Loads camera intrinsics (from the shot's meta JSON or the manifest).
+1) Loads camera intrinsics (from the shot's meta JSON or shots/manifest.csv).
 2) Detects AprilTags to estimate the board pose T_cam_board.
-3) Lets the user select 4 face corners (drag-quad or any-4 mode).
-4) Solves PnP against the object's 3D keypoints to get T_cam_object and
+3) Lets you select 4 face corners (drag-quad or any-4 mode).
+4) Solves PnP against the object's 3D keypoints to recover T_cam_object and
    computes T_board_object = inv(T_cam_board) @ T_cam_object.
-5) Writes a YAML with the transform and diagnostics, and saves review images.
+5) Saves review images and a YAML per face with transforms & diagnostics.
+6) Builds/updates faces/face_manifest.csv by scanning faces/*/*_T_board_object.yaml.
+   - Adds new/updated faces (including tag_size_m).
+   - Removes entries for YAMLs that were deleted offline.
 
 Outputs
 -------
 - YAML: faces/<object>/sideA|B|C|D/<face_key>_T_board_object.yaml
-- Images next to the raw:
+- Images (next to the raw):
     *_ann.png     (projection of face & other keypoints)
     *_reproj.png  (all keypoints reprojection view)
+- Faces manifest (auto-maintained):
+    faces/face_manifest.csv with columns:
+      timestamp, object, side, face_key, yaml_path, board_yaml, image, rms_px, tag_size_m
 
 Project layout
 --------------
@@ -27,24 +32,29 @@ Project layout
   meshes/...
   objects/<object>/keypoints.json
   faces/<object>/sideA|B|C|D/<face_key>_T_board_object.yaml     # OUTPUT HERE
+  faces/face_manifest.csv                                       # auto-created/updated
   shots/
-    manifest.csv                                                 # source of truth
-    <object>/<side>/..._raw.png, ..._ann.png, ..._meta.json      # inputs/optional outputs
-  boards/<object>_sideX.yaml                                     # board files (absolute or relative)
+    manifest.csv                                                 # source of truth for shots
+    <object>/<side>/..._raw.png, ..._ann.png, ..._meta.json
+  boards/<object>_sideX.yaml                                    # AprilTag board files
 
-Manifest (CSV)
---------------
-Expected headers (minimally used):
+Manifests
+---------
+Shots manifest (CSV) – minimally used fields:
   timestamp, object_base, object_full, side, face_yaml,
-  path_raw, path_ann, path_meta, width, height, fx, fy, cx, cy, ...
-Required: face_yaml, path_raw (and optionally path_meta), and camera intrinsics.
+  path_raw, path_ann, path_meta, width, height, fx, fy, cx, cy
+Required: face_yaml, path_raw (and/or path_meta), and camera intrinsics.
+
+Faces manifest (CSV) – auto-maintained by this tool:
+  timestamp (from YAML mtime), object, side, face_key, yaml_path,
+  board_yaml, image, rms_px, tag_size_m
 
 Modes
 -----
 1) Single shot
    python -m src.annotate_shots --shot /abs/path/to/..._raw.png
 
-2) Batch: latest per face from manifest
+2) Batch: latest per face from shots manifest
    python -m src.annotate_shots --batch latest
    (optional) --object-filter connection_plate --side A --force --pts-type {quad|any}
 
@@ -69,8 +79,11 @@ Annotation view:
 
 Notes
 -----
-- UI auto-sizes to content; long paths/tips/log lines are wrapped/ellipsized for readability.
-- No changes to annotation math or on-disk formats versus previous tool.
+- --check-tag-scale prints inter-tag scale ratio s; --auto-correct-scale divides
+  T_cam_board translation by s when |s-1| > --scale-tol (default 0.02).
+- UI auto-sizes and wraps/ellipsizes long paths/tips/log lines for readability.
+- RMS reprojection error is shown during review; written into the YAML.
+- Logs: <project_root>/logs/annotate_faces.log
 
 Dependencies
 ------------
@@ -82,12 +95,14 @@ OpenCV, numpy, PyYAML, pupil-apriltags (for detect_tags), and project utils:
 
 from __future__ import annotations
 import argparse, csv, json, os, sys, itertools
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import cv2, yaml
+from datetime import datetime
 
 from utils.logger import init_project_logger
 from utils.project_config import resolve_project_root, ensure_project_dirs
@@ -98,21 +113,23 @@ from utils.annotation_utils import (
 
 EXIT_QUIT_ALL = 99
 import logging
+
 UI_LOG: list[str] = []
 log: logging.Logger  # global
 
 _PILL = {
-    "ok":   ((224,245,228), (35,120,55)),
-    "warn": ((241,225,201), (110,85,45)),
-    "info": ((229,238,249), (70,95,160)),
+    "ok": ((224, 245, 228), (35, 120, 55)),
+    "warn": ((241, 225, 201), (110, 85, 45)),
+    "info": ((229, 238, 249), (70, 95, 160)),
 }
 
-UI_H        = 720
-UI_W_LEFT   = 820   # was 860
-UI_W_MID    = 520   # was 380  ← Faces list wider
-UI_W_RIGHT  = 480
-UI_WIN_H    = 820
-UI_WIN_W    = UI_W_LEFT + UI_W_MID + UI_W_RIGHT
+UI_H = 720
+UI_W_LEFT = 820  # was 860
+UI_W_MID = 520  # was 380  ← Faces list wider
+UI_W_RIGHT = 480
+UI_WIN_H = 820
+UI_WIN_W = UI_W_LEFT + UI_W_MID + UI_W_RIGHT
+
 
 class UIBufferHandler(logging.Handler):
     def emit(self, record):
@@ -120,10 +137,13 @@ class UIBufferHandler(logging.Handler):
         UI_LOG.append(msg)
         if len(UI_LOG) > 200:
             del UI_LOG[:-200]
+
+
 # ------- text wrapping / ellipsis helpers (ASCII only) -------
 def _measure(text: str, scale=0.5, thk=1, font=cv2.FONT_HERSHEY_SIMPLEX):
     (tw, _), _ = cv2.getTextSize(text, font, scale, thk)
     return tw
+
 
 def _ellipsize_end(text: str, max_w: int, scale=0.5, thk=1):
     if _measure(text, scale, thk) <= max_w:
@@ -133,18 +153,20 @@ def _ellipsize_end(text: str, max_w: int, scale=0.5, thk=1):
         base = base[:-1]
     return (base + "...") if base else "..."
 
+
 def _ellipsize_middle(text: str, max_w: int, scale=0.5, thk=1):
     if _measure(text, scale, thk) <= max_w:
         return text
     left, right = 0, 0
     while True:
-        cand = text[:left] + "..." + text[len(text)-right:]
+        cand = text[:left] + "..." + text[len(text) - right:]
         if _measure(cand, scale, thk) <= max_w or (left + right) >= len(text):
             return cand if cand else "..."
         if (left <= right) and (left < len(text)):
             left += 1
         elif right < len(text):
             right += 1
+
 
 def _wrap_to_width(text: str, max_w: int, scale=0.5, thk=1):
     """
@@ -185,8 +207,8 @@ def _wrap_to_width(text: str, max_w: int, scale=0.5, thk=1):
 def _pill(text: str, kind: str = "info"):
     (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.48, 1)
     pad = 6
-    img = np.full((th + pad*2, tw + pad*2, 3), _PILL[kind][0], np.uint8)
-    cv2.putText(img, text, (pad, th + pad//2), cv2.FONT_HERSHEY_SIMPLEX, 0.48, _PILL[kind][1], 1, cv2.LINE_AA)
+    img = np.full((th + pad * 2, tw + pad * 2, 3), _PILL[kind][0], np.uint8)
+    cv2.putText(img, text, (pad, th + pad // 2), cv2.FONT_HERSHEY_SIMPLEX, 0.48, _PILL[kind][1], 1, cv2.LINE_AA)
     return img
 
 
@@ -200,7 +222,8 @@ def _right_column(project_root, it, args, height, w=480):
         f"Board YAML: {Path(it['board']).name if it['board'] else '-'}",
         "",
         ("Status"),
-        f"  ANN : {'OK' if it['ann_ok'] else 'MISSING'}" + (f"  (RMS {it['rms']:.2f}px)" if it.get('rms') is not None else ""),
+        f"  ANN : {'OK' if it['ann_ok'] else 'MISSING'}" + (
+            f"  (RMS {it['rms']:.2f}px)" if it.get('rms') is not None else ""),
         f"  KP  : {'OK' if it['kp_ok'] else 'missing'}",
         f"  BOARD: {'OK' if it['board_ok'] else 'missing'}",
         "",
@@ -221,7 +244,6 @@ def _right_column(project_root, it, args, height, w=480):
     tail = UI_LOG[-max_lines:] if UI_LOG else ["(no messages yet)"]
     bottom = _text_panel(tail, w=w, h=max(1, height - top_h))
     return np.vstack([top, bottom])
-
 
 
 def _infer_object_and_side(shot_raw_path: Path, meta_json: dict | None, row) -> tuple[str, str]:
@@ -255,6 +277,7 @@ def _infer_object_and_side(shot_raw_path: Path, meta_json: dict | None, row) -> 
         side = "X"
     return obj, side.upper()
 
+
 def _index_faces(project_root: Path, manifest: Path) -> List[dict]:
     rows = _read_manifest(manifest)
     latest = _latest_per_face(rows, object_filter=None, side=None)
@@ -279,12 +302,14 @@ def _index_faces(project_root: Path, manifest: Path) -> List[dict]:
     items.sort(key=lambda d: (d["object"], d["side"]))
     return items
 
+
 def _browse_and_annotate(project_root: Path, manifest: Path, args):
     cv2.namedWindow("Annotate", cv2.WINDOW_NORMAL)
 
     items = _index_faces(project_root, manifest)
     if not items:
-        log.debug("[i] Nothing in manifest to annotate."); return
+        log.debug("[i] Nothing in manifest to annotate.");
+        return
 
     i = 0
     while True:
@@ -303,7 +328,8 @@ def _browse_and_annotate(project_root: Path, manifest: Path, args):
         cv2.imshow("Annotate", strip)
 
         k = cv2.waitKeyEx(60) & 0xFFFFFFFF
-        if k in (ord('q'), 27): break
+        if k in (ord('q'), 27):
+            break
         elif k in (2490368, ord('w'), ord('W')):  # up
             i = (i - 1) % len(items)
         elif k in (2621440, ord('s'), ord('S')):  # down
@@ -318,7 +344,7 @@ def _browse_and_annotate(project_root: Path, manifest: Path, args):
             args.force = not args.force
         elif k in (ord('r'), ord('R')):
             items = _index_faces(project_root, manifest)
-            i = min(i, len(items)-1)
+            i = min(i, len(items) - 1)
         elif k in (13, 10):  # ENTER → annotate selection
             if it["ann_ok"] and not args.force:
                 log.info(f"[i] Skip (already annotated): {it['out_yaml']}")
@@ -336,8 +362,10 @@ def _browse_and_annotate(project_root: Path, manifest: Path, args):
                 it["ann_ok"] = it["out_yaml"].exists()
                 it["rms"] = _load_rms_if_any(it["out_yaml"]) if it["ann_ok"] else None
             except SystemExit as e:
-                if str(e) == "Aborted.": pass
-                else: log.error(e)
+                if str(e) == "Aborted.":
+                    pass
+                else:
+                    log.error(e)
             except BaseException as e:
                 log.error(f"[!] Error: {e}")
     cv2.destroyAllWindows()
@@ -380,6 +408,111 @@ class ShotRow:
     fy: Optional[float]
     cx: Optional[float]
     cy: Optional[float]
+
+
+# -------------------------- Faces manifest (CSV) --------------------------
+
+@dataclass
+class FaceManifestRow:
+    timestamp: str  # ISO time from YAML file mtime
+    object: str
+    side: str  # A|B|C|D
+    face_key: str
+    yaml_path: str  # path to *_T_board_object.yaml (prefer relative to project_root)
+    board_yaml: str
+    image: str
+    rms_px: Optional[float]
+    tag_size_m: Optional[float] = None  # <-- NEW (default keeps older call sites safe)
+
+
+def _face_manifest_path(project_root: Path) -> Path:
+    return project_root / "faces" / "face_manifest.csv"
+
+
+def _side_from_face_key(face_key: str) -> str:
+    m = re.search(r"_side([ABCD])", face_key, re.IGNORECASE)
+    return m.group(1).upper() if m else "X"
+
+
+def _scan_face_yamls(project_root: Path) -> List[FaceManifestRow]:
+    rows: List[FaceManifestRow] = []
+    root = project_root / "faces"
+    if not root.exists():
+        return rows
+
+    for y in root.glob("*/*/*_T_board_object.yaml"):
+        try:
+            data = yaml.safe_load(open(y, "r"))
+            obj = str(data.get("object", "")).strip()
+            face_key = str(data.get("face_key", "")).strip() or (y.stem.replace("_T_board_object", ""))
+            side = _side_from_face_key(face_key)
+            board_yaml = str(data.get("board_yaml", "")).strip()
+            image = str(data.get("image", "")).strip()
+            rms = data.get("rms_px", None)
+
+            # --- tag_size_m: prefer diagnostics, else load board
+            tag_size_m = None
+            diag = data.get("diagnostics", {}) or {}
+            ts_mm = diag.get("board_tag_size_mm", None)
+            if ts_mm is not None:
+                try:
+                    tag_size_m = float(ts_mm) / 1000.0
+                except Exception:
+                    tag_size_m = None
+            if (tag_size_m is None) and board_yaml:
+                by = Path(board_yaml)
+                if not by.is_absolute():
+                    by = (project_root / by).resolve()
+                try:
+                    _origin_id, ts_m, _T_board_tag = load_board(by)
+                    tag_size_m = float(ts_m)
+                except Exception:
+                    pass
+
+            ts = datetime.fromtimestamp(y.stat().st_mtime).isoformat(timespec="seconds")
+            try:
+                yaml_rel = str(y.relative_to(project_root))
+            except Exception:
+                yaml_rel = str(y)
+
+            rows.append(FaceManifestRow(
+                timestamp=ts, object=obj, side=side, face_key=face_key,
+                yaml_path=yaml_rel, board_yaml=board_yaml, image=image,
+                rms_px=(float(rms) if rms is not None else None),
+                tag_size_m=tag_size_m
+            ))
+        except Exception as e:
+            if 'log' in globals():
+                log.warning(f"[faces-manifest] Skip bad YAML {y}: {e}")
+
+    rows.sort(key=lambda r: (r.object, r.side, r.face_key))
+    return rows
+
+
+def _write_face_manifest(csv_path: Path, rows: List[FaceManifestRow]) -> None:
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
+    with csv_path.open("w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow([
+            "timestamp", "object", "side", "face_key", "yaml_path",
+            "board_yaml", "image", "rms_px", "tag_size_m"  # <-- include
+        ])
+        for r in rows:
+            w.writerow([
+                r.timestamp, r.object, r.side, r.face_key, r.yaml_path,
+                r.board_yaml, r.image,
+                ("" if r.rms_px is None else f"{r.rms_px:.6f}"),
+                ("" if r.tag_size_m is None else f"{r.tag_size_m:.6f}")  # <-- include
+            ])
+
+
+def _sync_face_manifest(project_root: Path) -> None:
+    """Rebuild faces/face_manifest.csv from disk state (authoritative = YAML files)."""
+    rows = _scan_face_yamls(project_root)
+    path = _face_manifest_path(project_root)
+    _write_face_manifest(path, rows)
+    if 'log' in globals():
+        log.info(f"[faces-manifest] Wrote {path} ({len(rows)} faces)")
 
 
 def _read_manifest(path: Path) -> List[ShotRow]:
@@ -456,11 +589,11 @@ def _hstack(L, M=None, R=None):
     return np.hstack([l, m, r])
 
 
-def _text_panel(lines: List[str], w=380, h=720, scale=0.5, thk=1, color=(240,240,240)):
+def _text_panel(lines: List[str], w=380, h=720, scale=0.5, thk=1, color=(240, 240, 240)):
     """Draws a list of strings with wrapping and end/middle ellipses as needed."""
     img = np.full((h, w, 3), 18, np.uint8)
     y = 24
-    line_h = int(round(20 * max(0.8, scale/0.5)))  # keep spacing nice if scale changes
+    line_h = int(round(20 * max(0.8, scale / 0.5)))  # keep spacing nice if scale changes
     for ln in lines:
         wrapped = _wrap_to_width(ln, w - 18, scale, thk)
         for piece in wrapped:
@@ -469,7 +602,6 @@ def _text_panel(lines: List[str], w=380, h=720, scale=0.5, thk=1, color=(240,240
             cv2.putText(img, piece, (10, y), cv2.FONT_HERSHEY_SIMPLEX, scale, color, thk, cv2.LINE_AA)
             y += line_h
     return img
-
 
 
 def _help_panel(mode: str, h: int):
@@ -501,6 +633,7 @@ def _show_dash(L, M, R, banner=""):
     except Exception:
         pass
     cv2.imshow("Annotate", strip)
+
 
 # -------------------------- Annotation widgets --------------------------
 
@@ -643,7 +776,8 @@ def _collect_any4(image_bgr, mid_img=None, right_img=None):
         nonlocal cur, last_flags;
         last_flags = flags
         if event == cv2.EVENT_MOUSEMOVE:
-            cur = (float(x), float(y)); draw()
+            cur = (float(x), float(y));
+            draw()
         elif event == cv2.EVENT_LBUTTONDOWN and len(pts) < 4:
             p = (float(x), float(y))
             if pts: p = snap(pts[-1], p, flags)
@@ -701,17 +835,19 @@ def _review(anno_img, reproj_img, rms):
 
 def _render_list_faces(h, w, title, items, sel):
     pan = np.full((h, w, 3), 245, np.uint8)
-    cv2.putText(pan, title, (12, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (35,35,35), 2, cv2.LINE_AA)
-    max_show = min(22, len(items)); start = max(0, min(sel - max_show//2, max(0, len(items)-max_show)))
+    cv2.putText(pan, title, (12, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (35, 35, 35), 2, cv2.LINE_AA)
+    max_show = min(22, len(items));
+    start = max(0, min(sel - max_show // 2, max(0, len(items) - max_show)))
     y = 56
-    for i in range(start, start+max_show):
+    for i in range(start, start + max_show):
         if i >= len(items): break
         it = items[i]
 
         # build right-aligned chips
         chips = []
         if it["ann_ok"]:
-            chips.append(_pill(f"RMS {it['rms']:.2f}px", "info") if it.get("rms") is not None else _pill("ANN OK", "ok"))
+            chips.append(
+                _pill(f"RMS {it['rms']:.2f}px", "info") if it.get("rms") is not None else _pill("ANN OK", "ok"))
         else:
             chips.append(_pill("no ann", "warn"))
         chips.append(_pill("BOARD", "ok" if it["board_ok"] else "warn"))
@@ -719,20 +855,22 @@ def _render_list_faces(h, w, title, items, sel):
 
         x = w - 12
         for c in reversed(chips):
-            ch, cw = c.shape[:2]; x -= (cw + 6)
-            pan[y-16:y-16+ch, x:x+cw] = c
+            ch, cw = c.shape[:2];
+            x -= (cw + 6)
+            pan[y - 16:y - 16 + ch, x:x + cw] = c
 
         avail = x - 14
         base_name = f"{it['object']}  side{it['side']}"
         name = base_name
-        (tw, th), _ = cv2.getTextSize("> "+name, cv2.FONT_HERSHEY_SIMPLEX, 0.78, 2)
+        (tw, th), _ = cv2.getTextSize("> " + name, cv2.FONT_HERSHEY_SIMPLEX, 0.78, 2)
         while tw > avail and len(name) > 3:
             name = name[:-4] + "..."
-            (tw, th), _ = cv2.getTextSize("> "+name, cv2.FONT_HERSHEY_SIMPLEX, 0.78, 2)
-        col = (20,70,180) if i==sel else (30,30,30); thk = 2 if i==sel else 1
-        cv2.putText(pan, ("> " if i==sel else "  ") + name, (14, y), cv2.FONT_HERSHEY_SIMPLEX, 0.78, col, thk, cv2.LINE_AA)
+            (tw, th), _ = cv2.getTextSize("> " + name, cv2.FONT_HERSHEY_SIMPLEX, 0.78, 2)
+        col = (20, 70, 180) if i == sel else (30, 30, 30);
+        thk = 2 if i == sel else 1
+        cv2.putText(pan, ("> " if i == sel else "  ") + name, (14, y), cv2.FONT_HERSHEY_SIMPLEX, 0.78, col, thk,
+                    cv2.LINE_AA)
         y += 30
-
 
     tips = "UP/DOWN or W/S select   ENTER annotate   A pts   C auto-scale   T check   F force   R reload   Q quit"
     tips_lines = _wrap_to_width(tips, w - 24, scale=0.46, thk=1)
@@ -750,12 +888,12 @@ def _render_raw_thumb(path: Path, target_h=UI_H, target_w=UI_W_LEFT):
     if img is None:
         return np.full((target_h, target_w, 3), 32, np.uint8)
     h, w = img.shape[:2]
-    scale = min(target_w/w, target_h/h)
-    nw, nh = max(1, int(w*scale)), max(1, int(h*scale))
+    scale = min(target_w / w, target_h / h)
+    nw, nh = max(1, int(w * scale)), max(1, int(h * scale))
     vis = cv2.resize(img, (nw, nh), interpolation=cv2.INTER_AREA)
     out = np.full((target_h, target_w, 3), 22, np.uint8)
     out[:nh, :nw] = vis
-    cv2.putText(out, Path(path).name, (12, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,255), 2, cv2.LINE_AA)
+    cv2.putText(out, Path(path).name, (12, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2, cv2.LINE_AA)
     return out
 
 
@@ -792,8 +930,8 @@ def _load_K_and_face(project_root: Path, meta_path: Path, row) -> tuple[np.ndarr
 
 def annotate_single_shot(project_root: Path, shot_raw_path: Path, *,
                          pts_type: str = "quad", calib: Optional[str] = None,
-                         check_tag_scale:bool=False, auto_correct_scale:bool=False,
-                         scale_tol: float=0.02) -> Path:
+                         check_tag_scale: bool = False, auto_correct_scale: bool = False,
+                         scale_tol: float = 0.02) -> Path:
     if not shot_raw_path.exists():
         raise SystemExit(f"[!] Shot not found: {shot_raw_path}")
     if not shot_raw_path.name.endswith("_raw.png"):
@@ -817,7 +955,6 @@ def annotate_single_shot(project_root: Path, shot_raw_path: Path, *,
     # Infer object + side robustly
     obj, side_letter = _infer_object_and_side(shot_raw_path, meta_json, row)
     face_key = Path(face_yaml_path).stem
-
 
     img_ann = (meta_json.get("image") or {}).get("path_ann") or (
         row.path_ann if row and row.path_ann else str(shot_raw_path).replace("_raw.png", "_ann.png"))
@@ -857,7 +994,9 @@ def annotate_single_shot(project_root: Path, shot_raw_path: Path, *,
         T_cam_tag = se3(d.pose_R.astype(float), d.pose_t.reshape(3).astype(float))
         T_tag_board = inv_se3(T_board_tag[tid])
         T_cam_board = T_cam_tag @ T_tag_board
-    s = 1.0; n_pairs = 0; mad = 0.0
+    s = 1.0;
+    n_pairs = 0;
+    mad = 0.0
 
     if check_tag_scale or auto_correct_scale:
         s, n_pairs, mad = _estimate_tag_scale(det_by_id, T_board_tag)
@@ -952,10 +1091,10 @@ def annotate_single_shot(project_root: Path, shot_raw_path: Path, *,
         "assignment": {n: [float(mapping[n][0]), float(mapping[n][1])] for n in names_in_order},
         "notes": "Accepted.",
         "diagnostics": {
-        "board_tag_size_mm": float(tag_size_m * 1000.0),
-        "tag_scale_ratio": float(s),
-        "tag_scale_pairs": int(n_pairs),
-        "tag_scale_auto_corrected": bool(auto_correct_scale and abs(s - 1.0) > scale_tol),
+            "board_tag_size_mm": float(tag_size_m * 1000.0),
+            "tag_scale_ratio": float(s),
+            "tag_scale_pairs": int(n_pairs),
+            "tag_scale_auto_corrected": bool(auto_correct_scale and abs(s - 1.0) > scale_tol),
         },
     }
     log.info("RMS=%.2f px  (%s)", rms, face_key)
@@ -964,6 +1103,17 @@ def annotate_single_shot(project_root: Path, shot_raw_path: Path, *,
 
     log.info(f"[i] Wrote {out_yaml}")
     cv2.destroyAllWindows()
+    log.info(f"[i] Wrote {out_yaml}")
+
+    # Keep faces manifest in sync with disk (adds new/updated, prunes deleted)
+    try:
+        _sync_face_manifest(project_root)
+    except Exception as e:
+        log.warning(f"[faces-manifest] Sync after save failed: {e}")
+
+    cv2.destroyAllWindows()
+    return out_yaml
+
     return out_yaml
 
 
@@ -1007,9 +1157,11 @@ def main():
     parser.add_argument("--calib", type=str, default=None, help="Optional ChArUco calib yaml for distortion.")
     parser.add_argument("--dry-run", action="store_true", help="List actions then exit.")
     parser.add_argument("--check-tag-scale", action="store_true", help="Print scale ratio s from inter-tag distances.")
-    parser.add_argument("--auto-correct-scale", action="store_true", help="If |s-1|>tol, divide T_cam_board translation by s.")
+    parser.add_argument("--auto-correct-scale", action="store_true",
+                        help="If |s-1|>tol, divide T_cam_board translation by s.")
     parser.add_argument("--scale-tol", type=float, default=0.02, help="Relative tolerance (default 0.02 = 2%).")
-    parser.add_argument("--browse", action="store_true", help = "Interactive browser (arrow keys + ENTER) to pick which face to annotate.")
+    parser.add_argument("--browse", action="store_true",
+                        help="Interactive browser (arrow keys + ENTER) to pick which face to annotate.")
 
     args = parser.parse_args()
 
@@ -1017,12 +1169,20 @@ def main():
     ensure_project_dirs(project_root)
 
     global log
-    log = init_project_logger(project_root / "logs" / "annotate_faces.log",
+    log = init_project_logger(project_root / "logs" / "annotate_shots.log",
                               level="INFO", console=True)
     uih = UIBufferHandler()
     uih.setFormatter(logging.Formatter("[%(asctime)s] %(levelname)s: %(message)s",
                                        datefmt="%H:%M:%S"))
     log.addHandler(uih)
+    # Always rebuild the faces manifest from current on-disk YAMLs.
+    # - Creates if missing and faces exist
+    # - Updates timestamps/RMS on changed files
+    # - Removes rows for YAMLs deleted offline
+    try:
+        _sync_face_manifest(project_root)
+    except Exception as e:
+        log.warning(f"[faces-manifest] Initial sync failed: {e}")
 
     if args.browse:
         manifest = Path(args.manifest) if args.manifest else (project_root / "shots" / "manifest.csv")
@@ -1033,7 +1193,9 @@ def main():
         return
     elif args.shot:
         try:
-            annotate_single_shot(project_root, Path(args.shot), pts_type=args.pts_type, calib=args.calib, check_tag_scale=args.check_tag_scale, auto_correct_scale=args.auto_correct_scale, scale_tol=args.scale_tol)
+            annotate_single_shot(project_root, Path(args.shot), pts_type=args.pts_type, calib=args.calib,
+                                 check_tag_scale=args.check_tag_scale, auto_correct_scale=args.auto_correct_scale,
+                                 scale_tol=args.scale_tol)
 
         except SystemExit as e:
             # pass through normal abort; keep exit code 1 for errors
@@ -1076,7 +1238,9 @@ def main():
             log.info(f"[i] Skip (already done): {out_yaml}")
             continue
         try:
-            annotate_single_shot(project_root, Path(r.path_raw), pts_type=args.pts_type, calib=args.calib, check_tag_scale=args.check_tag_scale, auto_correct_scale=args.auto_correct_scale, scale_tol=args.scale_tol)
+            annotate_single_shot(project_root, Path(r.path_raw), pts_type=args.pts_type, calib=args.calib,
+                                 check_tag_scale=args.check_tag_scale, auto_correct_scale=args.auto_correct_scale,
+                                 scale_tol=args.scale_tol)
 
 
         except SystemExit as e:
@@ -1087,6 +1251,7 @@ def main():
             continue
         except BaseException as e:
             log.error("Error on %s: %s", r.path_raw, e)
+
 
 if __name__ == "__main__":
     main()
