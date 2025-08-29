@@ -1,4 +1,8 @@
 # GT-6DoF-ATag
+![License](https://img.shields.io/github/license/roboticslab-uc3m/GT-6DoF-ATag) ![Python](https://img.shields.io/badge/python-3.7%2B-blue) ![OpenCV](https://img.shields.io/badge/opencv-4.5%2B-green) ![NumPy](https://img.shields.io/badge/numpy-1.19%2B-yellow) ![PyPI](https://img.shields.io/pypi/v/opencv-contrib-python) ![PyPI](https://img.shields.io/pypi/v/pyrealsense2)
+![PyPI](https://img.shields.io/pypi/v/apriltag)
+![System Overview](media/Screenshot%20from%202025-08-28%2011-06-45.png)
+
 Utilities and scripts to generate ground-truth 6-DoF object poses from RGB using AprilTags and Intel RealSense (D435i).
 Designed for training RGB-only pose networks (e.g., ConPose) in pick-and-place / assembly scenarios.
 ## What this repo is for
