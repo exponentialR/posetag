@@ -3,8 +3,55 @@ from typing import Dict, List
 import math
 import numpy as np
 import cv2, sys, os
+import time
 
 
+def _dominant_color_near_polygon(bgr: np.ndarray, uv: np.ndarray) -> tuple[int,int,int]:
+    """
+    Pick a stable, object-like color from pixels under the projected tag quad.
+    Returns a BGR tuple.
+    """
+    mask = np.zeros(bgr.shape[:2], np.uint8)
+    pts = np.int32(uv.reshape(-1, 1, 2))
+    cv2.fillConvexPoly(mask, pts, 255)
+    # Erode a bit so we avoid black tag border / background bleed
+    mask = cv2.erode(mask, np.ones((3,3), np.uint8), iterations=1)
+    sel = bgr[mask > 0]
+    if sel.size == 0:
+        return (0, 255, 255)  # fallback: yellow
+
+    # Use median (robust to highlights/shadows)
+    med = np.median(sel, axis=0).astype(np.uint8)  # BGR
+
+    # Punch up saturation a little so it reads well on video
+    hsv = cv2.cvtColor(med.reshape(1,1,3), cv2.COLOR_BGR2HSV).reshape(3)
+    H, S, V = int(hsv[0]), int(hsv[1]), int(hsv[2])
+    S = max(S, 140)          # ensure some saturation
+    V = min(max(V, 90), 230) # keep within display-friendly range
+    out = cv2.cvtColor(np.uint8([[[H, S, V]]]), cv2.COLOR_HSV2BGR).reshape(3)
+    return (int(out[0]), int(out[1]), int(out[2]))  # B,G,R
+
+def _draw_tag_quad(img: np.ndarray, uv: np.ndarray, color_bgr: tuple[int,int,int]):
+    """Draw a visible quad (black under-stroke + colored over-stroke)."""
+    pts = np.int32(uv.reshape(-1,1,2))
+    cv2.polylines(img, [pts], True, (0,0,0), 4, cv2.LINE_AA)      # outline
+    cv2.polylines(img, [pts], True, color_bgr, 2, cv2.LINE_AA)    # colored stroke
+
+
+
+def _ts_tag_from_epoch(ts:float) -> str:
+    """Convert epoch timestamp to a compact string suitable for tag IDs."""
+    return time.strftime("%Y%m%d-%H%M%S", time.localtime(ts))
+
+def _map_class_id_and_name(object_name: str) -> tuple[int, str]:
+    n = object_name.lower()
+    if "connection_plate" in n or ("connection" in n and "plate" in n):
+        return 2, "connection_plate"
+    if "full_assembly" in n or ("full" in n and "assembly" in n):
+        return 3, "full_assembly"
+    if "column" in n:
+        return 1, "column"
+    return 0, object_name  # fallback: keep original name
 
 def rpy_from_R(R: np.ndarray) -> tuple[float,float,float]:
     sy = math.sqrt(R[0,0]**2 + R[1,0]**2)
