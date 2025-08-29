@@ -1002,8 +1002,8 @@ def main():
                         help="If bbox area < this, use tag fallback (default 12000 px^2).")
     parser.add_argument("--bbox-pad-frac", type=float, default=0.06,
                         help="Pad final bbox by this fraction of its size (default 6%).")
-    parser.add_argument("--tag-cover-margin-m", type=float, default=0.015)
-    parser.add_argument("--tag-sample-extra-m", type=float, default=0.015)
+    parser.add_argument("--tag-cover-margin-m", type=float, default=0.010)
+    parser.add_argument("--tag-sample-extra-m", type=float, default=0.008)
 
     args = parser.parse_args()
 
