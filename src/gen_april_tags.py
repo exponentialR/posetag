@@ -1,4 +1,40 @@
-#!/usr/bin/env python3
+"""
+Generate printable AprilTag 36h11 sheets (PNG + PDF) with grid-based auto layout.
+
+Features
+--------
+- Supports A4 / Letter / Legal (or custom paper via --paper-mm).
+- Tag size in millimetres with high-DPI rendering (default 600 DPI).
+- Labelled tags ("AprilTag 36h11 | ID <id> | <size> mm") using OpenCV text
+  or Pillow text if available (Pillow also enables PDF output).
+- Project-aware output: with --project_root, initializes a standard folder
+  layout (<root>/{boards,shots,objects,datasets}) and defaults outputs to
+  <root>/boards/patterns/ unless --out_dir is explicitly set.
+
+Typical usage
+-------------
+# Comma list of IDs
+python -m src.gen_april_tags --project_root my_proj --tag-size-mm 60 --ids 40,41,42
+
+# Hyphen range of IDs
+python -m src.gen_april_tags --project_root my_proj --tag-size-mm 60 --ids 40-55
+
+# Classic range flags (equivalent to 40-55)
+python -m src.gen_april_tags --project_root my_proj --tag-size-mm 60 --id_start 40 --id_end 55
+
+Outputs
+-------
+- <out_dir> / apriltag_36h11_IDs<idlist>_<size>mm_<paper>_<dpi>dpi.png
+- <out_dir> / apriltag_36h11_IDs<idlist>_<size>mm_<paper>_<dpi>dpi.pdf   (if Pillow available)
+
+Notes
+-----
+- Print at 100% (“Actual size”) to preserve the requested tag side length in mm.
+- If more IDs are requested than fit on one page, the list is truncated to capacity.
+- When --project_root is used and --out_dir is not given, files go to
+  <project_root>/boards/patterns/. Otherwise, --out_dir defaults to 'apriltags_out'.
+"""
+
 import os
 import sys
 from pathlib import Path
@@ -6,11 +42,14 @@ from utils.project_config import resolve_project_root, ensure_project_dirs
 import argparse
 import cv2
 import numpy as np
+import textwrap
+import argparse
 
 # ---------- Optional Pillow (for nicer text + PDF) ----------
 USE_PIL_TEXT_DEFAULT = False
 try:
     from PIL import Image, ImageDraw, ImageFont
+
     HAVE_PIL = True
 except Exception:
     HAVE_PIL = False
@@ -19,8 +58,8 @@ except Exception:
 # ---------- Paper presets (mm) ----------
 PAPER_MM = {
     "A4": (210.0, 297.0),
-    "LETTER": (215.9, 279.4),   # 8.5 x 11 in
-    "LEGAL": (215.9, 355.6),    # 8.5 x 14 in
+    "LETTER": (215.9, 279.4),  # 8.5 x 11 in
+    "LEGAL": (215.9, 355.6),  # 8.5 x 14 in
 }
 
 # ---------- Defaults / tuning ----------
@@ -33,11 +72,14 @@ DEFAULT_LABEL_GAP_FRAC = 0.05
 LABEL_FONT_SCALE = 1.5
 LABEL_THICKNESS = 6
 
+
 def mm_to_px(mm: float, dpi: int) -> int:
     return int(round(mm / 25.4 * dpi))
 
+
 def px_to_mm(px: int, dpi: int) -> float:
     return px * 25.4 / dpi
+
 
 def make_tag_bitmap(tag_id: int, side_mm: float, dpi: int) -> np.ndarray:
     side_px = mm_to_px(side_mm, dpi)
@@ -48,16 +90,26 @@ def make_tag_bitmap(tag_id: int, side_mm: float, dpi: int) -> np.ndarray:
         tag = cv2.aruco.drawMarker(dic, tag_id, side_px)
     return tag  # uint8
 
+class _HelpFormatter(argparse.ArgumentDefaultsHelpFormatter,
+                     argparse.RawDescriptionHelpFormatter):
+    """
+    Show defaults and preserve newlines/indentation in the docstring.
+    """
+    pass
+
+
 def estimate_label_size_cv(text: str):
     font = cv2.FONT_HERSHEY_SIMPLEX
     (tw, th), base = cv2.getTextSize(text, font, LABEL_FONT_SCALE, LABEL_THICKNESS)
     return tw, th, base
 
+
 def draw_label_cv(img, xc, y_top, text):
     font = cv2.FONT_HERSHEY_SIMPLEX
     (tw, th), base = cv2.getTextSize(text, font, LABEL_FONT_SCALE, LABEL_THICKNESS)
-    org = (int(xc - tw/2), int(y_top + th))
-    cv2.putText(img, text, org, font, LABEL_FONT_SCALE, (0,0,0), LABEL_THICKNESS, cv2.LINE_AA)
+    org = (int(xc - tw / 2), int(y_top + th))
+    cv2.putText(img, text, org, font, LABEL_FONT_SCALE, (0, 0, 0), LABEL_THICKNESS, cv2.LINE_AA)
+
 
 def draw_label_pil(img_rgb, xc, y_top, text):
     pil_img = Image.fromarray(img_rgb)
@@ -67,8 +119,9 @@ def draw_label_pil(img_rgb, xc, y_top, text):
     except Exception:
         font = ImageFont.load_default()
     tw = draw.textlength(text, font=font)
-    draw.text((int(xc - tw/2), int(y_top)), text, fill=(0,0,0), font=font)
+    draw.text((int(xc - tw / 2), int(y_top)), text, fill=(0, 0, 0), font=font)
     return np.array(pil_img)
+
 
 def compute_grid(W, H, margin, tag_px, label_gap_px, use_pil_text):
     """
@@ -77,7 +130,7 @@ def compute_grid(W, H, margin, tag_px, label_gap_px, use_pil_text):
     We use a small padding around each cell derived from tag size.
     """
     # Conservative paddings
-    top_gap = int(DEFAULT_TOP_GAP_FRAC * (H - 2*margin) / 3)  # scales with page height
+    top_gap = int(DEFAULT_TOP_GAP_FRAC * (H - 2 * margin) / 3)  # scales with page height
     side_pad = max(8, int(0.02 * tag_px))
     bottom_pad = max(8, int(0.02 * tag_px))
 
@@ -90,12 +143,13 @@ def compute_grid(W, H, margin, tag_px, label_gap_px, use_pil_text):
         _, th, base = estimate_label_size_cv(sample_text)
         label_h = th + base
 
-    cell_w = tag_px + 2*side_pad
+    cell_w = tag_px + 2 * side_pad
     cell_h = top_gap + tag_px + label_gap_px + label_h + bottom_pad
 
-    cols = max(0, (W - 2*margin) // cell_w)
-    rows = max(0, (H - 2*margin) // cell_h)
+    cols = max(0, (W - 2 * margin) // cell_w)
+    rows = max(0, (H - 2 * margin) // cell_h)
     return cols, rows, top_gap, side_pad, label_h
+
 
 def make_canvas(paper_w_mm, paper_h_mm, dpi):
     W = mm_to_px(paper_w_mm, dpi)
@@ -103,17 +157,18 @@ def make_canvas(paper_w_mm, paper_h_mm, dpi):
     sheet = np.full((H, W, 3), 255, dtype=np.uint8)
     return sheet, W, H
 
+
 def layout_sheet(
-    paper_w_mm: float,
-    paper_h_mm: float,
-    dpi: int,
-    tag_size_mm: float,
-    ids,
-    prefix: str,
-    out_dir: str,
-    use_pil_text: bool,
-    margin_frac: float,
-    label_gap_frac: float,
+        paper_w_mm: float,
+        paper_h_mm: float,
+        dpi: int,
+        tag_size_mm: float,
+        ids,
+        prefix: str,
+        out_dir: str,
+        use_pil_text: bool,
+        margin_frac: float,
+        label_gap_frac: float,
 ):
     os.makedirs(out_dir, exist_ok=True)
 
@@ -122,7 +177,7 @@ def layout_sheet(
 
     tag_gray = make_tag_bitmap(ids[0], tag_size_mm, dpi)
     tag_px = tag_gray.shape[0]
-    label_gap_px = int(label_gap_frac * ((H - 2*margin) // 3))
+    label_gap_px = int(label_gap_frac * ((H - 2 * margin) // 3))
 
     cols, rows, top_gap, side_pad, label_h = compute_grid(
         W, H, margin, tag_px, label_gap_px, use_pil_text
@@ -145,8 +200,8 @@ def layout_sheet(
 
     # Rebuild tag (to avoid resizing artefacts) and place
     tag_rgb_cache = {}
-    cell_w = (W - 2*margin) // max(1, cols)
-    cell_h = (H - 2*margin) // max(1, rows)
+    cell_w = (W - 2 * margin) // max(1, cols)
+    cell_h = (H - 2 * margin) // max(1, rows)
 
     y_tag_offset = top_gap
 
@@ -208,25 +263,10 @@ def layout_sheet(
         print("Saved:", png_path, "(install Pillow to also produce PDF)")
 
 
-    # Filenames
-    # paper_name = f"{int(round(paper_w_mm))}x{int(round(paper_h_mm))}mm"
-    png_path = os.path.join(
-        out_dir, f"{prefix}_{int(tag_size_mm)}mm_{paper_name}_{dpi}dpi.png"
-    )
-    cv2.imwrite(png_path, sheet)
-
-    if HAVE_PIL:
-        im = Image.fromarray(sheet)
-        pdf_path = os.path.join(out_dir, f"{prefix}_{int(tag_size_mm)}mm_{paper_name}.pdf")
-        im.save(pdf_path, "PDF", resolution=dpi)
-        print("Saved:", png_path, "and", pdf_path)
-    else:
-        print("Saved:", png_path, "(install Pillow to also produce PDF)")
-
 def parse_paper(paper: str, custom_mm: str | None, orientation: str):
     if custom_mm:
         try:
-            w_mm, h_mm = [float(x) for x in custom_mm.lower().replace("mm","").split("x")]
+            w_mm, h_mm = [float(x) for x in custom_mm.lower().replace("mm", "").split("x")]
         except Exception:
             sys.exit("Bad --paper-mm format. Use like: --paper-mm 210x297")
     else:
@@ -243,30 +283,65 @@ def parse_paper(paper: str, custom_mm: str | None, orientation: str):
 
     return w_mm, h_mm
 
+
 def build_id_list(start_id: int, end_id: int):
     if end_id < start_id:
         sys.exit("--id-end must be >= --id-start.")
     return list(range(start_id, end_id + 1))
 
+
+def _parse_ids_with_hyphens(ids_str: str) -> list[int]:
+    """
+    Parse a comma-separated list of IDs where tokens are either integers
+    or hyphen ranges 'a-b'. Returns a de-duplicated, order-preserving list.
+    """
+    ids: list[int] = []
+    seen = set()
+    for tok in (t.strip() for t in ids_str.split(",") if t.strip()):
+        if "-" in tok:
+            a_str, b_str = tok.split("-", 1)
+            a, b = int(a_str), int(b_str)
+            if b < a:
+                sys.exit(f"Bad range '{tok}': end < start")
+            for v in range(a, b + 1):
+                if v not in seen:
+                    ids.append(v);
+                    seen.add(v)
+        else:
+            v = int(tok)
+            if v not in seen:
+                ids.append(v);
+                seen.add(v)
+    if not ids:
+        sys.exit("No IDs parsed from --ids.")
+    return ids
+
+
 def parse_ids_arg(ids_str: str | None, start_id: int | None, end_id: int | None):
     if ids_str:
         try:
-            toks = [t.strip() for t in ids_str.split(",") if t.strip() != ""]
-            ids = [int(t) for t in toks]
+            return _parse_ids_with_hyphens(ids_str)
         except ValueError:
-            sys.exit("Bad --ids format. Use comma-separated integers, e.g., --ids 40,41,45,78,51")
-        if len(ids) == 0:
-            sys.exit("No IDs parsed from --ids.")
-        return ids
+            sys.exit("Bad --ids format. Use integers and hyphen ranges, e.g., '40,41,45' or '40-55'.")
     if start_id is not None and end_id is not None:
         return build_id_list(start_id, end_id)
-    sys.exit("Provide either --ids or both --id-start and --id-end.")
-
+    sys.exit("Provide either --ids or both --id_start and --id_end.")
 
 
 def main():
     ap = argparse.ArgumentParser(
         description="Generate printable AprilTag 36h11 sheets with auto grid and capacity checks."
+    )
+    DESC = __doc__ or "Generate printable AprilTag 36h11 sheets."
+
+    ap = argparse.ArgumentParser(
+        description=textwrap.dedent(DESC),
+        formatter_class=_HelpFormatter,
+        epilog=textwrap.dedent("""
+        Examples:
+          python -m src.gen_april_tags --project_root my_project --tag-size-mm 60 --ids 40-55
+          python -m src.gen_april_tags --tag-size-mm 60 --id_start 40 --id_end 55 --out_dir sheets
+        """),
     )
     ap.add_argument("--tag-size-mm", type=float, required=True,
                     help="Side length of tag in millimetres (e.g., 60)")
@@ -274,7 +349,7 @@ def main():
                     help="Paper preset: A4, LETTER, LEGAL (ignored if --paper-mm is provided)")
     ap.add_argument("--paper-mm", type=str, default=None,
                     help="Custom paper size WxH in millimetres (e.g., 210x297). Overrides --paper.")
-    ap.add_argument("--orientation", type=str, default="portrait", choices=["portrait","landscape"],
+    ap.add_argument("--orientation", type=str, default="portrait", choices=["portrait", "landscape"],
                     help="Paper orientation (default: portrait)")
     ap.add_argument("--dpi", type=int, default=DEFAULT_DPI, help=f"Rendering DPI (default: {DEFAULT_DPI})")
     ap.add_argument("--pil-text", action="store_true",
@@ -284,22 +359,22 @@ def main():
     ap.add_argument("--label-gap-frac", type=float, default=DEFAULT_LABEL_GAP_FRAC,
                     help=f"Fraction of cell height between tag and label. Default {DEFAULT_LABEL_GAP_FRAC:.2f}")
     ap.add_argument("--ids", type=str, default=None,
-                    help="Comma-separated list of specific IDs (e.g., 40,41,45,78,51). "
-                         "If given, overrides --id-start/--id-end.")
-    ap.add_argument("--id-start", type=int, help="First AprilTag ID (inclusive)")
-    ap.add_argument("--id-end", type=int, help="Last AprilTag ID (inclusive)")
-    ap.add_argument("--out-dir", type=str, default=DEFAULT_OUT_DIR,
+                    help="List of IDs or ranges. Examples: '40,41,45' or '40-55' or '10-15,21,33-36'. "
+                         "If given, overrides --id_start/--id_end.")
+    ap.add_argument("--id_start", type=int, help="First AprilTag ID (inclusive)")
+    ap.add_argument("--id_end", type=int, help="Last AprilTag ID (inclusive)")
+    ap.add_argument("--out_dir", type=str, default=DEFAULT_OUT_DIR,
                     help=f"Output directory (default: {DEFAULT_OUT_DIR})")
     ap.add_argument("--prefix", type=str, default=DEFAULT_PREFIX, help=f"Filename prefix (default: {DEFAULT_PREFIX})")
     ap.add_argument("--project_root", type=Path, default=None,
                     help="If set, initialise project layout and (when --out-dir is not given) save to <project_root>/boards/patterns")
 
-
     args = ap.parse_args()
     if args.project_root is not None:
-        pr = resolve_project_root(args.project_root); ensure_project_dirs(pr)  # boards/, shots/, objects/, datasets/
+        pr = resolve_project_root(args.project_root);
+        ensure_project_dirs(pr)  # boards/, shots/, objects/, datasets/
         if args.out_dir == DEFAULT_OUT_DIR:
-            args.out_dir= str(Path(pr) / "boards" / "patterns")
+            args.out_dir = str(Path(pr) / "boards" / "patterns")
 
     use_pil_text = bool(args.pil_text) and HAVE_PIL
     if args.pil_text and not HAVE_PIL:
@@ -323,6 +398,7 @@ def main():
     )
 
     print(f"Done. Open '{args.out_dir}/' and print at 100% (Actual size).")
+
 
 if __name__ == "__main__":
     main()

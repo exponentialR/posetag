@@ -22,22 +22,25 @@ A reproducible pipeline to convert AprilTags + a few clicks into high-quality 6-
 ---
 
 ## Quick start (scripts)
-
 ### 0) Generate AprilTags for printing
 
-Contiguous IDs
+Create printable **AprilTag 36h11** sheets to stick on object faces.
+Using `--project_root` also initializes the project and saves sheets to `<root>/boards/patterns/`.
+Outputs: **PNG** (and **PDF** if Pillow is installed). Print at **100%**—the black square edge = `--tag-size-mm`.
+
+**Range of IDs (inclusive)**
 
 ```bash
-python -m src.gen_april_tags --tag-size-mm 80 --id-start 46 --id-end 49 --pil-text
+python -m src.gen_april_tags --project_root my_project --tag-size-mm 80 --ids 46-49
 ```
 
-Non-contiguous IDs
+**Non-contiguous IDs**
 
 ```bash
-python -m src.gen_april_tags --tag-size-mm 40 --ids 19,20,21,22,27,28,29,30
+python -m src.gen_april_tags --project_root my_project --tag-size-mm 40 --ids 19,20,21,22,27,28,29,30
 ```
 
-> Print at the correct physical size. The **black square** edge = `--tag-size-mm`.
+<sub>Options you might tweak later: `--paper {A4,LETTER,LEGAL}` / `--paper-mm WxH`, `--orientation`, `--dpi`, `--out_dir`.</sub>
 
 ---
 
