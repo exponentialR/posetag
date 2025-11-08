@@ -45,7 +45,7 @@ python -m src.gen_april_tags --project_root my_project --tag-size-mm 40 --ids 19
 ---
 
 ### 1) Calibrate the colour camera (ChArUco)
-
+![calibration-grab](media/calibration.gif)
 SPACE to capture a sample; ENTER to solve. Outputs a `calib_color.yaml` (fx, fy, cx, cy, k1..k3, image size, RMS).
 With `--project_root`, output defaults to `<root>/calib/calib_color.yaml`.
 
