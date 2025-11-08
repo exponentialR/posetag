@@ -3,23 +3,32 @@ import numpy as np
 import cv2
 import pyrealsense2 as rs
 import os, datetime
+from pathlib import  Path
+
+try:
+    from utils.project_config import resolve_project_root, ensure_project_dirs
+except Exception:
+    resolve_project_root = None
+    ensure_project_dirs = None
+
 
 def parse_args():
-    p = argparse.ArgumentParser("RealSense colour ChArUco calibration (API-compatible)")
-    p.add_argument("--squares-x", type=int, default=3)
-    p.add_argument("--squares-y", type=int, default=5)
-    p.add_argument("--square-length-mm", type=float, default=50.0)
-    p.add_argument("--marker-length-mm", type=float, default=37.0)
-    p.add_argument("--dict", type=str, default="7X7_50")
-    p.add_argument("--width", type=int, default=640)
-    p.add_argument("--height", type=int, default=480)
-    p.add_argument("--fps", type=int, default=30)
-    p.add_argument("--min-corners", type=int, default=1, help="min ChArUco corners per sample")
-    p.add_argument("--min-samples", type=int, default=30, help="min accepted samples before solve")
-    p.add_argument("--out", type=str, default="calib_color.yaml")
-    p.add_argument("--auto", action="store_true")
-    p.add_argument("--auto-interval", type=int, default=10)
-    return p.parse_args()
+    ap = argparse.ArgumentParser("RealSense colour ChArUco calibration (API-compatible)")
+    ap.add_argument("--squares-x", type=int, default=3)
+    ap.add_argument("--squares-y", type=int, default=5)
+    ap.add_argument("--square-length-mm", type=float, default=50.0)
+    ap.add_argument("--marker-length-mm", type=float, default=37.0)
+    ap.add_argument("--dict", type=str, default="7X7_50")
+    ap.add_argument("--width", type=int, default=640)
+    ap.add_argument("--height", type=int, default=480)
+    ap.add_argument("--fps", type=int, default=30)
+    ap.add_argument("--min-corners", type=int, default=1, help="min ChArUco corners per sample")
+    ap.add_argument("--min-samples", type=int, default=30, help="min accepted samples before solve")
+    ap.add_argument("--out", type=str, default="calib_color.yaml")
+    ap.add_argument("--auto", action="store_true")
+    ap.add_argument("--auto-interval", type=int, default=10)
+
+    return ap.parse_args()
 
 def get_dictionary(name: str):
     name = name.upper().replace("-", "_")
