@@ -30,3 +30,6 @@ package-dir = {"" = "src"}
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[project.scripts]
+gtat = "gt6dof_atag.cli.gtat:main"

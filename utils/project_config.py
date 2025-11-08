@@ -1,17 +1,38 @@
 from __future__ import annotations
+"""
+Project resolution & registry for GT-6DoF-ATag.
+
+Key behavior
+------------
+- Cross-platform projects home:  ~/gt-6dof  (override with $GTAT_PROJECTS_DIR).
+- Priority when resolving a project root:
+    1) CLI path (--project_root)
+    2) $GTAT_PROJECT (path)
+    3) Config 'current' (name)
+    4) Most recent existing project under ~/gt-6dof
+    5) Create a new timestamped project under ~/gt-6dof
+- Standard per-project layout: boards/, shots/, objects/, datasets/
+- MRU tracking in ~/.config/gt6dof_atag/config.yaml
+"""
 import os, time
 from pathlib import Path
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List, Tuple
 import yaml
 
 _APP_NAME = "gt6dof_atag"
 _CFG_FILENAME = "config.yaml"
+_PROJECTS_HOME_ENV = "GTAT_PROJECTS_DIR"
+_DEFAULT_PROJECTS_HOME_NAME = "gt-6dof"
+_STANDARD_SUBDIRS = ("boards", "shots", "objects", "datasets")
 
+
+# --------- time & paths ---------
 def _now_iso() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
+
 def _config_dir() -> Path:
-    # XDG on Linux/macOS; APPDATA on Windows; fallback to ~/.config
+    """XDG on *nix/macOS; APPDATA on Windows; fallback to ~/.config/<app>."""
     if os.name == "nt":
         base = Path(os.environ.get("APPDATA", Path.home() / "AppData" / "Roaming"))
         return base / _APP_NAME
@@ -19,8 +40,10 @@ def _config_dir() -> Path:
     base = Path(xdg) if xdg else (Path.home() / ".config")
     return base / _APP_NAME
 
+
 def config_path() -> Path:
     return _config_dir() / _CFG_FILENAME
+
 
 def _atomic_write(path: Path, data: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -28,6 +51,50 @@ def _atomic_write(path: Path, data: str) -> None:
     tmp.write_text(data, encoding="utf-8")
     tmp.replace(path)
 
+
+def _norm(p: Path | str) -> Path:
+    return Path(p).expanduser().resolve()
+
+
+# --------- projects home ---------
+def projects_home_dir() -> Path:
+    """
+    Return the directory that houses all projects.
+    Default: ~/gt-6dof
+    Override with $GTAT_PROJECTS_DIR (absolute or relative).
+    """
+    env = os.environ.get(_PROJECTS_HOME_ENV)
+    if env:
+        home = _norm(env)
+    else:
+        home = _norm(Path.home() / _DEFAULT_PROJECTS_HOME_NAME)
+    home.mkdir(parents=True, exist_ok=True)
+    return home
+
+
+def is_project_root(root: Path) -> bool:
+    """
+    A project root is recognized by the presence of at least one standard subdir,
+    ideally all: boards/, shots/, objects/, datasets/.
+    """
+    root = _norm(root)
+    found = [ (root / s).is_dir() for s in _STANDARD_SUBDIRS ]
+    return any(found)
+
+
+def ensure_project_dirs(root: Path) -> None:
+    """Create the standard per-project layout under the given root."""
+    root = _norm(root)
+    for sub in _STANDARD_SUBDIRS:
+        (root / sub).mkdir(parents=True, exist_ok=True)
+
+
+def _project_name_for(root: Path) -> str:
+    """Default project name derived from the folder name."""
+    return _norm(root).name
+
+
+# --------- config I/O ---------
 def load_config() -> Dict[str, Any]:
     p = config_path()
     if not p.exists():
@@ -42,54 +109,58 @@ def load_config() -> Dict[str, Any]:
     cfg.setdefault("recent", [])
     return cfg
 
+
 def save_config(cfg: Dict[str, Any]) -> None:
     _atomic_write(config_path(), yaml.safe_dump(cfg, sort_keys=True))
 
-def _norm(p: Path | str) -> Path:
-    return Path(p).expanduser().resolve()
 
-def ensure_project_dirs(root: Path) -> None:
-    # Standard layout under a project root
-    for sub in ("boards", "shots", "objects", "datasets"):
-        (root / sub).mkdir(parents=True, exist_ok=True)
-
-def _project_name_for(root: Path) -> str:
-    # default name from folder
-    return root.name
-
+# --------- registry ---------
 def register_project(root: Path, name: Optional[str] = None) -> str:
+    """
+    Register (or update) a project at 'root' with an optional human name.
+    Ensures layout exists, updates MRU, returns the final project name.
+    """
     root = _norm(root)
     ensure_project_dirs(root)
-    cfg = load_config()
 
+    cfg = load_config()
     name = name or _project_name_for(root)
-    # ensure unique name
+
+    # ensure unique name if colliding with a different root
     base = name
     i = 2
     while name in cfg["projects"] and _norm(cfg["projects"][name]["root"]) != root:
         name = f"{base}-{i}"
         i += 1
 
+    prev = cfg["projects"].get(name, {})
     cfg["projects"][name] = {
         "root": str(root),
-        "created": cfg["projects"].get(name, {}).get("created", _now_iso()),
+        "created": prev.get("created", _now_iso()),
         "updated": _now_iso(),
     }
-    # set current + recent MRU
     cfg["current"] = name
     recent = [n for n in cfg.get("recent", []) if n != name]
     cfg["recent"] = [name] + recent[:9]
     save_config(cfg)
     return name
 
+
 def set_current_project(name_or_path: str | Path) -> Path:
-    cfg = load_config()
-    # path given?
+    """
+    Set the current project either by name or by existing path.
+    Returns the normalized project root.
+    """
     p = Path(str(name_or_path))
-    if Path(name_or_path).exists():
+    if p.exists():
+        # Treat as a path
         name = register_project(_norm(p))
-        return _norm(Path(cfg["projects"][name]["root"]))
-    # name given
+        # Reload to reflect register_project changes
+        cfg2 = load_config()
+        return _norm(Path(cfg2["projects"][name]["root"]))
+
+    # Treat as a name
+    cfg = load_config()
     name = str(name_or_path)
     if name not in cfg["projects"]:
         raise ValueError(f"Unknown project name: {name}")
@@ -99,11 +170,15 @@ def set_current_project(name_or_path: str | Path) -> Path:
     save_config(cfg)
     return _norm(Path(cfg["projects"][name]["root"]))
 
+
 def list_projects() -> Dict[str, Path]:
+    """Return {name: root_path} for all known projects."""
     cfg = load_config()
     return {name: _norm(Path(info["root"])) for name, info in cfg["projects"].items()}
 
+
 def current_project_root() -> Optional[Path]:
+    """Return the root of the current project (if any)."""
     cfg = load_config()
     cur = cfg.get("current")
     if not cur:
@@ -113,32 +188,79 @@ def current_project_root() -> Optional[Path]:
         return None
     return _norm(Path(info["root"]))
 
+
+# --------- discovery under ~/gt-6dof ---------
+def _iter_home_projects(home: Path) -> List[Tuple[Path, float]]:
+    """
+    Scan the projects home for candidate project roots, returning [(path, mtime)].
+    Recognizes subdirectories that look like a project (see is_project_root).
+    """
+    home = _norm(home)
+    if not home.exists():
+        return []
+    out: List[Tuple[Path, float]] = []
+    for child in home.iterdir():
+        if child.is_dir() and is_project_root(child):
+            try:
+                mtime = child.stat().st_mtime
+            except Exception:
+                mtime = 0.0
+            out.append((_norm(child), mtime))
+    # newest (largest mtime) first
+    out.sort(key=lambda t: t[1], reverse=True)
+    return out
+
+
+def _new_default_project_root(home: Path) -> Path:
+    """
+    Create a new timestamped project directory under projects home.
+    Example: ~/gt-6dof/project-2025-11-08T12-34-56Z
+    """
+    ts = _now_iso().replace(":", "-")
+    candidate = home / f"project-{ts}"
+    candidate.mkdir(parents=True, exist_ok=True)
+    ensure_project_dirs(candidate)
+    return _norm(candidate)
+
+
+# --------- resolution ---------
 def resolve_project_root(cli: Optional[Path | str] = None) -> Path:
     """
-    Priority:
-      1) --project_root CLI (path) if provided
-      2) $GTAT_PROJECT (path)
-      3) config.current (name) if set
-      4) default = CWD / 'gtat_project'
-    Registers and makes it current; ensures standard subdirs exist.
+    Resolve the active project root with the following priority:
+      1) CLI (--project_root) path if provided -> register & return
+      2) $GTAT_PROJECT (path) -> register & return
+      3) config.current (name) if set -> ensure layout & return
+      4) most recent project under projects_home_dir() -> register & return
+      5) create a new timestamped project under projects_home_dir() -> register & return
     """
     # 1) CLI
     if cli:
         root = _norm(cli)
         register_project(root)
         return root
-    # 2) ENV
+
+    # 2) ENV path
     env = os.environ.get("GTAT_PROJECT")
     if env:
         root = _norm(env)
         register_project(root)
         return root
-    # 3) Config current
+
+    # 3) Config 'current'
     cur = current_project_root()
     if cur:
         ensure_project_dirs(cur)
         return cur
-    # 4) Default
-    default = _norm(Path.cwd() / "gtat_project")
-    register_project(default)
-    return default
+
+    # 4) Most recent under ~/gt-6dof
+    home = projects_home_dir()
+    discovered = _iter_home_projects(home)
+    if discovered:
+        root = discovered[0][0]
+        register_project(root)  # update MRU/current
+        return root
+
+    # 5) Create a new project under ~/gt-6dof
+    root = _new_default_project_root(home)
+    register_project(root)
+    return root
