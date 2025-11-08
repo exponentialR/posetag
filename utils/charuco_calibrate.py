@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """
 Colour ChArUco camera calibration (OpenCV webcam, Intel RealSense, or video file).
 
@@ -5,9 +6,14 @@ What it does
 ------------
 - Detects ArUco/ChArUco corners from a live camera or video.
 - Lets you collect multiple views (SPACE), then solves intrinsics/distortion (ENTER).
-- Writes a `calib_color.yaml` with explicit fields (fx, fy, cx, cy, k1..k3, image size, RMS).
-- If `--project_root` is provided, initializes a project tree and defaults output to
-  `<root>/calib/calib_color.yaml` (unless `--out` is set).
+- Saves ALL artefacts under the active project:
+    <project_root>/calib/
+      ├─ calib_color.yaml                # latest calibration
+      ├─ images/set_XX/*.png             # captured raw samples (auto-incremented set)
+      └─ runs/<UTC-ISO>/                 # per-run snapshot
+           ├─ config.yaml                # args, board spec, image size, source info, samples
+           └─ calib_color.yaml           # calibration for this run
+- Project resolution priority: --project_root → $GTAT_PROJECT → config current → last/most recent under ~/gt-6dof → new timestamped.
 
 Typical usage
 -------------
@@ -22,12 +28,12 @@ python charuco_calibrate.py --source realsense --width 640 --height 480 --fps 30
 python charuco_calibrate.py --source video --video sample.mp4
 """
 
+from __future__ import annotations
 import argparse, yaml
-import sys
+import sys, os, datetime, shutil
+from pathlib import Path
 import numpy as np
 import cv2
-import os, datetime
-from pathlib import Path
 
 # RealSense is optional; general webcams/video should work without it
 try:
@@ -35,12 +41,15 @@ try:
 except Exception:
     rs = None
 
-# Project bootstrap helpers (optional)
+# Project helpers (prefer packaged utils, but support repo-local utils/)
 try:
-    from utils.project_config import resolve_project_root, ensure_project_dirs
+    from gt6dof_atag.utils.project_config import resolve_project_root, ensure_project_dirs  # type: ignore
 except Exception:
-    resolve_project_root = None
-    ensure_project_dirs = None
+    try:
+        from utils.project_config import resolve_project_root, ensure_project_dirs  # type: ignore
+    except Exception:
+        resolve_project_root = None  # type: ignore
+        ensure_project_dirs = None   # type: ignore
 
 
 class _HelpFmt(argparse.ArgumentDefaultsHelpFormatter, argparse.RawTextHelpFormatter):
@@ -83,9 +92,9 @@ def parse_args():
     ap.add_argument("--cam", type=int, default=0, help="OpenCV camera index when --source=opencv")
     ap.add_argument("--video", type=str, default=None, help="Video path when --source=video")
     ap.add_argument("--project_root", type=Path, default=None,
-                    help="If set, initialize project layout and (when --out is not given) save to <project_root>/calib/calib_color.yaml")
+                    help="Explicit project root; otherwise resolved via config/env/home logic.")
     ap.add_argument("--out", type=str, default=None,
-                    help="Output YAML file (default: <root>/calib/calib_color.yaml if --project_root is set; otherwise calib_color.yaml in CWD)")
+                    help="Output YAML file (default: <project_root>/calib/calib_color.yaml)")
     return ap.parse_args()
 
 
@@ -116,6 +125,55 @@ def make_board(aruco, sx, sy, square_m, marker_m, dictionary):
     if hasattr(aruco, "CharucoBoard_create"):
         return aruco.CharucoBoard_create(sx, sy, square_m, marker_m, dictionary)
     raise RuntimeError("Your OpenCV build lacks both CharucoBoard APIs.")
+
+
+def _now_iso_utc():
+    return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H-%M-%SZ")
+
+
+def _prepare_project_io(args) -> tuple[Path, Path, Path, Path, Path]:
+    """
+    Resolve project root and prepare:
+      calib_dir, images_root, run_dir (unique), out_yaml.
+    Returns (project_root, calib_dir, images_root, run_dir, out_yaml)
+    """
+    # Resolve project root (explicit → env/config/default)
+    if resolve_project_root is not None and ensure_project_dirs is not None:
+        pr = Path(resolve_project_root(args.project_root))
+        ensure_project_dirs(pr)
+    else:
+        # Fallback: cwd/gtat_project to avoid breaking older installs
+        pr = Path.cwd() / "gtat_project"
+        pr.mkdir(parents=True, exist_ok=True)
+
+    calib_dir = pr / "calib"
+    images_root = calib_dir / "images"
+    runs_root = calib_dir / "runs"
+    calib_dir.mkdir(parents=True, exist_ok=True)
+    images_root.mkdir(parents=True, exist_ok=True)
+    runs_root.mkdir(parents=True, exist_ok=True)
+
+    # Next images set_XX
+    existing = sorted([p.name for p in images_root.iterdir() if p.is_dir() and p.name.startswith("set_")])
+    if existing:
+        try:
+            last_idx = int(existing[-1].split("_")[-1])
+        except Exception:
+            last_idx = 0
+    else:
+        last_idx = 0
+    new_set_dir = images_root / f"set_{last_idx + 1:02d}"
+    new_set_dir.mkdir(parents=True, exist_ok=True)
+
+    # Per-run directory
+    run_dir = runs_root / _now_iso_utc()
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    # Output yaml path
+    out_yaml = Path(args.out) if args.out else (calib_dir / "calib_color.yaml")
+    out_yaml.parent.mkdir(parents=True, exist_ok=True)
+
+    return pr, calib_dir, new_set_dir, run_dir, out_yaml
 
 
 def calibrate_from_charuco(samples_corners, samples_ids, board, image_size):
@@ -183,55 +241,28 @@ def main():
     """CLI entry point: capture frames, collect ChArUco corners, calibrate, and write YAML."""
     args = parse_args()
 
-    # Project-aware default output path
-    if getattr(args, "project_root", None) is not None:
-        if resolve_project_root is None or ensure_project_dirs is None:
-            print("Warning: --project_root provided but project helpers unavailable; proceeding without init.",
-                  file=sys.stderr)
-            pr = Path(args.project_root)
-        else:
-            pr = Path(resolve_project_root(args.project_root))
-            ensure_project_dirs(str(pr))
-        if args.out is None:
-            out_path = pr / "calib" / "calib_color.yaml"
-            out_path.parent.mkdir(parents=True, exist_ok=True)
-            args.out = str(out_path)
-    else:
-        if args.out is None:
-            args.out = "calib_color.yaml"
+    # ----- Project-aware IO layout (always) -----
+    pr, calib_dir, images_dir, run_dir, out_yaml = _prepare_project_io(args)
+    print(f"[i] Project root = {pr}")
+    print(f"[i] Samples folder = {images_dir}")
+    print(f"[i] Run folder = {run_dir}")
+    args.out = str(out_yaml)  # ensure consistent path downstream
 
+    # ----- ArUco/board setup -----
     aruco = cv2.aruco
     dictionary = get_dictionary(args.dict)
 
-    # Prepare calibration image dump folder
-    calibration_folder = "calib_images"
-    os.makedirs(calibration_folder, exist_ok=True)
-    calib_folders = sorted(
-        [fd for fd in os.listdir(calibration_folder) if os.path.isdir(os.path.join(calibration_folder, fd))]
-    )
-    last_sub_calib_folder = calib_folders[-1] if len(calib_folders) > 0 else None
-    if last_sub_calib_folder is None:
-        new_sub_calib_folder = os.path.join(calibration_folder, "set_01")
-    else:
-        last_index = int(last_sub_calib_folder.split("_")[-1])
-        new_index = last_index + 1
-        new_sub_calib_folder = os.path.join(calibration_folder, f"set_{new_index:02d}")
-    os.makedirs(new_sub_calib_folder, exist_ok=True)
-    print(f"[i] Created new calibration image folder: {new_sub_calib_folder}")
-
-    # Build ChArUco board
     square_m = args.square_length_mm / 1000.0
     marker_m = args.marker_length_mm / 1000.0
     board = make_board(aruco, args.squares_x, args.squares_y, square_m, marker_m, dictionary)
 
-    # Detector setup
     has_charuco_detector = hasattr(aruco, "CharucoDetector")
     if has_charuco_detector:
         chdet = aruco.CharucoDetector(board)
     else:
         det_params = aruco.DetectorParameters_create()
 
-    # --- Camera/video source setup ---
+    # ----- Source setup -----
     if args.source == "realsense":
         if rs is None:
             sys.exit("pyrealsense2 not available; use --source opencv|video")
@@ -251,7 +282,6 @@ def main():
         cap = cv2.VideoCapture(args.cam)
         if not cap.isOpened():
             sys.exit(f"Could not open camera index {args.cam}")
-        # Best effort; actual size may differ
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, args.width)
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, args.height)
         cap.set(cv2.CAP_PROP_FPS, args.fps)
@@ -277,7 +307,9 @@ def main():
         def _stop():
             cap.release()
 
+    # ----- Capture loop -----
     samples_corners, samples_ids = [], []
+    saved_images: list[str] = []
     auto_tick = 0
 
     print("[i] Move/tilt the board; SPACE=add, ENTER=solve, q=quit")
@@ -327,18 +359,18 @@ def main():
             if args.auto and good:
                 auto_tick += 1
                 if auto_tick % args.auto_interval == 0:
-                    samples_corners.append(ch_corners.copy())
-                    samples_ids.append(ch_ids.copy())
-                    print(f"[+] auto sample {len(samples_corners)} ({len(ch_corners)} corners)")
+                    samples_corners.append(ch_corners.copy()); samples_ids.append(ch_ids.copy())
+                    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+                    img_filename = images_dir / f"calib_{ts}.png"
+                    cv2.imwrite(str(img_filename), color); saved_images.append(str(img_filename))
+                    print(f"[+] auto sample {len(samples_corners)} ({len(ch_corners)} corners) -> {img_filename}")
             elif k == ord(' '):
                 if good:
-                    samples_corners.append(ch_corners.copy())
-                    samples_ids.append(ch_ids.copy())
-                    print(f"[+] sample {len(samples_corners)} ({len(ch_corners)} corners)")
+                    samples_corners.append(ch_corners.copy()); samples_ids.append(ch_ids.copy())
                     ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-                    img_filename = os.path.join(new_sub_calib_folder, f"calib_{ts}.png")
-                    cv2.imwrite(img_filename, color)
-                    print(f"[i] Saved calibration image: {img_filename}")
+                    img_filename = images_dir / f"calib_{ts}.png"
+                    cv2.imwrite(str(img_filename), color); saved_images.append(str(img_filename))
+                    print(f"[+] sample {len(samples_corners)} ({len(ch_corners)} corners) -> {img_filename}")
                 else:
                     print("[!] not enough corners; get closer / reduce glare / tilt more.")
             elif k == 13:
@@ -353,12 +385,31 @@ def main():
     if len(samples_corners) < need:
         raise SystemExit(f"Need at least {need} good samples; got {len(samples_corners)}.")
 
+    # ----- Solve & write results -----
+    img_size = (args.width, args.height)
+    # ---- filter weak samples before solving ----
+    REQUIRED = max(4, args.min_corners)  # charuco solver needs at least 4 per view
+    filtered_corners, filtered_ids = [], []
+    for ch_c, ch_id in zip(samples_corners, samples_ids):
+        if ch_c is not None and ch_id is not None and len(ch_c) >= REQUIRED:
+            filtered_corners.append(ch_c)
+            filtered_ids.append(ch_id)
+
+    print(f"[i] using {len(filtered_corners)}/{len(samples_corners)} samples "
+          f"(dropped {len(samples_corners) - len(filtered_corners)} < {REQUIRED} corners)")
+
+    if len(filtered_corners) < max(10, args.min_samples):
+        raise SystemExit(f"Not enough valid samples after filtering: "
+                         f"{len(filtered_corners)} < {max(10, args.min_samples)}")
+
     img_size = (args.width, args.height)
     ret, K, dist, rvecs, tvecs = calibrate_from_charuco(
-        samples_corners, samples_ids, board, img_size
+        filtered_corners, filtered_ids, board, img_size
     )
 
-    # ---- write YAML with explicit keys ----
+    # ret, K, dist, rvecs, tvecs = calibrate_from_charuco(samples_corners, samples_ids, board, img_size)
+
+    # write main YAML (latest)
     dist = np.asarray(dist, dtype=float).reshape(1, -1)  # ensure shape (1, N)
     fx, fy, cx, cy = float(K[0, 0]), float(K[1, 1]), float(K[0, 2]), float(K[1, 2])
     k1 = float(dist[0, 0]) if dist.shape[1] > 0 else 0.0
@@ -371,25 +422,41 @@ def main():
     print("[i] K =\n", K)
     print("[i] dist =", dist.ravel())
 
-    data = dict(
+    calib_data = dict(
         image_width=args.width,
         image_height=args.height,
-        camera_matrix=dict(
-            fx=fx, fy=fy, cx=cx, cy=cy,
-            data=K.tolist()
-        ),
-        distortion_coefficients=dict(
-            k1=k1, k2=k2, p1=p1, p2=p2, k3=k3,
-            data=dist.tolist()
-        ),
+        camera_matrix=dict(fx=fx, fy=fy, cx=cx, cy=cy, data=K.tolist()),
+        distortion_coefficients=dict(k1=k1, k2=k2, p1=p1, p2=p2, k3=k3, data=dist.tolist()),
         reproj_rms=float(ret),
         model="plumb_bob",
-        notes=f"ChArUco {args.squares_x}x{args.squares_y}, "
-              f"square={args.square_length_mm}mm, marker={args.marker_length_mm}mm, dict={args.dict}"
+        notes=f"ChArUco {args.squares_x}x{args.squares_y}, square={args.square_length_mm}mm, "
+              f"marker={args.marker_length_mm}mm, dict={args.dict}"
     )
-    with open(args.out, "w") as f:
-        yaml.safe_dump(data, f)
-    print(f"[i] wrote {args.out}")
+    with open(out_yaml, "w") as f:
+        yaml.safe_dump(calib_data, f)
+    print(f"[i] wrote {out_yaml}")
+
+    # Run snapshot: config + calibration copy
+    run_cfg = dict(
+        timestamp=Path(run_dir).name,
+        project_root=str(pr),
+        source=dict(kind=args.source, cam=args.cam if args.source == "opencv" else None,
+                    video=args.video if args.source == "video" else None,
+                    width=args.width, height=args.height, fps=args.fps),
+        board=dict(squares_x=args.squares_x, squares_y=args.squares_y,
+                   square_length_mm=args.square_length_mm, marker_length_mm=args.marker_length_mm,
+                   dict=args.dict),
+        thresholds=dict(min_corners=args.min_corners, min_samples=args.min_samples, auto=args.auto,
+                        auto_interval=args.auto_interval),
+        image_size=dict(width=args.width, height=args.height),
+        samples=dict(count=len(saved_images), files=saved_images),
+        reproj_rms=float(ret),
+    )
+    with open(run_dir / "config.yaml", "w") as f:
+        yaml.safe_dump(run_cfg, f)
+    with open(run_dir / "calib_color.yaml", "w") as f:
+        yaml.safe_dump(calib_data, f)
+    print(f"[i] run snapshot saved in {run_dir}")
 
 
 if __name__ == "__main__":
