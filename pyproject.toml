@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gt6dof-atag"
+version = "0.1.0"
+description = "Ground-truth 6-DoF from AprilTags with minimal annotation"
+readme = "README.md"
+license = { file = "LICENSE" }
+authors = [{ name = "Samuel Adebayo" }]
+requires-python = ">=3.9"
+dependencies = ["numpy", "opencv-python>=4.5", "PyYAML"]
+
+[project.optional-dependencies]
+apriltags = ["pupil-apriltags"]
+realsense = ["pyrealsense2"]
+scipy = ["scipy"]
+
+[project.scripts]
+gtat-gen-tags     = "gt6dof_atag.cli.gen_tags:main"
+gtat-calib-charuco= "gt6dof_atag.cli.charuco:main"
+gtat-make-board   = "gt6dof_atag.cli.make_board:main"
+gtat-capture-face = "gt6dof_atag.cli.capture_face:main"
+gtat-annotate     = "gt6dof_atag.cli.annotate:main"
+gtat-collect      = "gt6dof_atag.cli.collect:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
