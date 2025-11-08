@@ -68,7 +68,42 @@ python charuco_calibrate.py --source video --video sample.mp4
 ```
 
 <sub>Keep print scale at 100%. OpenCV webcams treat --width/--height as best-effort; the YAML records the actual stream size.</sub>
+Sample calibration file `calib_color.yaml`:
 
+```yaml
+camera_matrix:
+  cx: 327.64591864758034
+  cy: 191.92344695734758
+  data:
+  - - 1130.1711396910728
+    - 0.0
+    - 327.64591864758034
+  - - 0.0
+    - 1137.6243734485495
+    - 191.92344695734758
+  - - 0.0
+    - 0.0
+    - 1.0
+  fx: 1130.1711396910728
+  fy: 1137.6243734485495
+distortion_coefficients:
+  data:
+  - - -0.4270123490995857
+    - 6.863413191402844
+    - -0.010742366737405607
+    - -0.0025807724510832734
+    - -63.07160252228832
+  k1: -0.4270123490995857
+  k2: 6.863413191402844
+  k3: -63.07160252228832
+  p1: -0.010742366737405607
+  p2: -0.0025807724510832734
+image_height: 480
+image_width: 640
+model: plumb_bob
+notes: ChArUco 3x5, square=50.0mm, marker=37.0mm, dict=7X7_50
+reproj_rms: 0.13782644794293097
+```
 ---
 
 ### 2) Build per-face boards and tag registry
