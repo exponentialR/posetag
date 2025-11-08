@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 import os
 import sys
-import math
+from pathlib import Path
+from utils.project_config import resolve_project_root, ensure_project_dirs
 import argparse
 import cv2
 import numpy as np
@@ -276,8 +277,6 @@ def main():
     ap.add_argument("--orientation", type=str, default="portrait", choices=["portrait","landscape"],
                     help="Paper orientation (default: portrait)")
     ap.add_argument("--dpi", type=int, default=DEFAULT_DPI, help=f"Rendering DPI (default: {DEFAULT_DPI})")
-    ap.add_argument("--out-dir", type=str, default=DEFAULT_OUT_DIR, help=f"Output directory (default: {DEFAULT_OUT_DIR})")
-    ap.add_argument("--prefix", type=str, default=DEFAULT_PREFIX, help=f"Filename prefix (default: {DEFAULT_PREFIX})")
     ap.add_argument("--pil-text", action="store_true",
                     help="Use Pillow for nicer text (needs Pillow installed). Also writes PDF if Pillow available.")
     ap.add_argument("--margin-frac", type=float, default=DEFAULT_MARGIN_FRAC,
@@ -289,8 +288,18 @@ def main():
                          "If given, overrides --id-start/--id-end.")
     ap.add_argument("--id-start", type=int, help="First AprilTag ID (inclusive)")
     ap.add_argument("--id-end", type=int, help="Last AprilTag ID (inclusive)")
+    ap.add_argument("--out-dir", type=str, default=DEFAULT_OUT_DIR,
+                    help=f"Output directory (default: {DEFAULT_OUT_DIR})")
+    ap.add_argument("--prefix", type=str, default=DEFAULT_PREFIX, help=f"Filename prefix (default: {DEFAULT_PREFIX})")
+    ap.add_argument("--project_root", type=Path, default=None,
+                    help="If set, initialise project layout and (when --out-dir is not given) save to <project_root>/boards/patterns")
+
 
     args = ap.parse_args()
+    if args.project_root is not None:
+        pr = resolve_project_root(args.project_root); ensure_project_dirs(pr)  # boards/, shots/, objects/, datasets/
+        if args.out_dir == DEFAULT_OUT_DIR:
+            args.out_dir= str(Path(pr) / "boards" / "patterns")
 
     use_pil_text = bool(args.pil_text) and HAVE_PIL
     if args.pil_text and not HAVE_PIL:
