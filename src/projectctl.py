@@ -1,6 +1,6 @@
 import argparse
 from pathlib import Path
-from utils.project_config import (
+from gt6dof_atag.utils.project_config import (
     load_config, save_config, list_projects, register_project,
     set_current_project, current_project_root, resolve_project_root
 )

@@ -82,8 +82,8 @@ from typing import List, Optional, Tuple, Dict, Set
 import cv2
 import numpy as np
 
-from utils.project_config import resolve_project_root, ensure_project_dirs
-from utils.logger import init_project_logger
+from gt6dof_atag.utils.project_config import resolve_project_root, ensure_project_dirs
+from gt6dof_atag.utils.logger import init_project_logger
 
 log: logging.Logger
 

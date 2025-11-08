@@ -161,13 +161,13 @@ except Exception:
     rs = None  # optional
 
 # --- repo utils ---
-from utils.project_config import resolve_project_root, ensure_project_dirs
-from utils.logger import init_project_logger
-from utils.annotation_utils import (
+from gt6dof_atag.utils.project_config import resolve_project_root, ensure_project_dirs
+from gt6dof_atag.utils.logger import init_project_logger
+from gt6dof_atag.utils.annotation_utils import (
     detect_tags, load_board, se3, inv_se3, load_keypoints_fuzzy
 )
-from utils.gt_pose_utils import rotation_to_quat
-from utils.collect_gt_utils import rpy_from_R, _estimate_tag_scale, _text_panel, _show_dash, _ts_tag_from_epoch, \
+from gt6dof_atag.utils.gt_pose_utils import rotation_to_quat
+from gt6dof_atag.utils.collect_gt_utils import rpy_from_R, _estimate_tag_scale, _text_panel, _show_dash, _ts_tag_from_epoch, \
     _map_class_id_and_name, _dominant_color_near_polygon
 
 try:

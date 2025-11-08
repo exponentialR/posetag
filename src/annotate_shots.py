@@ -104,9 +104,9 @@ import numpy as np
 import cv2, yaml
 from datetime import datetime
 
-from utils.logger import init_project_logger
-from utils.project_config import resolve_project_root, ensure_project_dirs
-from utils.annotation_utils import (
+from gt6dof_atag.utils.logger import init_project_logger
+from gt6dof_atag.utils.project_config import resolve_project_root, ensure_project_dirs
+from gt6dof_atag.utils.annotation_utils import (
     detect_tags, load_board, se3, inv_se3,
     load_keypoints_fuzzy
 )

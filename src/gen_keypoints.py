@@ -85,8 +85,8 @@ from typing import Tuple
 import numpy as np
 import cv2, yaml
 
-from utils.project_config import resolve_project_root, ensure_project_dirs
-from utils.logger import init_project_logger
+from gt6dof_atag.utils.project_config import resolve_project_root, ensure_project_dirs
+from gt6dof_atag.utils.logger import init_project_logger
 
 def _pill_width(text):
     (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)

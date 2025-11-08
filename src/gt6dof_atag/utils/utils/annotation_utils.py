@@ -152,7 +152,7 @@ def load_meta(path: str | Path, strict: bool = True) -> dict:
     if not obj_base:
         obj_base = m.get("object")
     if not obj_base and m.get("object_full"):
-        from utils.capture_utils import parse_base_and_side
+        from gt6dof_atag.utils.capture_utils import parse_base_and_side
         obj_base, side_infer = parse_base_and_side(m["object_full"])
         m.setdefault("side", side_infer)
 

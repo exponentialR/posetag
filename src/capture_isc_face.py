@@ -65,14 +65,14 @@ import pyrealsense2 as rs
 from pathlib import Path
 from typing import List, Dict, Tuple, Optional, Set
 
-from utils.intel_realsense_utils import start_rs, get_frames_with_retry, load_calib, _face_label
-from utils.capture_utils import (
+from gt6dof_atag.utils.intel_realsense_utils import start_rs, get_frames_with_retry, load_calib, _face_label
+from gt6dof_atag.utils.capture_utils import (
     draw_detections, make_info_panel, make_recent_panel, text_lines,
     load_registry, unique_bases, faces_for_base, faces_for_object,
     parse_base_and_side, ensure_dir, timestamp, _append_manifest
 )
-from utils.project_config import resolve_project_root, ensure_project_dirs
-from utils.logger import init_project_logger
+from gt6dof_atag.utils.project_config import resolve_project_root, ensure_project_dirs
+from gt6dof_atag.utils.logger import init_project_logger
 
 try:
     from pupil_apriltags import Detector

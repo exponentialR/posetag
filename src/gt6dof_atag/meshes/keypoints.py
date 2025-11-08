@@ -128,8 +128,8 @@ import numpy as np
 import cv2
 import json as _json
 
-from utils.project_config import resolve_project_root, ensure_project_dirs
-from utils.generate_canonical_utils import (
+from gt6dof_atag.utils.project_config import resolve_project_root, ensure_project_dirs
+from gt6dof_atag.utils.generate_canonical_utils import (
     load_mesh_any, auto_keypoints, save_keypoints, existing_kp_file,
     load_state, save_state, find_meshes, view_points,
     render_mesh_thumb, render_list_meshes, text_panel,
