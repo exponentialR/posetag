@@ -46,20 +46,28 @@ python -m src.gen_april_tags --project_root my_project --tag-size-mm 40 --ids 19
 
 ### 1) Calibrate the colour camera (ChArUco)
 
-SPACE to capture a sample; ENTER to solve:
+SPACE to capture a sample; ENTER to solve. Outputs a `calib_color.yaml` (fx, fy, cx, cy, k1..k3, image size, RMS).
+With `--project_root`, output defaults to `<root>/calib/calib_color.yaml`.
+
+**Generic webcam (default)**
+```bash
+python charuco_calibrate.py --source opencv --cam 0 \
+  --squares-x 5 --squares-y 3 --square-length-mm 50 --marker-length-mm 37 --dict 7X7_100
+````
+
+**Intel RealSense**
 
 ```bash
-python charuco_calibrate.py --squares-x 5 --squares-y 3 \
-  --square-length-mm 50 --marker-length-mm 37 --dict 7X7_1000 \
-  --width 640 --height 480 --min-samples 30 --out calib_color.yaml
+python charuco_calibrate.py --source realsense --width 640 --height 480 --fps 30
 ```
 
-Outputs `calib_color.yaml` with:
+**Video file**
 
-* `camera_matrix` (fx, fy, cx, cy)
-* `distortion_coefficients` (k1, k2, p1, p2, k3)
-* `image_width`, `image_height` (keep these consistent later)
-* `reproj_rms` (px)
+```bash
+python charuco_calibrate.py --source video --video sample.mp4
+```
+
+<sub>Keep print scale at 100%. OpenCV webcams treat --width/--height as best-effort; the YAML records the actual stream size.</sub>
 
 ---
 
