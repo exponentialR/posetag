@@ -188,11 +188,12 @@ The registry is updated each time you run `make_board`. If the same tag ID is al
 
 
 ### 3) Capture “face shots” for annotation
+![capture-face](media/capture_face.gif)
+Now that you’ve built per-face boards and recorded the tag registry (Step 2), the next step is to capture wide shots of each face with detections overlaid. These images + metadata will be used later to annotate and solve the board→object transform.
 
+**Quick start (project-aware, RealSense by default)**
 ```bash
-python -m src.capture_isc_face \
-  --calib calib_color.yaml \
-  --width 640 --height 480 --fps 30
+python -m src.capture_face --object_name connection_plate_white
 # Optional UI sizing
 #   --panel_w 560         # centre info panel width
 #   --recent_w 480        # right "Last saved" panel width
@@ -200,35 +201,37 @@ python -m src.capture_isc_face \
 #   --layout {flat,by_object,by_object_side,split_type}   # default: by_object_side
 #   --manifest boards/shots/manifest.csv                  # append one row per save
 ```
+**Other sources**
 
-**Workflow (no terminal prompts while preview runs):**
+```bash
+# OpenCV webcam
+python -m utils.capture_face --source opencv --cam 0 --object_name connection_plate_white
 
-* Press **`o`** to open the **in-window object picker**; navigate with **↑/↓/W/S/K/J**, **Enter** to select, **Esc** to cancel.
-* You may also start with `--object_name`:
+# From a video
+python -m utils.capture_face --source video --video sample.mp4 --object_name connection_plate_white
+```
+**Notes**
 
-  * Base only: `--object_name connection_plate_white` → **side auto-deduced** from live detections via `boards/tag_registry.yaml`.
-  * Full face: `--object_name connection_plate_white_sideA` → fixed side.
-* **ENTER** saves a shot. If expected tags are missing, **double-press ENTER within 3 s** to force.
+* Outputs live under your active project (same resolver as Steps 1–2):
 
-**Keys**
+  * `<root>/shots/<object_base>/side<Side>/..._{raw,ann}.png` and `..._meta.json`
+  * Appends to `<root>/shots/manifest.csv` if `--manifest` is used (defaults there if omitted).
+* `--calib` and `--registry` default to `<root>/calib/calib_color.yaml` and `<root>/boards/tag_registry.yaml`.
 
-* **ENTER** – save (double-press to force if validation fails)
-* **o** – object picker (in-window)
-* **a** – toggle **auto side/face** (works when an object base is chosen)
-* **f** – cycle faces **when auto is OFF**
-* **g** – toggle gallery/“Last saved” panels
-* **h** – help overlay
-* **q / Esc** – quit
+**Workflow in the viewer**
 
-**Panels & window**
+* `o` picker (navigate ↑/↓/W/S/K/J, Enter select), `a` auto-side on/off, `f` cycle faces (when auto is off).
+* `ENTER` save (double-press within 3s to force if expected tags are missing), `g` panels, `h` help, `q/ESC` quit.
+* You can pass a base (`--object_name connection_plate_white`, side auto-deduced) or a full face (`..._sideA`).
 
-* Left: 640×480 live feed with detections (unchanged resolution).
-* Centre: **Info** (object/side, seen vs expected IDs, validation, recent thumbnails, instructions).
-* Right: **Last saved** annotated image (blank when off).
-* The top-level window is **resizable**; use `--panel_w` / `--recent_w` to make side panels roomier.
+**Optional layout & UI sizing**
 
-**Outputs (default layout: `by_object_side`)**
-
+```bash
+# Layout: flat | by_object | by_object_side (default) | split_type
+python -m utils.capture_face --layout split_type --raw_dir shots/images --ann_dir shots/ann --meta_dir shots/meta
+# Panel widths
+python -m utils.capture_face --panel_w 560 --recent_w 480
+```
 ```
 boards/shots/
   <object_base>/
