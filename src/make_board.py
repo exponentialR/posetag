@@ -236,10 +236,15 @@ def main():
 
     # Calib: allow relative path under project_root
     calib_path = Path(args.calib)
-    if not calib_path.is_absolute():
-        cand = (project_root / calib_path)
-        if cand.exists():
-            calib_path = cand
+    # If no calib_path given
+    if calib_path is not None:
+        if not calib_path.is_absolute():
+            cand = (project_root / 'calib' / calib_path)
+            if cand.exists():
+                calib_path = cand
+    else:
+        calib_path = (project_root / 'calib/calib_color.yaml')
+        print(f'Calibration yaml not provided defaulting to recent calib path found in {calib_path}')
     (fx, fy, cx, cy), K, _D = load_calib(str(calib_path))
 
     tag_size_m = args.tag_size_mm / 1000.0
