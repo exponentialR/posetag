@@ -108,24 +108,78 @@ reproj_rms: 0.13782644794293097
 
 ### 2) Build per-face boards and tag registry
 
-For each *face*, capture one view with all its tags visible; pick an **origin** tag. The script estimates in-plane offsets/rotation and writes a board YAML and updates the registry.
+![make-board](media/make_board.gif)
+
+Capture one view with all tags visible, pick an **origin** ID, and write a face YAML plus update the tag registry under your active project. Outputs live under `<root>/boards/...` (not repo-relative `boards/...`).
+
+**OpenCV webcam (default)**
 
 ```bash
-python make_board.py \
+python -m src.make_board \
   --object_name connection_plate_white_sideA \
   --calib calib_color.yaml \
   --tag_size_mm 80 \
-  --out_dir boards \
-  --save_shot \
-  --z_thresh 0.01
-# Repeat for sideB / other objects...
+  --save_shot
 ```
 
-Outputs:
+**Intel RealSense**
 
-* `boards/<object_face>.yaml`  (origin\_id, tag\_size\_m, 2D offsets + yaw)
-* `boards/tag_registry.yaml`   (tag ID → face YAML)
-* Optional `boards/shots/*` audit images
+```bash
+python -m src.make_board \
+  --source realsense --width 640 --height 480 --fps 30 \
+  --object_name connection_plate_white_sideA --calib calib_color.yaml --tag_size_mm 80
+```
+
+**From a video**
+
+```bash
+python -m src.make_board \
+  --source video --video sample.mp4 \
+  --object_name connection_plate_white_sideA --calib calib_color.yaml --tag_size_mm 80
+```
+
+**Outputs**
+
+* `<root>/boards/<object_face>.yaml` (origin_id, tag_size_m, per-tag 2D offsets + yaw)
+* `<root>/boards/tag_registry.yaml` (tag-ID → face YAML mapping; updated on each run)
+* Optional `<root>/boards/shots/*` audit images (when `--save_shot`)
+
+<sub>Tips: add `--project_root <path>` to create/select a project; otherwise the resolver uses your current/last project. Use `--z_thresh` (default `0.01` m) to enforce planarity or `--allow_nonplanar` to proceed with a warning.</sub>
+
+**Example board YAML** (`connection_plate_white_sideA.yaml`)
+
+```yaml
+object: connection_plate_white_sideA
+family: tag36h11
+tag_size_m: 0.04
+origin_id: 52
+tags:
+- id: 52
+  cx: 0.0
+  cy: 2.7755575615628914e-17
+  yaw_deg: -6.095899809673727e-15
+- id: 53
+  cx: -0.0014025137524277254
+  cy: -0.1884154905688507
+  yaw_deg: 179.95955209337157
+notes: "Board frame = origin tag centre; x,y follow origin tag axes; z ≈ 0."
+```
+
+**Example tag registry** (`tag_registry.yaml`)
+
+```yaml
+version: 1
+updated: '2025-11-09T18:50:42Z'
+tags:
+  '52': {object: connection_plate_white_sideA, yaml: /home/samuel/gt-6dof/project-2025-11-08T23-10-29Z/boards/connection_plate_white_sideA.yaml}
+  '53': {object: connection_plate_white_sideA, yaml: /home/samuel/gt-6dof/project-2025-11-08T23-10-29Z/boards/connection_plate_white_sideA.yaml}
+  '54': {object: connection_plate_white_sideA, yaml: /home/samuel/gt-6dof/project-2025-11-08T23-10-29Z/boards/connection_plate_white_sideA.yaml}
+  '55': {object: connection_plate_white_sideA, yaml: /home/samuel/gt-6dof/project-2025-11-08T23-10-29Z/boards/connection_plate_white_sideA.yaml}
+```
+
+The registry is updated each time you run `make_board`. If the same tag ID is already mapped to another face, you’ll be warned; resolve by editing or removing the older mapping if that’s intentional.
+
+---
 
 > Faces may use different tag sizes; each face YAML stores its own `tag_size_m`.
 
