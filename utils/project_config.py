@@ -1,28 +1,34 @@
 from __future__ import annotations
 """
-Project resolution & registry for GT-6DoF-ATag.
+Project resolution & registry for PoseTag.
 
 Key behavior
 ------------
-- Cross-platform projects home:  ~/gt-6dof  (override with $GTAT_PROJECTS_DIR).
+- Canonical projects home: ~/posetag.
+- Legacy projects home: ~/gt-6dof (kept as a read fallback during migration).
 - Priority when resolving a project root:
     1) CLI path (--project_root)
-    2) $GTAT_PROJECT (path)
+    2) $POSETAG_PROJECT (or legacy $GTAT_PROJECT)
     3) Config 'current' (name)
-    4) Most recent existing project under ~/gt-6dof
-    5) Create a new timestamped project under ~/gt-6dof
+    4) Most recent existing project under the canonical/legacy projects homes
+    5) Create a new timestamped project under ~/posetag
 - Standard per-project layout: boards/, shots/, objects/, datasets/
-- MRU tracking in ~/.config/gt6dof_atag/config.yaml
+- MRU tracking in ~/.config/posetag/config.yaml
+- Legacy config in ~/.config/gt6dof_atag/config.yaml is read when the canonical
+  config does not exist yet.
 """
 import os, time
 from pathlib import Path
 from typing import Optional, Dict, Any, List, Tuple
 import yaml
 
-_APP_NAME = "gt6dof_atag"
+_APP_NAME = "posetag"
+_LEGACY_APP_NAME = "gt6dof_atag"
 _CFG_FILENAME = "config.yaml"
-_PROJECTS_HOME_ENV = "GTAT_PROJECTS_DIR"
-_DEFAULT_PROJECTS_HOME_NAME = "gt-6dof"
+_PROJECTS_HOME_ENVS = ("POSETAG_PROJECTS_DIR", "GTAT_PROJECTS_DIR")
+_ACTIVE_PROJECT_ENVS = ("POSETAG_PROJECT", "GTAT_PROJECT")
+_DEFAULT_PROJECTS_HOME_NAME = "posetag"
+_LEGACY_PROJECTS_HOME_NAME = "gt-6dof"
 _STANDARD_SUBDIRS = ("boards", "shots", "objects", "datasets")
 
 
@@ -45,6 +51,16 @@ def config_path() -> Path:
     return _config_dir() / _CFG_FILENAME
 
 
+def _legacy_config_path() -> Path:
+    """Legacy config location retained as a read fallback during migration."""
+    if os.name == "nt":
+        base = Path(os.environ.get("APPDATA", Path.home() / "AppData" / "Roaming"))
+        return base / _LEGACY_APP_NAME / _CFG_FILENAME
+    xdg = os.environ.get("XDG_CONFIG_HOME")
+    base = Path(xdg) if xdg else (Path.home() / ".config")
+    return base / _LEGACY_APP_NAME / _CFG_FILENAME
+
+
 def _atomic_write(path: Path, data: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
@@ -57,17 +73,32 @@ def _norm(p: Path | str) -> Path:
 
 
 # --------- projects home ---------
+def _default_projects_homes() -> list[Path]:
+    """Return canonical and legacy project homes in preferred discovery order."""
+    canonical = _norm(Path.home() / _DEFAULT_PROJECTS_HOME_NAME)
+    legacy = _norm(Path.home() / _LEGACY_PROJECTS_HOME_NAME)
+    if canonical.exists():
+        return [canonical] + ([legacy] if legacy != canonical else [])
+    if legacy.exists():
+        return [legacy, canonical]
+    return [canonical]
+
+
+def _env_projects_home() -> Optional[Path]:
+    for env_name in _PROJECTS_HOME_ENVS:
+        env_value = os.environ.get(env_name)
+        if env_value:
+            return _norm(env_value)
+    return None
+
+
 def projects_home_dir() -> Path:
     """
     Return the directory that houses all projects.
-    Default: ~/gt-6dof
-    Override with $GTAT_PROJECTS_DIR (absolute or relative).
+    Default: ~/posetag
+    Override with $POSETAG_PROJECTS_DIR (or legacy $GTAT_PROJECTS_DIR).
     """
-    env = os.environ.get(_PROJECTS_HOME_ENV)
-    if env:
-        home = _norm(env)
-    else:
-        home = _norm(Path.home() / _DEFAULT_PROJECTS_HOME_NAME)
+    home = _env_projects_home() or _default_projects_homes()[0]
     home.mkdir(parents=True, exist_ok=True)
     return home
 
@@ -96,11 +127,13 @@ def _project_name_for(root: Path) -> str:
 
 # --------- config I/O ---------
 def load_config() -> Dict[str, Any]:
-    p = config_path()
-    if not p.exists():
+    primary = config_path()
+    legacy = _legacy_config_path()
+    path = primary if primary.exists() else legacy
+    if not path.exists():
         return {"version": 1, "current": None, "projects": {}, "recent": []}
     try:
-        cfg = yaml.safe_load(p.read_text(encoding="utf-8")) or {}
+        cfg = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
     except Exception:
         cfg = {}
     cfg.setdefault("version", 1)
@@ -189,7 +222,7 @@ def current_project_root() -> Optional[Path]:
     return _norm(Path(info["root"]))
 
 
-# --------- discovery under ~/gt-6dof ---------
+# --------- discovery under project homes ---------
 def _iter_home_projects(home: Path) -> List[Tuple[Path, float]]:
     """
     Scan the projects home for candidate project roots, returning [(path, mtime)].
@@ -214,7 +247,7 @@ def _iter_home_projects(home: Path) -> List[Tuple[Path, float]]:
 def _new_default_project_root(home: Path) -> Path:
     """
     Create a new timestamped project directory under projects home.
-    Example: ~/gt-6dof/project-2025-11-08T12-34-56Z
+    Example: ~/posetag/project-2025-11-08T12-34-56Z
     """
     ts = _now_iso().replace(":", "-")
     candidate = home / f"project-{ts}"
@@ -228,9 +261,9 @@ def resolve_project_root(cli: Optional[Path | str] = None) -> Path:
     """
     Resolve the active project root with the following priority:
       1) CLI (--project_root) path if provided -> register & return
-      2) $GTAT_PROJECT (path) -> register & return
+      2) $POSETAG_PROJECT (or legacy $GTAT_PROJECT) -> register & return
       3) config.current (name) if set -> ensure layout & return
-      4) most recent project under projects_home_dir() -> register & return
+      4) most recent project under the canonical/legacy projects homes -> register & return
       5) create a new timestamped project under projects_home_dir() -> register & return
     """
     # 1) CLI
@@ -240,11 +273,12 @@ def resolve_project_root(cli: Optional[Path | str] = None) -> Path:
         return root
 
     # 2) ENV path
-    env = os.environ.get("GTAT_PROJECT")
-    if env:
-        root = _norm(env)
-        register_project(root)
-        return root
+    for env_name in _ACTIVE_PROJECT_ENVS:
+        env = os.environ.get(env_name)
+        if env:
+            root = _norm(env)
+            register_project(root)
+            return root
 
     # 3) Config 'current'
     cur = current_project_root()
@@ -252,15 +286,19 @@ def resolve_project_root(cli: Optional[Path | str] = None) -> Path:
         ensure_project_dirs(cur)
         return cur
 
-    # 4) Most recent under ~/gt-6dof
-    home = projects_home_dir()
-    discovered = _iter_home_projects(home)
-    if discovered:
-        root = discovered[0][0]
-        register_project(root)  # update MRU/current
-        return root
+    # 4) Most recent under canonical/legacy project homes
+    homes = [projects_home_dir()]
+    for candidate in _default_projects_homes():
+        if candidate not in homes:
+            homes.append(candidate)
+    for home in homes:
+        discovered = _iter_home_projects(home)
+        if discovered:
+            root = discovered[0][0]
+            register_project(root)  # update MRU/current
+            return root
 
-    # 5) Create a new project under ~/gt-6dof
-    root = _new_default_project_root(home)
+    # 5) Create a new project under the preferred projects home
+    root = _new_default_project_root(projects_home_dir())
     register_project(root)
     return root

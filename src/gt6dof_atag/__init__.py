@@ -1,1 +1,3 @@
-__version__ = "0.1.0"
+"""Compatibility package for the legacy gt6dof_atag namespace."""
+
+from posetag import __version__

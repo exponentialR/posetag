@@ -9,7 +9,7 @@ import csv
 import yaml, logging
 
 SIDE_RE = re.compile(r"^(?P<base>.+?)_side(?P<side>[A-Za-z]+)$")
-log = logging.getLogger("gtat")
+log = logging.getLogger("posetag")
 
 def _append_manifest(manifest_path: str, meta: dict):
     """

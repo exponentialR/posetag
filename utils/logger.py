@@ -16,8 +16,8 @@ def init_project_logger(log_file: Path, level: str = "INFO", console: bool = Fal
     log_file = Path(log_file)
     log_file.parent.mkdir(parents=True, exist_ok=True)
 
-    logger = logging.getLogger("gtat")
-    if getattr(logger, "_gtat_inited", False):
+    logger = logging.getLogger("posetag")
+    if getattr(logger, "_posetag_inited", False):
         return logger
 
     logger.setLevel(getattr(logging, level.upper(), logging.INFO))
@@ -31,6 +31,6 @@ def init_project_logger(log_file: Path, level: str = "INFO", console: bool = Fal
         sh.setFormatter(logging.Formatter(_FMT, datefmt=_DATEFMT))
         logger.addHandler(sh)
 
-    logger._gtat_inited = True  # type: ignore[attr-defined]
+    logger._posetag_inited = True  # type: ignore[attr-defined]
     logger.debug("Logger initialised at %s (level=%s)", log_file, level.upper())
     return logger
