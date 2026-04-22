@@ -13,7 +13,9 @@ What it does
       └─ runs/<UTC-ISO>/                 # per-run snapshot
            ├─ config.yaml                # args, board spec, image size, source info, samples
            └─ calib_color.yaml           # calibration for this run
-- Project resolution priority: --project_root → $GTAT_PROJECT → config current → last/most recent under ~/gt-6dof → new timestamped.
+- Project resolution priority: --project_root → $POSETAG_PROJECT
+  (legacy $GTAT_PROJECT still accepted) → config current → last/most recent
+  under ~/posetag (legacy ~/gt-6dof still discovered) → new timestamped project.
 
 Typical usage
 -------------
@@ -43,13 +45,16 @@ except Exception:
 
 # Project helpers (prefer packaged utils, but support repo-local utils/)
 try:
-    from gt6dof_atag.utils.project_config import resolve_project_root, ensure_project_dirs  # type: ignore
+    from posetag.utils.project_config import resolve_project_root, ensure_project_dirs  # type: ignore
 except Exception:
     try:
-        from utils.project_config import resolve_project_root, ensure_project_dirs  # type: ignore
+        from gt6dof_atag.utils.project_config import resolve_project_root, ensure_project_dirs  # type: ignore
     except Exception:
-        resolve_project_root = None  # type: ignore
-        ensure_project_dirs = None   # type: ignore
+        try:
+            from utils.project_config import resolve_project_root, ensure_project_dirs  # type: ignore
+        except Exception:
+            resolve_project_root = None  # type: ignore
+            ensure_project_dirs = None   # type: ignore
 
 
 class _HelpFmt(argparse.ArgumentDefaultsHelpFormatter, argparse.RawTextHelpFormatter):
@@ -142,8 +147,8 @@ def _prepare_project_io(args) -> tuple[Path, Path, Path, Path, Path]:
         pr = Path(resolve_project_root(args.project_root))
         ensure_project_dirs(pr)
     else:
-        # Fallback: cwd/gtat_project to avoid breaking older installs
-        pr = Path.cwd() / "gtat_project"
+        # Fallback: cwd/posetag_project to avoid breaking older installs
+        pr = Path.cwd() / "posetag_project"
         pr.mkdir(parents=True, exist_ok=True)
 
     calib_dir = pr / "calib"
