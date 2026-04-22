@@ -3,9 +3,9 @@ requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "gt6dof-atag"
+name = "posetag"
 version = "0.1.0"
-description = "Ground-truth 6-DoF from AprilTags with minimal annotation"
+description = "PoseTag: reproducible ground-truth 6-DoF poses from AprilTags"
 readme = "README.md"
 license = { file = "LICENSE" }
 authors = [{ name = "Samuel Adebayo" }]
@@ -18,18 +18,41 @@ realsense = ["pyrealsense2"]
 scipy = ["scipy"]
 
 [project.scripts]
-gtat-gen-tags     = "gt6dof_atag.cli.gen_tags:main"
-gtat-calib-charuco= "gt6dof_atag.cli.charuco:main"
-gtat-make-board   = "gt6dof_atag.cli.make_board:main"
+posetag = "posetag.cli.posetag:main"
+posetag-gen-tags = "posetag.cli.gen_tags:main"
+posetag-calib-charuco = "posetag.cli.charuco:main"
+posetag-make-board = "posetag.cli.make_board:main"
+posetag-capture-face = "posetag.cli.capture_face:main"
+posetag-annotate = "posetag.cli.annotate:main"
+posetag-collect = "posetag.cli.collect:main"
+gtat = "gt6dof_atag.cli.gtat:main"
+gtat-gen-tags = "gt6dof_atag.cli.gen_tags:main"
+gtat-calib-charuco = "gt6dof_atag.cli.charuco:main"
+gtat-make-board = "gt6dof_atag.cli.make_board:main"
 gtat-capture-face = "gt6dof_atag.cli.capture_face:main"
-gtat-annotate     = "gt6dof_atag.cli.annotate:main"
-gtat-collect      = "gt6dof_atag.cli.collect:main"
+gtat-annotate = "gt6dof_atag.cli.annotate:main"
+gtat-collect = "gt6dof_atag.cli.collect:main"
 
 [tool.setuptools]
-package-dir = {"" = "src"}
-
-[tool.setuptools.packages.find]
-where = ["src"]
-
-[project.scripts]
-gtat = "gt6dof_atag.cli.gtat:main"
+package-dir = { "" = "src", "utils" = "utils" }
+packages = [
+  "posetag",
+  "posetag.cli",
+  "posetag.utils",
+  "gt6dof_atag",
+  "gt6dof_atag.cli",
+  "gt6dof_atag.utils",
+  "utils",
+]
+py-modules = [
+  "annotate_shots",
+  "capture_face",
+  "collect_gt_dataset",
+  "gen_april_tags",
+  "gen_keypoints",
+  "generate_canonical_keypoints",
+  "make_board",
+  "projectctl",
+  "review_bboxes",
+  "view_keypoints",
+]
