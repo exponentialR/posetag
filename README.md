@@ -65,6 +65,20 @@ python3 -m pip install -e ".[realsense]"
 python3 -m pip install -e ".[scipy]"
 ```
 
+## Developer checks
+
+Validate GitHub Actions workflows locally before commit or push:
+
+```bash
+./scripts/check-workflows.sh
+```
+
+The script uses a local `actionlint` binary when available, or falls back to
+the `rhysd/actionlint` Docker image if Docker is installed.
+
+Workflow changes are also linted automatically in GitHub Actions on pull
+requests and pushes to `develop`.
+
 ## Project Management
 
 Create or select an active PoseTag project:
