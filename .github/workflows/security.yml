@@ -47,11 +47,25 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install package and audit tool
+      - name: Install audit tool
         run: |
           python -m pip install --upgrade pip
-          python -m pip install ".[apriltags,scipy]" pip-audit
+          python -m pip install pip-audit
 
-      - name: Audit Python dependencies
+      - name: Build project dependency list
         run: |
-          python -m pip_audit
+          python -m venv .audit-venv
+          . .audit-venv/bin/activate
+          python -m pip install --upgrade pip
+          python -m pip install ".[apriltags,scipy]"
+          python -m pip freeze \
+            --exclude posetag \
+            --exclude pip \
+            --exclude setuptools \
+            --exclude wheel \
+            > audit-requirements.txt
+          cat audit-requirements.txt
+
+      - name: Audit project dependencies
+        run: |
+          python -m pip_audit -r audit-requirements.txt
