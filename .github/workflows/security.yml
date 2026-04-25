@@ -39,14 +39,6 @@ jobs:
           output: .codeql-results
           upload: never
 
-      - name: Upload CodeQL SARIF artifact
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: codeql-sarif-${{ matrix.language }}
-          path: .codeql-results/*.sarif
-          if-no-files-found: error
-
   python-dependency-audit:
     name: Python dependency audit
     runs-on: ubuntu-latest
