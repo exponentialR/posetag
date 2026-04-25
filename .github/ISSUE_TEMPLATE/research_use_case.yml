@@ -1,0 +1,58 @@
+name: Research use case
+description: Describe how PoseTag is being used or evaluated in research work.
+title: "[Research Use Case]: "
+labels:
+  - research-use
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Use this template to document a research, experimental, or evaluation
+        use case involving PoseTag.
+
+        These reports can help demonstrate public research use and clarify
+        future requirements.
+  - type: textarea
+    id: context
+    attributes:
+      label: Research context
+      description: Describe the project, task, or study in which PoseTag is being used.
+    validations:
+      required: true
+  - type: textarea
+    id: workflow
+    attributes:
+      label: PoseTag workflow used
+      description: Which stages or tools are part of your workflow?
+    validations:
+      required: true
+  - type: textarea
+    id: objects
+    attributes:
+      label: Objects, sensors, and data conditions
+      description: Describe relevant objects, camera setup, calibration assumptions, and capture conditions.
+    validations:
+      required: true
+  - type: textarea
+    id: outcomes
+    attributes:
+      label: Outcomes and value
+      description: What did PoseTag enable, and what evidence can be shared publicly?
+    validations:
+      required: true
+  - type: textarea
+    id: gaps
+    attributes:
+      label: Limitations or requested improvements
+      description: Describe missing features, pain points, or scientific concerns.
+    validations:
+      required: false
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Confirmation
+      options:
+        - label: I am sharing only information that can be disclosed publicly.
+          required: true
+        - label: I described the use case clearly enough to help guide future development.
+          required: true

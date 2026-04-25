@@ -1,0 +1,82 @@
+name: Bug report
+description: Report a reproducible bug in PoseTag.
+title: "[Bug]: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting a bug in PoseTag.
+
+        Please provide enough detail for another user or maintainer to
+        reproduce the issue. Scientific correctness and reproducibility matter
+        more than quick guesses, so concrete inputs, commands, and outputs are
+        especially helpful.
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: Describe the bug and the expected behaviour.
+      placeholder: A short explanation of what happened and what you expected.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction steps
+      description: List the exact steps needed to reproduce the problem.
+      placeholder: |
+        1. Install PoseTag with ...
+        2. Run ...
+        3. Open ...
+        4. Observe ...
+    validations:
+      required: true
+  - type: textarea
+    id: inputs
+    attributes:
+      label: Inputs and data
+      description: Describe the calibration files, board YAMLs, media, or other inputs involved.
+      placeholder: Include file names, sample paths, units, resolutions, or minimal synthetic inputs when possible.
+    validations:
+      required: true
+  - type: textarea
+    id: observed
+    attributes:
+      label: Observed result
+      description: Paste the error, incorrect output, or unexpected behaviour.
+      render: text
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected result
+      description: Explain what should have happened instead.
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Report the software environment used for the reproduction.
+      placeholder: |
+        - OS:
+        - Python version:
+        - Install method:
+        - Camera source:
+        - Optional dependencies in use:
+    validations:
+      required: true
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Confirmation
+      options:
+        - label: I confirmed this issue is reproducible with the steps above.
+          required: true
+        - label: I included enough detail for another person to attempt reproduction.
+          required: true
+        - label: If the issue may affect pose maths, calibration, units, or schemas, I described the scientific impact.
+          required: false

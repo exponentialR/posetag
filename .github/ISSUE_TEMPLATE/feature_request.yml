@@ -1,0 +1,58 @@
+name: Feature request
+description: Propose an improvement or new capability for PoseTag.
+title: "[Feature]: "
+labels:
+  - enhancement
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Use this template for proposed improvements to PoseTag.
+
+        Please focus on the user need, scientific or reproducibility benefit,
+        and likely workflow impact.
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem or need
+      description: What limitation, pain point, or missing capability are you trying to address?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed change
+      description: Describe the feature or improvement you want.
+    validations:
+      required: true
+  - type: textarea
+    id: workflow
+    attributes:
+      label: Workflow impact
+      description: Explain which PoseTag workflow stages this would affect.
+      placeholder: For example calibration, board creation, annotation, collection, packaging, testing, or documentation.
+    validations:
+      required: true
+  - type: textarea
+    id: scientific
+    attributes:
+      label: Scientific and reproducibility considerations
+      description: Note any implications for pose conventions, units, schemas, validation, or reproducibility.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Describe any workaround or alternative you considered.
+    validations:
+      required: false
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Confirmation
+      options:
+        - label: I explained why this request would help users or maintainers.
+          required: true
+        - label: I described any expected scientific, schema, or reproducibility impact.
+          required: true
