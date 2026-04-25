@@ -47,6 +47,7 @@ PAPER_MM = {
     "LEGAL": (215.9, 355.6),
 }
 APRILTAG_36H11_DICT = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_APRILTAG_36h11)
+MARKER_BORDER_BITS = 1
 
 DEFAULT_OUT_DIR = "apriltags_out"
 DEFAULT_PREFIX = "apriltag_36h11"
@@ -76,7 +77,9 @@ def mm_to_px(mm: float, dpi: int) -> int:
 def make_tag_bitmap(tag_id: int, side_mm: float, dpi: int) -> np.ndarray:
     side_px = mm_to_px(side_mm, dpi)
     if hasattr(cv2.aruco, "generateImageMarker"):
-        return cv2.aruco.generateImageMarker(APRILTAG_36H11_DICT, tag_id, side_px, 1)
+        return cv2.aruco.generateImageMarker(
+            APRILTAG_36H11_DICT, tag_id, side_px, MARKER_BORDER_BITS
+        )
     return cv2.aruco.drawMarker(APRILTAG_36H11_DICT, tag_id, side_px)
 
 
@@ -306,8 +309,12 @@ def validate_generation_inputs(
         raise TagGenerationError("--tag-size-mm must be a positive millimetre value.")
     if dpi <= 0:
         raise TagGenerationError("--dpi must be a positive integer.")
-    if mm_to_px(tag_size_mm, dpi) < 1:
-        raise TagGenerationError("--tag-size-mm and --dpi must produce a tag at least 1 pixel wide.")
+    min_tag_px = APRILTAG_36H11_DICT.markerSize + 2 * MARKER_BORDER_BITS
+    if mm_to_px(tag_size_mm, dpi) < min_tag_px:
+        raise TagGenerationError(
+            f"--tag-size-mm and --dpi must produce a tag at least {min_tag_px} pixels wide "
+            "for AprilTag 36h11."
+        )
     if mm_to_px(paper_w_mm, dpi) < 1 or mm_to_px(paper_h_mm, dpi) < 1:
         raise TagGenerationError("Paper dimensions and --dpi must produce a page at least 1 pixel wide and high.")
     if not (math.isfinite(margin_frac) and 0 <= margin_frac < 0.45):

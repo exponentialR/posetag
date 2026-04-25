@@ -200,7 +200,11 @@ class GenerateTagsStep0Tests(unittest.TestCase):
         parser = generate_tags.build_parser()
         bad_cases = [
             (["--tag-size-mm", "0", "--ids", "1"], "--tag-size-mm"),
-            (["--tag-size-mm", "0.001", "--ids", "1", "--dpi", "1"], "at least 1 pixel"),
+            (["--tag-size-mm", "0.001", "--ids", "1", "--dpi", "1"], "at least 8 pixels"),
+            (
+                ["--tag-size-mm", "1", "--ids", "1", "--dpi", "100", "--out_dir", "/tmp/posetag-smalltag"],
+                "at least 8 pixels",
+            ),
             (["--tag-size-mm", "40", "--ids", "1", "--dpi", "0"], "--dpi"),
             (["--tag-size-mm", "40", "--ids", "1", "--margin-frac", "0.9"], "--margin-frac"),
             (["--tag-size-mm", "40", "--ids", "1", "--label-gap-frac", "-0.1"], "--label-gap-frac"),
