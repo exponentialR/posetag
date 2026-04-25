@@ -178,30 +178,41 @@ output; otherwise it reports that PDF output is optional and continues.
 
 Press `SPACE` to capture a sample and `ENTER` to solve. Outputs a
 `calib_color.yaml` containing `fx`, `fy`, `cx`, `cy`, distortion, image size,
-and reprojection RMS. With `--project_root`, output defaults to
-`<root>/calib/calib_color.yaml`.
+and reprojection RMS. With `--project_root`, the latest calibration defaults to
+`<root>/calib/calib_color.yaml`. Each run also stores raw calibration samples
+under `<root>/calib/images/set_XX/` and a timestamped snapshot under
+`<root>/calib/runs/<UTC-timestamp>/`.
 
 **Generic webcam**
 
 ```bash
-posetag-calib-charuco --source opencv --cam 0 \
-  --squares-x 5 --squares-y 3 --square-length-mm 50 --marker-length-mm 37 --dict 7X7_100
+posetag-calib-charuco --project_root my_project --source opencv --cam 0 \
+  --squares-x 3 --squares-y 5 --square-length-mm 50 --marker-length-mm 37 --dict 7X7_50
 ```
 
 **Intel RealSense**
 
 ```bash
-posetag-calib-charuco --source realsense --width 640 --height 480 --fps 30
+posetag-calib-charuco --project_root my_project --source realsense \
+  --width 640 --height 480 --fps 30 \
+  --squares-x 3 --squares-y 5 --square-length-mm 50 --marker-length-mm 37 --dict 7X7_50
 ```
 
 **Video file**
 
 ```bash
-posetag-calib-charuco --source video --video sample.mp4
+posetag-calib-charuco --project_root my_project --source video --video sample.mp4 \
+  --squares-x 3 --squares-y 5 --square-length-mm 50 --marker-length-mm 37 --dict 7X7_50
 ```
 
-Keep print scale at 100%. OpenCV webcams treat `--width` / `--height` as
+Keep print scale at `100%` / `Actual size`, and ensure `--squares-x`,
+`--squares-y`, `--square-length-mm`, `--marker-length-mm`, and `--dict` match
+the printed ChArUco board. OpenCV webcams treat `--width` / `--height` as
 best-effort; the YAML records the actual stream size used during calibration.
+Use the recorded `image_width` / `image_height` for downstream capture.
+
+For the full Step 1 contract, failure modes, and verification checklist, see
+[`docs/workflows/step1_calibrate_charuco.md`](docs/workflows/step1_calibrate_charuco.md).
 
 Sample `calib_color.yaml`:
 
