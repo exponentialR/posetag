@@ -8,6 +8,7 @@ on:
   merge_group:
 
 permissions:
+  actions: read
   contents: read
   security-events: write
   pull-requests: read
