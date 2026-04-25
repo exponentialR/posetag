@@ -19,8 +19,13 @@
   overlapping neighbouring tags
 - Replaced single-page truncation with deterministic multi-page output so all
   requested IDs are emitted
+- Fixed explicit `--out_dir apriltags_out` handling when `--project_root` is set
+- Added user-facing validation for invalid IDs, non-positive dimensions, DPI,
+  and layout fractions before OpenCV rendering
+- Embedded requested DPI metadata in guaranteed PNG outputs
 - Added hardware-free tests for ID parsing, project-root behavior, output
-  placement, error handling, label fitting, pagination, and CLI smoke coverage
+  placement, error handling, label fitting, pagination, config isolation, and
+  CLI smoke coverage
 - Added focused Step 0 workflow documentation
 
 ## Commands Tested
@@ -40,6 +45,9 @@
 - Generated PNG opens with OpenCV and has non-zero dimensions
 - Generated labels are compact and fit within their grid cells
 - More requested IDs than one page can hold are split across page-numbered PNGs
+- Explicit output directories are honored even when they match the default name
+- Invalid numeric inputs and out-of-range tag IDs fail with PoseTag errors
+- PNG outputs include requested DPI metadata for print tooling that reads it
 - PDF remains optional and depends on Pillow availability
 
 ## Remaining Technical Debt

@@ -28,7 +28,8 @@ posetag-gen-tags --project_root <path> --tag-size-mm <N> --ids <ids>
 - `--dpi <N>`
   Output rendering DPI. Example: `150` for quick checks, higher for print.
 - `--out_dir <path>`
-  Optional explicit output directory override.
+  Optional explicit output directory override. When supplied with
+  `--project_root`, this path is still honored instead of the project default.
 
 ## Output Locations
 
@@ -75,6 +76,7 @@ posetag-gen-tags --project_root my_project --tag-size-mm 40 --ids 1-3,7,9-10 --o
 ## Guaranteed Vs Optional Outputs
 
 - Guaranteed: PNG output.
+  PNG files include the requested DPI metadata.
 - Optional: PDF output when Pillow is installed.
 - Multiple pages: when the requested IDs exceed one sheet, PoseTag writes
   deterministic page-numbered outputs such as `page01of03`, `page02of03`, and
@@ -89,8 +91,11 @@ The command should fail clearly for:
 
 - malformed `--ids` values such as `1,a,3`
 - descending ranges such as `4-1`
+- tag IDs outside the AprilTag 36h11 dictionary
 - missing required ID inputs
+- non-positive `--tag-size-mm` or `--dpi` values
 - invalid paper size strings such as `--paper-mm bad`
+- invalid margin or label-gap fractions
 - impossible page configurations where even one tag cannot fit on the selected page
 
 ## Printing Guidance

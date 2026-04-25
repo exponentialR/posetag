@@ -20,9 +20,12 @@ Print at 100% / Actual size so the black square edge matches ``--tag-size-mm``.
 from __future__ import annotations
 
 import argparse
+import math
 import os
+import struct
 import sys
 import textwrap
+import zlib
 from pathlib import Path
 
 import cv2
@@ -43,6 +46,7 @@ PAPER_MM = {
     "LETTER": (215.9, 279.4),
     "LEGAL": (215.9, 355.6),
 }
+APRILTAG_36H11_DICT = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_APRILTAG_36h11)
 
 DEFAULT_OUT_DIR = "apriltags_out"
 DEFAULT_PREFIX = "apriltag_36h11"
@@ -71,10 +75,9 @@ def mm_to_px(mm: float, dpi: int) -> int:
 
 def make_tag_bitmap(tag_id: int, side_mm: float, dpi: int) -> np.ndarray:
     side_px = mm_to_px(side_mm, dpi)
-    tag_dictionary = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_APRILTAG_36h11)
     if hasattr(cv2.aruco, "generateImageMarker"):
-        return cv2.aruco.generateImageMarker(tag_dictionary, tag_id, side_px, 1)
-    return cv2.aruco.drawMarker(tag_dictionary, tag_id, side_px)
+        return cv2.aruco.generateImageMarker(APRILTAG_36H11_DICT, tag_id, side_px, 1)
+    return cv2.aruco.drawMarker(APRILTAG_36H11_DICT, tag_id, side_px)
 
 
 def estimate_label_size_cv(
@@ -176,6 +179,30 @@ def make_canvas(paper_w_mm: float, paper_h_mm: float, dpi: int) -> tuple[np.ndar
     return np.full((height_px, width_px, 3), 255, dtype=np.uint8), width_px, height_px
 
 
+def write_png_with_dpi(path: Path, image: np.ndarray, dpi: int) -> None:
+    ok, encoded = cv2.imencode(".png", image)
+    if not ok:
+        raise TagGenerationError(f"Could not encode PNG output: {path}")
+
+    png_bytes = encoded.tobytes()
+    if not png_bytes.startswith(b"\x89PNG\r\n\x1a\n"):
+        raise TagGenerationError(f"OpenCV did not produce a valid PNG stream: {path}")
+
+    pixels_per_metre = int(round(dpi / 0.0254))
+    data = struct.pack(">IIB", pixels_per_metre, pixels_per_metre, 1)
+    chunk_type = b"pHYs"
+    chunk = (
+        struct.pack(">I", len(data))
+        + chunk_type
+        + data
+        + struct.pack(">I", zlib.crc32(chunk_type + data) & 0xFFFFFFFF)
+    )
+
+    first_chunk_length = struct.unpack(">I", png_bytes[8:12])[0]
+    first_chunk_end = 8 + 4 + 4 + first_chunk_length + 4
+    path.write_bytes(png_bytes[:first_chunk_end] + chunk + png_bytes[first_chunk_end:])
+
+
 def parse_paper(paper: str, custom_mm: str | None, orientation: str) -> tuple[float, float]:
     if custom_mm:
         try:
@@ -193,6 +220,9 @@ def parse_paper(paper: str, custom_mm: str | None, orientation: str) -> tuple[fl
                 f"Unknown paper '{paper}'. Choose from: {', '.join(PAPER_MM.keys())} or use --paper-mm WxH."
             )
         w_mm, h_mm = PAPER_MM[key]
+
+    if not (math.isfinite(w_mm) and math.isfinite(h_mm)) or w_mm <= 0 or h_mm <= 0:
+        raise TagGenerationError("Paper dimensions must be positive finite millimetre values.")
 
     if orientation.lower() == "landscape":
         return max(w_mm, h_mm), min(w_mm, h_mm)
@@ -251,15 +281,49 @@ def parse_ids_arg(
     raise TagGenerationError("Provide either --ids or both --id_start and --id_end.")
 
 
-def resolve_output_dir(project_root: Path | None, out_dir: str) -> Path:
+def resolve_output_dir(project_root: Path | None, out_dir: str | None) -> Path:
     if project_root is None:
-        return Path(out_dir)
+        return Path(out_dir or DEFAULT_OUT_DIR)
 
     resolved_root = Path(resolve_project_root(project_root))
     ensure_project_dirs(resolved_root)
-    if out_dir == DEFAULT_OUT_DIR:
+    if out_dir is None:
         return resolved_root / "boards" / "patterns"
     return Path(out_dir)
+
+
+def validate_generation_inputs(
+    *,
+    tag_size_mm: float,
+    dpi: int,
+    ids: list[int],
+    paper_w_mm: float,
+    paper_h_mm: float,
+    margin_frac: float,
+    label_gap_frac: float,
+) -> None:
+    if not math.isfinite(tag_size_mm) or tag_size_mm <= 0:
+        raise TagGenerationError("--tag-size-mm must be a positive millimetre value.")
+    if dpi <= 0:
+        raise TagGenerationError("--dpi must be a positive integer.")
+    if mm_to_px(tag_size_mm, dpi) < 1:
+        raise TagGenerationError("--tag-size-mm and --dpi must produce a tag at least 1 pixel wide.")
+    if mm_to_px(paper_w_mm, dpi) < 1 or mm_to_px(paper_h_mm, dpi) < 1:
+        raise TagGenerationError("Paper dimensions and --dpi must produce a page at least 1 pixel wide and high.")
+    if not (math.isfinite(margin_frac) and 0 <= margin_frac < 0.45):
+        raise TagGenerationError("--margin-frac must be at least 0 and less than 0.45.")
+    if not (math.isfinite(label_gap_frac) and 0 <= label_gap_frac < 1):
+        raise TagGenerationError("--label-gap-frac must be at least 0 and less than 1.")
+    if not (math.isfinite(paper_w_mm) and math.isfinite(paper_h_mm)):
+        raise TagGenerationError("Paper dimensions must be finite millimetre values.")
+
+    max_marker_id = APRILTAG_36H11_DICT.bytesList.shape[0] - 1
+    bad_ids = [tag_id for tag_id in ids if tag_id < 0 or tag_id > max_marker_id]
+    if bad_ids:
+        raise TagGenerationError(
+            f"AprilTag 36h11 IDs must be between 0 and {max_marker_id}; invalid ID(s): "
+            + ", ".join(str(tag_id) for tag_id in bad_ids[:5])
+        )
 
 
 def _format_id_range(ids: list[int]) -> str:
@@ -354,7 +418,7 @@ def layout_sheet(
             base_name = f"{base_name}_page{page_index:02d}of{len(page_ids):02d}"
 
         png_path = out_dir / f"{base_name}.png"
-        cv2.imwrite(str(png_path), sheet)
+        write_png_with_dpi(png_path, sheet, dpi)
         png_paths.append(png_path)
 
         if HAVE_PIL:
@@ -422,7 +486,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--out_dir",
         type=str,
-        default=DEFAULT_OUT_DIR,
+        default=None,
         help="Output directory. With --project_root and no explicit override, outputs go to <project_root>/boards/patterns.",
     )
     parser.add_argument("--prefix", type=str, default=DEFAULT_PREFIX, help="Filename prefix.")
@@ -444,6 +508,15 @@ def run(args: argparse.Namespace) -> tuple[list[Path], list[Path]]:
 
     paper_w_mm, paper_h_mm = parse_paper(args.paper, args.paper_mm, args.orientation)
     ids = parse_ids_arg(args.ids, args.id_start, args.id_end)
+    validate_generation_inputs(
+        tag_size_mm=args.tag_size_mm,
+        dpi=args.dpi,
+        ids=ids,
+        paper_w_mm=paper_w_mm,
+        paper_h_mm=paper_h_mm,
+        margin_frac=args.margin_frac,
+        label_gap_frac=args.label_gap_frac,
+    )
     out_dir = resolve_output_dir(args.project_root, args.out_dir)
     return layout_sheet(
         paper_w_mm=paper_w_mm,
