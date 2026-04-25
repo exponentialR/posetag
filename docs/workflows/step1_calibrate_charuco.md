@@ -1,0 +1,205 @@
+# Step 1: Calibrate The Colour Camera With ChArUco
+
+This workflow validates the PoseTag Step 1 command:
+
+```bash
+posetag-calib-charuco --project_root <path> --source opencv --cam 0
+```
+
+Step 1 estimates colour-camera intrinsics and lens distortion from a printed
+ChArUco board. The calibration algorithm and OpenCV model are unchanged from
+the legacy implementation; this document records the user-facing contract,
+outputs, and checks needed before moving to Step 2.
+
+## Scientific Assumptions
+
+- The printed ChArUco board must be flat, rigid, and printed at `100%` /
+  `Actual size`.
+- `--square-length-mm` is the physical side length of one chessboard square in
+  millimetres.
+- `--marker-length-mm` is the physical side length of the ArUco marker inside
+  each square in millimetres.
+- The dictionary passed with `--dict` must match the printed board exactly.
+- Calibration is for the colour image stream only.
+- OpenCV webcam resolution requests are best effort. PoseTag records the actual
+  image size used for calibration in `image_width` and `image_height`.
+- Downstream capture should use the same colour resolution recorded in
+  `calib_color.yaml`.
+
+## Command Examples
+
+Generic OpenCV webcam:
+
+```bash
+posetag-calib-charuco --project_root my_project --source opencv --cam 0 \
+  --squares-x 3 --squares-y 5 --square-length-mm 50 --marker-length-mm 37 --dict 7X7_50
+```
+
+Intel RealSense colour stream:
+
+```bash
+posetag-calib-charuco --project_root my_project --source realsense \
+  --width 640 --height 480 --fps 30 \
+  --squares-x 3 --squares-y 5 --square-length-mm 50 --marker-length-mm 37 --dict 7X7_50
+```
+
+Video file:
+
+```bash
+posetag-calib-charuco --project_root my_project --source video --video sample.mp4 \
+  --squares-x 3 --squares-y 5 --square-length-mm 50 --marker-length-mm 37 --dict 7X7_50
+```
+
+Explicit output override:
+
+```bash
+posetag-calib-charuco --project_root my_project --source video --video sample.mp4 \
+  --out exported/calib_color.yaml
+```
+
+When `--out` is omitted, the latest calibration is always written to:
+
+```text
+<project_root>/calib/calib_color.yaml
+```
+
+## Board Arguments
+
+- `--squares-x`
+  Number of ChArUco squares along the board x direction.
+- `--squares-y`
+  Number of ChArUco squares along the board y direction.
+- `--square-length-mm`
+  Physical square size in millimetres.
+- `--marker-length-mm`
+  Physical marker size in millimetres.
+- `--dict`
+  ArUco dictionary name, for example `4X4_50`, `5X5_250`, `6X6_1000`,
+  `7X7_50`, or `APRILTAG_36H11`.
+
+The command fails before opening hardware if the dictionary name is not
+supported by the installed OpenCV build.
+
+## Controls
+
+- `SPACE`: save the current frame as a calibration sample when enough ChArUco
+  corners are detected.
+- `ENTER`: solve calibration from the collected samples.
+- `q`: quit without solving.
+
+Use diverse views: move and tilt the board so it appears across the frame,
+including near corners and edges, while avoiding blur and glare.
+
+## Project Directory Side Effects
+
+With `--project_root my_project`, PoseTag initializes or reuses:
+
+```text
+my_project/
+  boards/
+  shots/
+  objects/
+  datasets/
+  calib/
+    calib_color.yaml
+    images/
+      set_01/
+    runs/
+      <UTC-timestamp>/
+        config.yaml
+        calib_color.yaml
+```
+
+Each calibration invocation creates a new sample image folder:
+
+```text
+<project_root>/calib/images/set_01/
+<project_root>/calib/images/set_02/
+...
+```
+
+Each invocation also creates a timestamped run snapshot:
+
+```text
+<project_root>/calib/runs/YYYY-MM-DDTHH-MM-SSZ/
+```
+
+The latest calibration path remains deterministic:
+
+```text
+<project_root>/calib/calib_color.yaml
+```
+
+If `--out <path>` is supplied, the latest calibration YAML is written to that
+path instead. The run snapshot still stores a copy at:
+
+```text
+<project_root>/calib/runs/<UTC-timestamp>/calib_color.yaml
+```
+
+## Calibration YAML Schema
+
+The output YAML round-trips with `yaml.safe_load` and contains:
+
+```yaml
+image_width: 640
+image_height: 480
+camera_matrix:
+  fx: 600.0
+  fy: 610.0
+  cx: 320.0
+  cy: 240.0
+  data:
+  - [600.0, 0.0, 320.0]
+  - [0.0, 610.0, 240.0]
+  - [0.0, 0.0, 1.0]
+distortion_coefficients:
+  k1: -0.1
+  k2: 0.02
+  p1: 0.001
+  p2: -0.002
+  k3: 0.0
+  data:
+  - [-0.1, 0.02, 0.001, -0.002, 0.0]
+reproj_rms: 0.123
+model: plumb_bob
+notes: ChArUco 3x5, square=50.0mm, marker=37.0mm, dict=7X7_50
+```
+
+Required top-level fields:
+
+- `image_width`
+- `image_height`
+- `camera_matrix`
+- `distortion_coefficients`
+- `reproj_rms`
+- `model`
+- `notes`
+
+## Common Failure Modes
+
+- `--source video` without `--video` fails with a clear message.
+- `--source realsense` fails clearly when `pyrealsense2` is not installed.
+- Unsupported dictionary names fail before opening camera hardware.
+- A webcam index that cannot be opened reports the failing camera index.
+- A video path that cannot be opened reports the failing path.
+- Too few accepted samples, or too few samples after corner-count filtering,
+  stops before writing calibration output.
+- Poor print scale, glare, blur, or using the wrong dictionary can cause weak
+  detections and high reprojection error.
+
+## Verify Before Step 2
+
+Before building boards in Step 2:
+
+1. Confirm the YAML exists at `<project_root>/calib/calib_color.yaml` or at the
+   explicit `--out` path you supplied.
+2. Load it with `yaml.safe_load` and confirm the required top-level fields are
+   present.
+3. Check `image_width` and `image_height`; use the same colour resolution in
+   downstream capture.
+4. Inspect `reproj_rms`. Lower is better; unexpectedly large values suggest
+   blur, wrong board dimensions, wrong dictionary, insufficient viewpoint
+   diversity, or print scaling errors.
+5. Check `<project_root>/calib/runs/<timestamp>/config.yaml` to confirm the
+   board dimensions, dictionary, source, and sample count match the run.

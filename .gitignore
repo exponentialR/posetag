@@ -24,3 +24,10 @@ htmlcov/
 .venv/
 venv/
 env/
+
+# Local PoseTag projects and generated calibration/capture artifacts
+my_project/
+
+# Editable-install/build metadata
+*.egg-info/
+src/*.egg-info/
