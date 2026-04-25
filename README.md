@@ -105,11 +105,32 @@ notes should change together.
 ### 0) Generate AprilTags for printing
 
 Create printable **AprilTag 36h11** sheets to stick on object faces.
-Using `--project_root` also initializes the project and saves sheets to
-`<root>/boards/patterns/`. Outputs are **PNG** and, if Pillow is installed,
-**PDF**. Print at **100%** so the black square edge matches `--tag-size-mm`.
+The normal project workflow is:
 
-**Range of IDs (inclusive)**
+```bash
+posetag-gen-tags --project_root my_project --tag-size-mm 40 --ids 1-4 --dpi 150
+```
+
+This initializes or reuses `my_project/` and writes sheets to:
+
+```text
+my_project/boards/patterns/
+```
+
+Preview of generated sheet content:
+
+![AprilTag sheet preview](media/step0_apriltag_sheet_preview.png)
+
+Print at **100%** / **Actual size** so the black square edge matches
+`--tag-size-mm`. Do not use “Fit to page”.
+
+**Without a project root**
+
+```bash
+posetag-gen-tags --tag-size-mm 40 --ids 1-4 --out_dir apriltags_out
+```
+
+**Range of IDs**
 
 ```bash
 posetag-gen-tags --project_root my_project --tag-size-mm 80 --ids 46-49
@@ -121,8 +142,19 @@ posetag-gen-tags --project_root my_project --tag-size-mm 80 --ids 46-49
 posetag-gen-tags --project_root my_project --tag-size-mm 40 --ids 19,20,21,22,27,28,29,30
 ```
 
+If the requested IDs do not fit on one sheet, PoseTag writes deterministic
+page-numbered PNGs, for example `page01of03`, `page02of03`, and `page03of03`.
+This tiny-paper command is mainly useful for testing pagination:
+
+```bash
+posetag-gen-tags --project_root my_project --tag-size-mm 40 --paper-mm 80x80 --ids 1-3 --dpi 100
+```
+
 Options you might tweak later: `--paper {A4,LETTER,LEGAL}`, `--paper-mm WxH`,
 `--orientation`, `--dpi`, and `--out_dir`.
+
+PNG output is guaranteed. If Pillow is installed, PoseTag also writes PDF
+output; otherwise it reports that PDF output is optional and continues.
 
 ---
 
