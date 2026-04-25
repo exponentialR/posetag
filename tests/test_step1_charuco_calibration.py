@@ -14,6 +14,7 @@ import numpy as np
 import yaml
 
 from posetag.cli import charuco as charuco_cli
+from utils import charuco_calibrate
 from posetag.pipelines.charuco_calibration import (
     CharucoCalibrationError,
     build_calibration_yaml,
@@ -52,6 +53,17 @@ class CharucoCalibrationStep1Tests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, msg=result.stderr)
         self.assertIn("Colour ChArUco calibration", result.stdout)
 
+    def test_direct_legacy_script_help_resolves_from_checkout(self) -> None:
+        result = subprocess.run(
+            [sys.executable, "utils/charuco_calibrate.py", "--help"],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+
+        self.assertEqual(result.returncode, 0, msg=result.stderr)
+        self.assertIn("Colour ChArUco calibration", result.stdout)
+
     def test_dictionary_parsing_accepts_valid_name(self) -> None:
         dictionary = get_dictionary("7X7_50")
 
@@ -70,12 +82,92 @@ class CharucoCalibrationStep1Tests(unittest.TestCase):
 
         self.assertIn("--video path is required", str(ctx.exception))
 
+    def test_missing_video_path_fails_before_project_artifacts(self) -> None:
+        class FakeClosedVideoCapture:
+            def __init__(self, _path: str) -> None:
+                pass
+
+            def isOpened(self) -> bool:
+                return False
+
+        with TemporaryDirectory() as tmpdir:
+            base = Path(tmpdir)
+            project_root = base / "project"
+            env = {
+                "HOME": str(base / "home"),
+                "XDG_CONFIG_HOME": str(base / ".config"),
+            }
+
+            with patch.dict(os.environ, env, clear=False):
+                with patch("utils.charuco_calibrate.cv2.VideoCapture", FakeClosedVideoCapture):
+                    with self.assertRaises(SystemExit) as ctx:
+                        charuco_cli.main(
+                            [
+                                "--project_root",
+                                str(project_root),
+                                "--source",
+                                "video",
+                                "--video",
+                                str(base / "missing.mp4"),
+                            ]
+                        )
+
+            self.assertIn("Could not open video", str(ctx.exception))
+            self.assertFalse((project_root / "calib").exists())
+
+    def test_video_eof_exits_capture_loop_clearly(self) -> None:
+        class FakeVideoCapture:
+            def __init__(self, _path: str) -> None:
+                self.released = False
+
+            def isOpened(self) -> bool:
+                return True
+
+            def read(self):
+                return False, None
+
+            def release(self) -> None:
+                self.released = True
+
+        with TemporaryDirectory() as tmpdir:
+            base = Path(tmpdir)
+            project_root = base / "project"
+            env = {
+                "HOME": str(base / "home"),
+                "XDG_CONFIG_HOME": str(base / ".config"),
+            }
+            stdout = StringIO()
+
+            with patch.dict(os.environ, env, clear=False):
+                with patch("utils.charuco_calibrate.cv2.VideoCapture", FakeVideoCapture):
+                    with patch("utils.charuco_calibrate.cv2.destroyAllWindows"):
+                        with self.assertRaises(SystemExit) as ctx:
+                            with redirect_stdout(stdout):
+                                charuco_cli.main(
+                                    [
+                                        "--project_root",
+                                        str(project_root),
+                                        "--source",
+                                        "video",
+                                        "--video",
+                                        str(base / "empty.mp4"),
+                                    ]
+                                )
+
+            self.assertIn("video ended", stdout.getvalue())
+            self.assertIn("Need at least", str(ctx.exception))
+
     def test_realsense_source_without_dependency_fails_clearly(self) -> None:
         with patch("utils.charuco_calibrate.rs", None):
             with self.assertRaises(SystemExit) as ctx:
                 charuco_cli.main(["--source", "realsense"])
 
         self.assertIn("pyrealsense2 is not available", str(ctx.exception))
+
+    def test_min_corners_default_matches_solver_threshold(self) -> None:
+        args = charuco_calibrate.parse_args([])
+
+        self.assertEqual(args.min_corners, 4)
 
     def test_project_io_preparation_creates_calibration_layout(self) -> None:
         with TemporaryDirectory() as tmpdir:

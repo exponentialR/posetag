@@ -30,9 +30,15 @@ leaving the legacy calibration loop in place as temporary technical debt.
   wrapper with explicit argv.
 - `--source video` without `--video` fails before opening hardware or creating
   calibration output folders.
+- Unreadable video paths fail before creating calibration output folders.
+- Video EOF exits the capture loop with a clear message instead of hanging.
 - `--source realsense` fails clearly when `pyrealsense2` is unavailable.
 - Invalid ArUco dictionary names fail clearly and list supported dictionary
   names.
+- The UI sample threshold now matches the solver threshold by default:
+  `--min-corners` defaults to `4`, and smaller values are promoted to `4`.
+- Direct checkout usage of `python utils/charuco_calibrate.py --help` is
+  preserved as a temporary legacy-script compatibility path.
 - Project calibration IO preparation is reusable and hardware-free.
 - Default latest output path is deterministic:
 
@@ -79,7 +85,10 @@ Hardware-free tests added for:
 - CLI help resolution.
 - Dictionary parsing success and failure.
 - Missing `--video` validation.
+- Missing/unreadable video path validation before project artifacts are created.
+- Video EOF behavior.
 - Missing RealSense dependency validation.
+- Legacy script `--help` resolution from a checkout.
 - Project IO layout creation.
 - Explicit `--out` override.
 - Calibration YAML schema writing and `yaml.safe_load` round-trip.

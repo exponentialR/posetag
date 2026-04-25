@@ -46,14 +46,27 @@ except Exception:
 # Canonical PoseTag helpers.  The capture/calibration loop remains in this
 # legacy module temporarily; pure validation, IO, and YAML helpers live in
 # posetag.pipelines so they can be tested without camera hardware.
-from posetag.pipelines.charuco_calibration import (  # type: ignore
-    CharucoCalibrationError,
-    build_calibration_yaml,
-    get_dictionary,
-    prepare_project_io,
-    validate_capture_args,
-    write_calibration_yaml,
-)
+try:
+    from posetag.pipelines.charuco_calibration import (  # type: ignore
+        CharucoCalibrationError,
+        build_calibration_yaml,
+        get_dictionary,
+        prepare_project_io,
+        validate_capture_args,
+        write_calibration_yaml,
+    )
+except ModuleNotFoundError:
+    repo_src = Path(__file__).resolve().parents[1] / "src"
+    if repo_src.is_dir() and str(repo_src) not in sys.path:
+        sys.path.insert(0, str(repo_src))
+    from posetag.pipelines.charuco_calibration import (  # type: ignore
+        CharucoCalibrationError,
+        build_calibration_yaml,
+        get_dictionary,
+        prepare_project_io,
+        validate_capture_args,
+        write_calibration_yaml,
+    )
 
 
 class _HelpFmt(argparse.ArgumentDefaultsHelpFormatter, argparse.RawTextHelpFormatter):
@@ -87,7 +100,8 @@ def build_parser():
                     help="Requested capture height (best effort for OpenCV webcams).")
     ap.add_argument("--fps", type=int, default=30,
                     help="Requested frames per second (best effort for OpenCV webcams).")
-    ap.add_argument("--min-corners", type=int, default=1, help="min ChArUco corners per sample")
+    ap.add_argument("--min-corners", type=int, default=4,
+                    help="min ChArUco corners per sample; values below 4 are promoted to 4")
     ap.add_argument("--min-samples", type=int, default=30, help="min accepted samples before solve")
     ap.add_argument("--auto", action="store_true")
     ap.add_argument("--auto-interval", type=int, default=10)
@@ -129,6 +143,58 @@ def _prepare_project_io(args) -> tuple[Path, Path, Path, Path, Path]:
         project_io.run_dir,
         project_io.out_yaml,
     )
+
+
+def _open_capture_source(args):
+    """Open the requested capture source without creating project artifacts."""
+
+    if args.source == "realsense":
+        pipe, cfg = rs.pipeline(), rs.config()
+        cfg.enable_stream(rs.stream.color, args.width, args.height, rs.format.bgr8, args.fps)
+        pipe.start(cfg)
+
+        def _read_frame():
+            frames = pipe.wait_for_frames()
+            cframe = frames.get_color_frame()
+            return None if not cframe else np.asanyarray(cframe.get_data())
+
+        def _stop():
+            pipe.stop()
+
+        return _read_frame, _stop
+
+    if args.source == "opencv":
+        cap = cv2.VideoCapture(args.cam)
+        if not cap.isOpened():
+            raise SystemExit(f"Could not open camera index {args.cam}")
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, args.width)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, args.height)
+        cap.set(cv2.CAP_PROP_FPS, args.fps)
+
+        def _read_frame():
+            ok, frame = cap.read()
+            return frame if ok else None
+
+        def _stop():
+            cap.release()
+
+        return _read_frame, _stop
+
+    if args.source == "video":
+        cap = cv2.VideoCapture(args.video)
+        if not cap.isOpened():
+            raise SystemExit(f"Could not open video: {args.video}")
+
+        def _read_frame():
+            ok, frame = cap.read()
+            return frame if ok else None
+
+        def _stop():
+            cap.release()
+
+        return _read_frame, _stop
+
+    raise SystemExit(f"Unsupported source: {args.source}")
 
 
 def calibrate_from_charuco(samples_corners, samples_ids, board, image_size):
@@ -201,13 +267,7 @@ def main(argv=None):
         dictionary = get_dictionary(args.dict)
     except CharucoCalibrationError as exc:
         raise SystemExit(str(exc)) from exc
-
-    # ----- Project-aware IO layout (always) -----
-    pr, calib_dir, images_dir, run_dir, out_yaml = _prepare_project_io(args)
-    print(f"[i] Project root = {pr}")
-    print(f"[i] Samples folder = {images_dir}")
-    print(f"[i] Run folder = {run_dir}")
-    args.out = str(out_yaml)  # ensure consistent path downstream
+    args.min_corners = max(4, args.min_corners)
 
     # ----- ArUco/board setup -----
     aruco = cv2.aruco
@@ -223,49 +283,18 @@ def main(argv=None):
         det_params = aruco.DetectorParameters_create()
 
     # ----- Source setup -----
-    if args.source == "realsense":
-        if rs is None:
-            sys.exit("pyrealsense2 not available; use --source opencv|video")
-        pipe, cfg = rs.pipeline(), rs.config()
-        cfg.enable_stream(rs.stream.color, args.width, args.height, rs.format.bgr8, args.fps)
-        profile = pipe.start(cfg)
+    _read_frame, _stop = _open_capture_source(args)
 
-        def _read_frame():
-            frames = pipe.wait_for_frames()
-            cframe = frames.get_color_frame()
-            return None if not cframe else np.asanyarray(cframe.get_data())
-
-        def _stop():
-            pipe.stop()
-
-    elif args.source == "opencv":
-        cap = cv2.VideoCapture(args.cam)
-        if not cap.isOpened():
-            sys.exit(f"Could not open camera index {args.cam}")
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, args.width)
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, args.height)
-        cap.set(cv2.CAP_PROP_FPS, args.fps)
-
-        def _read_frame():
-            ok, frame = cap.read()
-            return frame if ok else None
-
-        def _stop():
-            cap.release()
-
-    elif args.source == "video":
-        if not args.video:
-            sys.exit("--video path is required when --source=video")
-        cap = cv2.VideoCapture(args.video)
-        if not cap.isOpened():
-            sys.exit(f"Could not open video: {args.video}")
-
-        def _read_frame():
-            ok, frame = cap.read()
-            return frame if ok else None
-
-        def _stop():
-            cap.release()
+    try:
+        # ----- Project-aware IO layout -----
+        pr, calib_dir, images_dir, run_dir, out_yaml = _prepare_project_io(args)
+        print(f"[i] Project root = {pr}")
+        print(f"[i] Samples folder = {images_dir}")
+        print(f"[i] Run folder = {run_dir}")
+        args.out = str(out_yaml)  # ensure consistent path downstream
+    except Exception:
+        _stop()
+        raise
 
     # ----- Capture loop -----
     samples_corners, samples_ids = [], []
@@ -278,6 +307,9 @@ def main(argv=None):
         while True:
             color = _read_frame()
             if color is None:
+                if args.source == "video":
+                    print("[i] video ended; solving with collected samples.")
+                    break
                 continue
 
             # For non-RealSense, sync image_size to actual stream
@@ -348,7 +380,7 @@ def main(argv=None):
     # ----- Solve & write results -----
     img_size = (args.width, args.height)
     # ---- filter weak samples before solving ----
-    REQUIRED = max(4, args.min_corners)  # charuco solver needs at least 4 per view
+    REQUIRED = args.min_corners  # charuco solver needs at least 4 per view
     filtered_corners, filtered_ids = [], []
     for ch_c, ch_id in zip(samples_corners, samples_ids):
         if ch_c is not None and ch_id is not None and len(ch_c) >= REQUIRED:

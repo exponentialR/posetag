@@ -76,6 +76,10 @@ When `--out` is omitted, the latest calibration is always written to:
 - `--dict`
   ArUco dictionary name, for example `4X4_50`, `5X5_250`, `6X6_1000`,
   `7X7_50`, or `APRILTAG_36H11`.
+- `--min-corners`
+  Minimum detected ChArUco corners required before the UI marks a sample as
+  acceptable. The default is `4`, matching the minimum used before solving.
+  Smaller user-supplied values are promoted to `4`.
 
 The command fails before opening hardware if the dictionary name is not
 supported by the installed OpenCV build.
@@ -181,6 +185,10 @@ Required top-level fields:
 - `--source video` without `--video` fails with a clear message.
 - `--source realsense` fails clearly when `pyrealsense2` is not installed.
 - Unsupported dictionary names fail before opening camera hardware.
+- Missing or unreadable video paths fail before creating calibration run
+  folders.
+- Video EOF exits the capture loop with a clear message instead of waiting
+  forever for keyboard input.
 - A webcam index that cannot be opened reports the failing camera index.
 - A video path that cannot be opened reports the failing path.
 - Too few accepted samples, or too few samples after corner-count filtering,
