@@ -64,6 +64,26 @@ class CharucoCalibrationStep1Tests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, msg=result.stderr)
         self.assertIn("Colour ChArUco calibration", result.stdout)
 
+    def test_direct_script_fallback_adds_repo_root_and_src(self) -> None:
+        repo_root = Path(__file__).resolve().parents[1]
+        repo_src = repo_root / "src"
+        original_path = sys.path[:]
+
+        try:
+            sys.path[:] = [
+                path
+                for path in sys.path
+                if path not in {str(repo_root), str(repo_src)}
+            ]
+
+            charuco_calibrate._ensure_checkout_import_paths()
+
+            self.assertIn(str(repo_root), sys.path)
+            self.assertIn(str(repo_src), sys.path)
+            self.assertLess(sys.path.index(str(repo_src)), sys.path.index(str(repo_root)))
+        finally:
+            sys.path[:] = original_path
+
     def test_dictionary_parsing_accepts_valid_name(self) -> None:
         dictionary = get_dictionary("7X7_50")
 

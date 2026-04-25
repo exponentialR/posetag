@@ -43,6 +43,17 @@ try:
 except Exception:
     rs = None
 
+
+def _ensure_checkout_import_paths() -> None:
+    """Make direct ``python utils/charuco_calibrate.py`` work from a checkout."""
+
+    repo_root = Path(__file__).resolve().parents[1]
+    repo_src = repo_root / "src"
+    for path in (repo_root, repo_src):
+        if path.is_dir() and str(path) not in sys.path:
+            sys.path.insert(0, str(path))
+
+
 # Canonical PoseTag helpers.  The capture/calibration loop remains in this
 # legacy module temporarily; pure validation, IO, and YAML helpers live in
 # posetag.pipelines so they can be tested without camera hardware.
@@ -56,9 +67,7 @@ try:
         write_calibration_yaml,
     )
 except ModuleNotFoundError:
-    repo_src = Path(__file__).resolve().parents[1] / "src"
-    if repo_src.is_dir() and str(repo_src) not in sys.path:
-        sys.path.insert(0, str(repo_src))
+    _ensure_checkout_import_paths()
     from posetag.pipelines.charuco_calibration import (  # type: ignore
         CharucoCalibrationError,
         build_calibration_yaml,

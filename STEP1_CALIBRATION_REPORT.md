@@ -39,7 +39,8 @@ leaving the legacy calibration loop in place as temporary technical debt.
 - The UI sample threshold now matches the solver threshold by default:
   `--min-corners` defaults to `4`, and smaller values are promoted to `4`.
 - Direct checkout usage of `python utils/charuco_calibrate.py --help` is
-  preserved as a temporary legacy-script compatibility path.
+  preserved as a temporary legacy-script compatibility path by adding both the
+  repository root and `src/` to `sys.path` when needed.
 - Project calibration IO preparation is reusable and hardware-free.
 - Default latest output path is deterministic:
 
