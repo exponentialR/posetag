@@ -32,6 +32,7 @@ leaving the legacy calibration loop in place as temporary technical debt.
   calibration output folders.
 - Unreadable video paths fail before creating calibration output folders.
 - Video EOF exits the capture loop with a clear message instead of hanging.
+- Pressing `q` exits cleanly without solving or printing a traceback.
 - `--source realsense` fails clearly when `pyrealsense2` is unavailable.
 - Invalid ArUco dictionary names fail clearly and list supported dictionary
   names.
@@ -87,6 +88,7 @@ Hardware-free tests added for:
 - Missing `--video` validation.
 - Missing/unreadable video path validation before project artifacts are created.
 - Video EOF behavior.
+- Clean `q` exit behavior.
 - Missing RealSense dependency validation.
 - Legacy script `--help` resolution from a checkout.
 - Project IO layout creation.

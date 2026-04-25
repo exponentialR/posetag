@@ -157,6 +157,51 @@ class CharucoCalibrationStep1Tests(unittest.TestCase):
             self.assertIn("video ended", stdout.getvalue())
             self.assertIn("Need at least", str(ctx.exception))
 
+    def test_q_exits_cleanly_without_traceback_or_solve(self) -> None:
+        class FakeVideoCapture:
+            def __init__(self, _path: str) -> None:
+                self.released = False
+
+            def isOpened(self) -> bool:
+                return True
+
+            def read(self):
+                frame = np.zeros((20, 20, 3), dtype=np.uint8)
+                return True, frame
+
+            def release(self) -> None:
+                self.released = True
+
+        with TemporaryDirectory() as tmpdir:
+            base = Path(tmpdir)
+            project_root = base / "project"
+            env = {
+                "HOME": str(base / "home"),
+                "XDG_CONFIG_HOME": str(base / ".config"),
+            }
+            stdout = StringIO()
+
+            with patch.dict(os.environ, env, clear=False):
+                with patch("utils.charuco_calibrate.cv2.VideoCapture", FakeVideoCapture):
+                    with patch("utils.charuco_calibrate.cv2.imshow"):
+                        with patch("utils.charuco_calibrate.cv2.waitKey", return_value=ord("q")):
+                            with patch("utils.charuco_calibrate.cv2.destroyAllWindows"):
+                                with redirect_stdout(stdout):
+                                    result = charuco_cli.main(
+                                        [
+                                            "--project_root",
+                                            str(project_root),
+                                            "--source",
+                                            "video",
+                                            "--video",
+                                            str(base / "sample.mp4"),
+                                        ]
+                                    )
+
+            self.assertEqual(result, 0)
+            self.assertIn("quit requested", stdout.getvalue())
+            self.assertFalse((project_root / "calib" / "calib_color.yaml").exists())
+
     def test_realsense_source_without_dependency_fails_clearly(self) -> None:
         with patch("utils.charuco_calibrate.rs", None):
             with self.assertRaises(SystemExit) as ctx:

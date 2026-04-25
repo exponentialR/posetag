@@ -368,7 +368,8 @@ def main(argv=None):
             elif k == 13:
                 break
             elif k == ord('q'):
-                raise KeyboardInterrupt
+                print("[i] quit requested; exiting without calibration.")
+                return 0
     finally:
         _stop()
         cv2.destroyAllWindows()

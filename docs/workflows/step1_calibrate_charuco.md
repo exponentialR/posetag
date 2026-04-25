@@ -89,7 +89,7 @@ supported by the installed OpenCV build.
 - `SPACE`: save the current frame as a calibration sample when enough ChArUco
   corners are detected.
 - `ENTER`: solve calibration from the collected samples.
-- `q`: quit without solving.
+- `q`: quit cleanly without solving or writing a calibration YAML.
 
 Use diverse views: move and tilt the board so it appears across the frame,
 including near corners and edges, while avoiding blur and glare.
