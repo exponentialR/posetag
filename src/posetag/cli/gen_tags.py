@@ -1,7 +1,7 @@
 """PoseTag CLI wrapper for AprilTag sheet generation."""
 
+from posetag.pipelines.generate_tags import main
 
-def main():
-    from gen_april_tags import main as _main
 
-    return _main()
+if __name__ == "__main__":
+    raise SystemExit(main())
