@@ -1,0 +1,5 @@
+blank_issues_enabled: false
+contact_links:
+  - name: PoseTag contribution guide
+    url: https://github.com/exponentialR/posetag/blob/develop/CONTRIBUTING.md
+    about: Read how to report reproducible issues, validate workflows, and propose changes.

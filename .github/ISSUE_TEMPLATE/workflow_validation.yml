@@ -1,0 +1,73 @@
+name: Workflow validation
+description: Record results from validating a documented PoseTag workflow.
+title: "[Workflow Validation]: "
+labels:
+  - workflow-validation
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Use this template to document a successful or failed validation of a
+        PoseTag workflow.
+
+        These reports help build public evidence for installability,
+        documentation accuracy, and reproducibility.
+  - type: input
+    id: workflow_name
+    attributes:
+      label: Workflow name
+      description: Which workflow or stage did you validate?
+      placeholder: Installation, tag generation, calibration, board creation, annotation, dataset collection, or workflow linting.
+    validations:
+      required: true
+  - type: textarea
+    id: objective
+    attributes:
+      label: Validation objective
+      description: What were you trying to confirm?
+    validations:
+      required: true
+  - type: textarea
+    id: commands
+    attributes:
+      label: Commands run
+      description: List the exact commands or steps used.
+      render: bash
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Report the environment used for validation.
+      placeholder: |
+        - OS:
+        - Python version:
+        - Install method:
+        - Camera or media source:
+        - Relevant optional dependencies:
+    validations:
+      required: true
+  - type: textarea
+    id: result
+    attributes:
+      label: Result
+      description: Describe what succeeded, what failed, and what outputs were produced.
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Evidence
+      description: Link or paste logs, screenshots, sample outputs, or notes that support the result.
+    validations:
+      required: false
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Confirmation
+      options:
+        - label: I included enough information for another person to repeat this validation.
+          required: true
+        - label: I described whether the documented instructions matched the actual behaviour.
+          required: true
