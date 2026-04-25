@@ -18,6 +18,7 @@ Key behavior
   config does not exist yet.
 """
 import os, time
+import tempfile
 from pathlib import Path
 from typing import Optional, Dict, Any, List, Tuple
 import yaml
@@ -63,9 +64,20 @@ def _legacy_config_path() -> Path:
 
 def _atomic_write(path: Path, data: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(data, encoding="utf-8")
-    tmp.replace(path)
+    fd, tmp_name = tempfile.mkstemp(
+        dir=str(path.parent),
+        prefix=f"{path.name}.",
+        suffix=".tmp",
+        text=True,
+    )
+    tmp = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(data)
+        os.replace(tmp, path)
+    finally:
+        if tmp.exists():
+            tmp.unlink()
 
 
 def _norm(p: Path | str) -> Path:
