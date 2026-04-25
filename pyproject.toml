@@ -38,6 +38,7 @@ package-dir = { "" = "src", "utils" = "utils" }
 packages = [
   "posetag",
   "posetag.cli",
+  "posetag.pipelines",
   "posetag.utils",
   "gt6dof_atag",
   "gt6dof_atag.cli",
