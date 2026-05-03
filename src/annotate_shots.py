@@ -927,7 +927,7 @@ def _load_K_and_face(project_root: Path, meta_path: Path, row) -> tuple[np.ndarr
 
     return K, str(fy_path), meta_json
 
-
+# Main function for annotating a single shot: detects tags, collects user points, solves PnP, saves results
 def annotate_single_shot(project_root: Path, shot_raw_path: Path, *,
                          pts_type: str = "quad", calib: Optional[str] = None,
                          check_tag_scale: bool = False, auto_correct_scale: bool = False,
@@ -974,7 +974,7 @@ def annotate_single_shot(project_root: Path, shot_raw_path: Path, *,
         raise SystemExit(f"[!] Face '{face_key}' not in {kp_path}. Available: {list(faces_map.keys())}")
     names_in_order = faces_map[face_key]
 
-    # Board pose from tags
+    # Board pose from tags: detect AprilTags and estimate camera-to-board transform
     origin_id, tag_size_m, T_board_tag = load_board(Path(face_yaml_path))
     log.info(f"[i] Board: {Path(face_yaml_path).name}  tag_size={tag_size_m * 1000:.1f} mm  origin={origin_id}")
 
@@ -1018,7 +1018,7 @@ def annotate_single_shot(project_root: Path, shot_raw_path: Path, *,
     mid = None
     clicked = (_collect_quad if pts_type == "quad" else _collect_any4)(img, mid, None)
 
-    # PnP (best assignment)
+    # Solve PnP to find best assignment of clicked points to face corners and get camera-to-object pose
     mapping, ordered2d, fit = _assign_any_order(clicked, names_in_order, pts3d_dict, K, dist)
     R, _ = cv2.Rodrigues(fit["rvec"]);
     T_cam_obj = se3(R, fit["tvec"].reshape(3))
@@ -1064,7 +1064,7 @@ def annotate_single_shot(project_root: Path, shot_raw_path: Path, *,
             continue
         break
 
-    # Compose outputs
+    # Compose outputs: compute board-to-object transform and save YAML, images
     T_board_obj = inv_se3(T_cam_board) @ T_cam_obj
 
     out_yaml = _out_yaml_path(project_root, obj, side_letter)
@@ -1075,7 +1075,7 @@ def annotate_single_shot(project_root: Path, shot_raw_path: Path, *,
     cv2.imwrite(str(img_ann), anno)
     cv2.imwrite(str(img_reproj), mid)
 
-    # Save YAML
+    # Save YAML with all annotation data
     out = {
         "object": obj,
         "face_key": face_key,
@@ -1146,6 +1146,7 @@ def _load_rms_if_any(yaml_path: Path) -> Optional[float]:
 # -------------------------- CLI --------------------------
 
 def main():
+   # Parse command-line arguments for single-shot, batch, or browse modes
     parser = argparse.ArgumentParser("Annotate ISC faces (single or batch via manifest).")
     parser.add_argument("--shot", type=str, help="Absolute path to *_raw.png (single-shot mode).")
     parser.add_argument("--batch", choices=["latest"], help="Batch mode from manifest.csv.")
