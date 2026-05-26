@@ -257,67 +257,97 @@ reproj_rms: 0.13782644794293097
 
 ![make-board](media/make_board.gif)
 
-Capture one view with all tags visible, pick an **origin** ID, and write a face
-YAML plus update the tag registry under your active project. Outputs live under
-`<root>/boards/...`.
+Capture one view with all tags on a face visible, pick an **origin** ID, and
+write a face YAML plus update the project tag registry. The board frame is the
+origin tag centre; board x/y axes follow the origin tag axes; planar boards
+should have z offsets approximately equal to `0`.
 
 **OpenCV webcam**
 
 ```bash
-posetag-make-board \
+posetag-make-board --project_root my_project \
+  --source opencv --cam 0 \
   --object_name connection_plate_white_sideA \
   --calib calib_color.yaml \
-  --tag_size_mm 80 \
-  --save_shot
+  --tag_size_mm 80
 ```
 
 **Intel RealSense**
 
 ```bash
-posetag-make-board \
+posetag-make-board --project_root my_project \
   --source realsense --width 640 --height 480 --fps 30 \
-  --object_name connection_plate_white_sideA --calib calib_color.yaml --tag_size_mm 80
+  --object_name connection_plate_white_sideA \
+  --calib calib_color.yaml \
+  --tag_size_mm 80
 ```
 
 **From a video**
 
 ```bash
-posetag-make-board \
+posetag-make-board --project_root my_project \
   --source video --video sample.mp4 \
-  --object_name connection_plate_white_sideA --calib calib_color.yaml --tag_size_mm 80
+  --object_name connection_plate_white_sideA \
+  --calib calib_color.yaml \
+  --tag_size_mm 80
 ```
+
+`--tag_size_mm` is the physical black-square edge size of the AprilTags in
+millimetres. The board YAML stores this as `tag_size_m` in metres.
+
+With `--project_root my_project --calib calib_color.yaml`, PoseTag first looks
+for the Step 1 calibration at:
+
+```text
+my_project/calib/calib_color.yaml
+```
+
+Absolute calibration paths are used exactly as supplied. Relative paths retain
+legacy compatibility after the project calibration lookup.
+
+Controls and prompts:
+
+- `ENTER`: capture the current frame and estimate tag poses.
+- `ESC`: exit cleanly without writing board YAML.
+- After capture, enter the comma-separated tag IDs to include, then choose the
+  origin ID from the selected IDs.
 
 **Outputs**
 
-- `<root>/boards/<object_face>.yaml`
-  with `origin_id`, `tag_size_m`, and per-tag 2D offsets plus yaw.
-- `<root>/boards/tag_registry.yaml`
-  with tag-ID to face-YAML mappings, updated on each run.
-- Optional `<root>/boards/shots/*` audit images when `--save_shot` is enabled.
+- `my_project/boards/<object_name>.yaml`
+  with `origin_id`, `tag_size_m`, and per-tag `cx`, `cy`, and `yaw_deg`.
+- `my_project/boards/tag_registry.yaml`
+  with tag-ID to face-YAML mappings.
+- Optional `my_project/boards/shots/*` audit images when `--save_shot` is
+  enabled.
 
 Tips:
 
 - add `--project_root <path>` to create or select a project explicitly
 - otherwise the resolver uses your current or last project
+- use `--out_dir`, `--registry`, and `--shots_dir` to override board, registry,
+  and audit-shot paths
 - use `--z_thresh` (default `0.01` m) to enforce planarity
 - use `--allow_nonplanar` to proceed with a warning
+- source and calibration failures are checked before board YAML or registry
+  output artifacts are created
 
 **Example board YAML** (`connection_plate_white_sideA.yaml`)
 
 ```yaml
 object: connection_plate_white_sideA
 family: tag36h11
-tag_size_m: 0.04
+tag_size_m: 0.08
 origin_id: 52
 tags:
 - id: 52
   cx: 0.0
-  cy: 2.7755575615628914e-17
-  yaw_deg: -6.095899809673727e-15
+  cy: 0.0
+  yaw_deg: 0.0
 - id: 53
-  cx: -0.0014025137524277254
-  cy: -0.1884154905688507
-  yaw_deg: 179.95955209337157
+  cx: 0.1
+  cy: -0.2
+  yaw_deg: 180.0
 notes: "Board frame = origin tag centre; x,y follow origin tag axes; z ≈ 0."
 ```
 
@@ -327,15 +357,17 @@ notes: "Board frame = origin tag centre; x,y follow origin tag axes; z ≈ 0."
 version: 1
 updated: "2025-11-09T18:50:42Z"
 tags:
-  "52": {object: connection_plate_white_sideA, yaml: /home/samuel/posetag/project-2025-11-08T23-10-29Z/boards/connection_plate_white_sideA.yaml}
-  "53": {object: connection_plate_white_sideA, yaml: /home/samuel/posetag/project-2025-11-08T23-10-29Z/boards/connection_plate_white_sideA.yaml}
-  "54": {object: connection_plate_white_sideA, yaml: /home/samuel/posetag/project-2025-11-08T23-10-29Z/boards/connection_plate_white_sideA.yaml}
-  "55": {object: connection_plate_white_sideA, yaml: /home/samuel/posetag/project-2025-11-08T23-10-29Z/boards/connection_plate_white_sideA.yaml}
+  "52":
+    object: connection_plate_white_sideA
+    yaml: my_project/boards/connection_plate_white_sideA.yaml
+  "53":
+    object: connection_plate_white_sideA
+    yaml: my_project/boards/connection_plate_white_sideA.yaml
 ```
 
 The registry is updated each time you run `posetag-make-board`. If the same tag
-ID is already mapped to another face, you’ll be warned so you can resolve the
-conflict intentionally.
+ID is already mapped to another board YAML, PoseTag warns and preserves the
+existing mapping so conflicts are not silently overwritten.
 
 Faces may use different tag sizes; each face YAML stores its own `tag_size_m`.
 
