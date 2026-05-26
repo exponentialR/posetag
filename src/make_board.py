@@ -16,16 +16,10 @@ Defaults are *project-aware*: if `--project_root` is omitted, we resolve one via
 utils.project_config.resolve_project_root (env/config/home logic).
 """
 
-import argparse, os, sys, yaml, numpy as np, cv2, datetime, tempfile, shutil
+import argparse, sys, numpy as np, cv2, datetime
 from math import atan2, degrees
 from pathlib import Path
-from typing import Optional, Tuple
-
-# ---- Tag detector (pupil-apriltags) ----
-try:
-    from pupil_apriltags import Detector
-except Exception as e:
-    raise SystemExit("Install pupil-apriltags: pip install pupil-apriltags") from e
+from typing import Tuple
 
 # ---- Optional RealSense ----
 try:
@@ -33,41 +27,19 @@ try:
 except Exception:
     rs = None
 
-# ---- Project root helpers ----
-try:
-    from utils.project_config import resolve_project_root, ensure_project_dirs
-except Exception:
-    resolve_project_root = None
-    ensure_project_dirs = None
-
-
-# --------- IO helpers ---------
-def _now_iso_utc() -> str:
-    return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H-%M-%SZ")
-
-
-def _atomic_write_yaml(path: Path, data: dict) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp = tempfile.mkstemp(prefix="._tmp_yaml_", dir=str(path.parent))
-    os.close(fd)
-    with open(tmp, "w") as f:
-        yaml.safe_dump(data, f, sort_keys=False)
-    shutil.move(tmp, str(path))
-
-
-def load_calib(path: str) -> Tuple[Tuple[float, float, float, float], np.ndarray, np.ndarray]:
-    if not os.path.exists(path):
-        print(f"[!] {path} not found.")
-        print("    Run ChArUco calibration to generate calib_color.yaml first.")
-        sys.exit(1)
-    y = yaml.safe_load(open(path)) or {}
-    cm = y["camera_matrix"]; dc = y.get("distortion_coefficients", {})
-    fx, fy, cx, cy = float(cm["fx"]), float(cm["fy"]), float(cm["cx"]), float(cm["cy"])
-    K = np.array([[fx, 0, cx], [0, fy, cy], [0, 0, 1]], float)
-    # Distortion is not required by pupil-apriltags pose solver (assumes pinhole).
-    D = np.array([[dc.get("k1", 0.0), dc.get("k2", 0.0), dc.get("p1", 0.0),
-                   dc.get("p2", 0.0), dc.get("k3", 0.0)]], float)
-    return (fx, fy, cx, cy), K, D
+from posetag.pipelines.make_board import (
+    MakeBoardError,
+    build_board_yaml,
+    load_calibration_yaml,
+    load_registry,
+    prepare_project_paths,
+    preview_project_root,
+    resolve_calibration_path,
+    save_registry,
+    update_registry_entries,
+    validate_source_args,
+    write_board_yaml,
+)
 
 
 def se3(R, t):
@@ -86,18 +58,15 @@ def inv_se3(T):
     return Ti
 
 
-def load_registry(path: Path) -> dict:
-    if not path.exists():
-        return {"version": 1, "updated": None, "tags": {}}
-    reg = yaml.safe_load(open(path)) or {}
-    reg.setdefault("version", 1)
-    reg.setdefault("tags", {})
-    return reg
-
-
-def save_registry(path: Path, reg: dict) -> None:
-    reg["updated"] = datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
-    _atomic_write_yaml(path, reg)
+def _load_detector_class():
+    try:
+        from pupil_apriltags import Detector
+    except Exception as exc:
+        raise MakeBoardError(
+            "pupil-apriltags is not available; install PoseTag with the 'apriltags' "
+            "extra or run `python -m pip install pupil-apriltags`."
+        ) from exc
+    return Detector
 
 
 # --------- CLI ---------
@@ -106,9 +75,10 @@ class _HelpFmt(argparse.ArgumentDefaultsHelpFormatter, argparse.RawTextHelpForma
     pass
 
 
-def parse_args():
+def build_parser():
     ap = argparse.ArgumentParser(
-        "Interactive AprilTag board builder (project-aware)",
+        prog="posetag-make-board",
+        description="Interactive AprilTag board builder (project-aware)",
         formatter_class=_HelpFmt,
         epilog=(
             "Workflow:\n"
@@ -151,29 +121,24 @@ def parse_args():
     ap.add_argument("--allow_nonplanar", action="store_true",
                     help="Warn but still write YAML even if |z| > z_thresh.")
 
-    return ap.parse_args()
+    return ap
+
+
+def parse_args(argv=None):
+    return build_parser().parse_args(argv)
 
 
 def _resolve_paths(args) -> Tuple[Path, Path, Path, Path]:
     """Resolve project root and default output paths."""
-    # Project root
-    if resolve_project_root is not None:
-        pr = Path(resolve_project_root(args.project_root))
-        if ensure_project_dirs is not None:
-            ensure_project_dirs(pr)
-    else:
-        pr = Path(args.project_root).expanduser().resolve() if args.project_root else Path.cwd()
-
-    # Defaults under <project_root>/boards
-    boards_dir = Path(args.out_dir) if args.out_dir else pr / "boards"
-    shots_dir = Path(args.shots_dir) if args.shots_dir else boards_dir / "shots"
-    registry = Path(args.registry) if args.registry else boards_dir / "tag_registry.yaml"
-
-    boards_dir.mkdir(parents=True, exist_ok=True)
-    if args.save_shot:
-        shots_dir.mkdir(parents=True, exist_ok=True)
-
-    return pr, boards_dir, shots_dir, registry
+    paths = prepare_project_paths(
+        project_root=args.project_root,
+        object_name=args.object_name,
+        out_dir=args.out_dir,
+        shots_dir=args.shots_dir,
+        registry=args.registry,
+        save_shot=args.save_shot,
+    )
+    return paths.project_root, paths.boards_dir, paths.shots_dir, paths.registry_path
 
 
 def _open_source(args):
@@ -213,9 +178,8 @@ def _open_source(args):
         return _read, _stop
 
     # video
-    if not args.video:
-        sys.exit("--video path is required when --source=video")
-    cap = cv2.VideoCapture(args.video)
+    video_path = str(Path(args.video).expanduser())
+    cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         sys.exit(f"Could not open video: {args.video}")
 
@@ -230,27 +194,40 @@ def _open_source(args):
 
 
 # --------- Main ---------
-def main():
-    args = parse_args()
-    project_root, boards_dir, shots_dir, registry_path = _resolve_paths(args)
+def main(argv=None):
+    args = parse_args(argv)
 
-    # Calib: allow relative path under project_root
-    calib_path = Path(args.calib)
-    # If no calib_path given
-    if calib_path is not None:
-        if not calib_path.is_absolute():
-            cand = (project_root / 'calib' / calib_path)
-            if cand.exists():
-                calib_path = cand
-    else:
-        calib_path = (project_root / 'calib/calib_color.yaml')
-        print(f'Calibration yaml not provided defaulting to recent calib path found in {calib_path}')
-    (fx, fy, cx, cy), K, _D = load_calib(str(calib_path))
+    try:
+        validate_source_args(args.source, args.video, rs)
+        project_root_for_calib = preview_project_root(args.project_root)
+        calib_path = resolve_calibration_path(project_root_for_calib, args.calib)
+        calib = load_calibration_yaml(calib_path)
+        Detector = _load_detector_class()
+    except MakeBoardError as exc:
+        raise SystemExit(str(exc)) from exc
+
+    read_frame, stop = _open_source(args)
+    try:
+        paths = prepare_project_paths(
+            project_root=args.project_root,
+            object_name=args.object_name,
+            out_dir=args.out_dir,
+            shots_dir=args.shots_dir,
+            registry=args.registry,
+            save_shot=args.save_shot,
+        )
+    except Exception:
+        stop()
+        raise
+
+    project_root = paths.project_root
+    shots_dir = paths.shots_dir
+    registry_path = paths.registry_path
+
+    fx, fy, cx, cy = calib.camera_params
 
     tag_size_m = args.tag_size_mm / 1000.0
     det = Detector(families=args.family, nthreads=4, quad_decimate=1.0, refine_edges=True)
-
-    read_frame, stop = _open_source(args)
 
     # ---- Live preview & capture ----
     print(f"[i] Project root = {project_root}")
@@ -263,6 +240,9 @@ def main():
         while True:
             c = read_frame()
             if c is None:
+                if args.source == "video":
+                    print("[i] video ended before a board frame was captured; exiting without writing board YAML.")
+                    return 0
                 continue
             g = cv2.cvtColor(c, cv2.COLOR_BGR2GRAY)
 
@@ -277,8 +257,9 @@ def main():
             cv2.imshow("Select a view (ENTER to use)", vis)
             k = cv2.waitKey(1) & 0xFF
             if k == 27:  # ESC
-                return
-            if k == 13:  # ENTER
+                print("[i] quit requested; exiting without writing board YAML.")
+                return 0
+            if k in (10, 13):  # ENTER
                 frame = c.copy()
                 g2 = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
                 dets = det.detect(
@@ -356,16 +337,15 @@ def main():
     entries.sort(key=lambda e: e["id"])
 
     # ---- Write board YAML ----
-    out_path = boards_dir / f"{args.object_name}.yaml"
-    board = dict(
-        object=args.object_name,
+    out_path = paths.board_yaml_path
+    board = build_board_yaml(
+        object_name=args.object_name,
         family=args.family,
-        tag_size_m=tag_size_m,
-        origin_id=int(origin_id),
-        tags=entries,
-        notes="Board frame = origin tag centre; x,y follow origin tag axes; z ≈ 0."
+        tag_size_mm=args.tag_size_mm,
+        origin_id=origin_id,
+        entries=entries,
     )
-    _atomic_write_yaml(out_path, board)
+    write_board_yaml(out_path, board)
     print(f"[i] Wrote {out_path}")
     print("[i] Example entries:")
     for e in entries:
@@ -373,24 +353,16 @@ def main():
 
     # ---- Update registry ----
     reg = load_registry(registry_path)
-    updated, conflicts = 0, []
-    for e in entries:
-        tid = str(e["id"])
-        current = reg["tags"].get(tid)
-        if current is None or current.get("yaml") == str(out_path):
-            reg["tags"][tid] = {"object": args.object_name, "yaml": str(out_path)}
-            updated += 1
-        else:
-            conflicts.append((tid, current["yaml"], str(out_path)))
+    registry_update = update_registry_entries(reg, board["tags"], args.object_name, out_path)
 
-    if conflicts:
+    if registry_update.conflicts:
         print("[!] Registry conflicts:")
-        for tid, oldp, newp in conflicts:
-            print(f"    tag {tid}: {oldp}  ->  {newp}")
+        for conflict in registry_update.conflicts:
+            print(f"    tag {conflict.tag_id}: {conflict.existing_yaml}  ->  {conflict.requested_yaml}")
         # By design we *don't* overwrite automatically here. Edit or delete the old mapping if intended.
 
     save_registry(registry_path, reg)
-    print(f"[i] Registry updated ({updated} entries) at {registry_path}")
+    print(f"[i] Registry updated ({registry_update.updated} entries) at {registry_path}")
 
 
 if __name__ == "__main__":
