@@ -206,6 +206,16 @@ def main(argv=None):
     except MakeBoardError as exc:
         raise SystemExit(str(exc)) from exc
 
+    fx, fy, cx, cy = calib.camera_params
+
+    tag_size_m = args.tag_size_mm / 1000.0
+    try:
+        det = Detector(families=args.family, nthreads=4, quad_decimate=1.0, refine_edges=True)
+    except Exception as exc:
+        raise SystemExit(
+            f"Could not initialize AprilTag detector for family '{args.family}': {exc}"
+        ) from exc
+
     read_frame, stop = _open_source(args)
     try:
         paths = prepare_project_paths(
@@ -223,11 +233,6 @@ def main(argv=None):
     project_root = paths.project_root
     shots_dir = paths.shots_dir
     registry_path = paths.registry_path
-
-    fx, fy, cx, cy = calib.camera_params
-
-    tag_size_m = args.tag_size_mm / 1000.0
-    det = Detector(families=args.family, nthreads=4, quad_decimate=1.0, refine_edges=True)
 
     # ---- Live preview & capture ----
     print(f"[i] Project root = {project_root}")

@@ -225,6 +225,66 @@ class MakeBoardStep2Tests(unittest.TestCase):
             self.assertIn("Malformed calibration YAML", str(ctx.exception))
             self.assertFalse((project_root / "boards").exists())
 
+    def test_non_numeric_distortion_coefficients_fail_clearly(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            project_root = Path(tmpdir) / "project"
+            calib = project_root / "calib" / "calib_color.yaml"
+            _write_calibration(calib)
+            data = yaml.safe_load(calib.read_text(encoding="utf-8"))
+            data["distortion_coefficients"]["k1"] = "not-a-number"
+            calib.write_text(yaml.safe_dump(data), encoding="utf-8")
+
+            with self.assertRaises(SystemExit) as ctx:
+                make_board_cli.main(
+                    [
+                        "--project_root",
+                        str(project_root),
+                        "--object_name",
+                        "connection_plate_white_sideA",
+                    ]
+                )
+
+            self.assertIn("Malformed calibration YAML", str(ctx.exception))
+            self.assertIn("distortion_coefficients.k1", str(ctx.exception))
+            self.assertFalse((project_root / "boards").exists())
+
+    def test_detector_initialization_failure_does_not_open_source(self) -> None:
+        class RaisingDetector:
+            def __init__(self, *args, **kwargs) -> None:
+                raise RuntimeError("unsupported family")
+
+        class SourceShouldNotOpen:
+            def __init__(self, _path: str) -> None:
+                raise AssertionError("source opened before detector initialized")
+
+        with TemporaryDirectory() as tmpdir:
+            base = Path(tmpdir)
+            project_root = base / "project"
+            video = base / "sample.mp4"
+            video.touch()
+            _write_calibration(project_root / "calib" / "calib_color.yaml")
+
+            with patch.dict(os.environ, self.isolated_env(base), clear=False):
+                with patch("make_board._load_detector_class", return_value=RaisingDetector):
+                    with patch("make_board.cv2.VideoCapture", SourceShouldNotOpen):
+                        with self.assertRaises(SystemExit) as ctx:
+                            make_board_cli.main(
+                                [
+                                    "--project_root",
+                                    str(project_root),
+                                    "--object_name",
+                                    "connection_plate_white_sideA",
+                                    "--source",
+                                    "video",
+                                    "--video",
+                                    str(video),
+                                ]
+                            )
+
+            self.assertIn("Could not initialize AprilTag detector", str(ctx.exception))
+            self.assertIn("unsupported family", str(ctx.exception))
+            self.assertFalse((project_root / "boards").exists())
+
     def test_calibration_resolution_finds_project_calib_color_yaml(self) -> None:
         with TemporaryDirectory() as tmpdir:
             project_root = Path(tmpdir) / "project"

@@ -171,20 +171,18 @@ def load_calibration_yaml(path: Union[Path, str]) -> CalibrationData:
         raise MakeBoardError(
             f"Malformed calibration YAML: {target} distortion_coefficients must be a mapping."
         )
+    distortion_values: list[float] = []
+    for name in ("k1", "k2", "p1", "p2", "k3"):
+        try:
+            distortion_values.append(float(distortion.get(name, 0.0)))
+        except (TypeError, ValueError) as exc:
+            raise MakeBoardError(
+                f"Malformed calibration YAML: {target} "
+                f"distortion_coefficients.{name} must be numeric."
+            ) from exc
 
     camera_matrix_array = np.array([[fx, 0.0, cx], [0.0, fy, cy], [0.0, 0.0, 1.0]], float)
-    distortion_array = np.array(
-        [
-            [
-                float(distortion.get("k1", 0.0)),
-                float(distortion.get("k2", 0.0)),
-                float(distortion.get("p1", 0.0)),
-                float(distortion.get("p2", 0.0)),
-                float(distortion.get("k3", 0.0)),
-            ]
-        ],
-        float,
-    )
+    distortion_array = np.array([distortion_values], float)
     return CalibrationData(
         path=target,
         camera_params=(fx, fy, cx, cy),
