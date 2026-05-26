@@ -78,7 +78,7 @@ def object_picker_panel(h: int, w: int, bases: List[str], sel: int,
     cv2.putText(pan, tips, (12, h - 16), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (60, 60, 60), 1, cv2.LINE_AA)
     return pan
 
-
+# Select the best face based on overlap of expected vs detected tag IDs
 def best_face_by_overlap(faces: List[Dict], det_ids: Set[int], prev_idx: int | None = None) -> Tuple[Optional[int], int]:
     """Return (best_index, best_overlap_count). Tie-broken by prev_idx and tag count."""
     if not faces:
@@ -95,6 +95,7 @@ def best_face_by_overlap(faces: List[Dict], det_ids: Set[int], prev_idx: int | N
 
 
 def main():
+  # Parse command-line arguments for capture settings
     ap = argparse.ArgumentParser("Capture wide shots per face for later annotation")
     ap.add_argument("--project_root", type=Path, default=None,
                     help="Root for boards/shots/objects/datasets (default: resolver/env/config).")
@@ -217,6 +218,7 @@ def main():
 
     try:
         first = True
+        # Main capture loop: read frames, detect tags, update UI, handle key presses
         while True:
             c = read_frame()
             if c is None:
@@ -332,7 +334,8 @@ def main():
                         state["save_warn"], state["save_warn_t0"] = True, now
                         continue
                 state["save_warn"] = False
-
+              
+                # Generate timestamp and determine save paths based on layout
                 ts = timestamp()
                 obj_full = face["object"] if face else (state["object_base"] or "unknown")
                 base_name, side = parse_base_and_side(obj_full)
@@ -379,7 +382,7 @@ def main():
                 logger.info(f"[+] Saved {meta_path}")
                 _append_manifest(str(manifest_path), meta)
 
-                # thumbnails
+                # Update thumbnails for gallery panel
                 try:
                     tw = min(320, vis.shape[1]); th = int(vis.shape[0] * tw / vis.shape[1])
                     state["thumbs"].append(cv2.resize(vis, (tw, th)))
