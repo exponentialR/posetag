@@ -21,6 +21,7 @@ scipy = ["scipy"]
 [project.scripts]
 posetag = "posetag.cli.posetag:main"
 posetag-gen-tags = "posetag.cli.gen_tags:main"
+posetag-gen-charuco = "posetag.cli.gen_charuco:main"
 posetag-calib-charuco = "posetag.cli.charuco:main"
 posetag-make-board = "posetag.cli.make_board:main"
 posetag-capture-face = "posetag.cli.capture_face:main"
