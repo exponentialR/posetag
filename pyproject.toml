@@ -40,6 +40,7 @@ packages = [
   "posetag.cli",
   "posetag.pipelines",
   "posetag.utils",
+  "posetag.workflows",
   "gt6dof_atag",
   "gt6dof_atag.cli",
   "gt6dof_atag.utils",
