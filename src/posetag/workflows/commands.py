@@ -43,10 +43,14 @@ _COMMAND_TEMPLATES = {
         "OBJECT_NAME",
     ),
     "annotate_faces": (
+        "env",
+        "POSETAG_PROJECT={project_root}",
         "posetag-annotate",
         "--browse",
     ),
     "collect_dataset": (
+        "env",
+        "POSETAG_PROJECT={project_root}",
         "posetag-collect",
         "--mode",
         "live",
@@ -67,12 +71,15 @@ def command_preview(stage_key: str, project_root: Union[Path, str]) -> str:
 
     root = str(Path(project_root).expanduser())
     parts = (
-        root if part == "{project_root}" else part
+        _format_part(part, root)
         for part in template
     )
     return _join_command(parts)
 
 
+def _format_part(part: str, project_root: str) -> str:
+    return part.replace("{project_root}", project_root)
+
+
 def _join_command(parts: Iterable[str]) -> str:
     return shlex.join(tuple(parts))
-

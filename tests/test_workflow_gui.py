@@ -100,6 +100,17 @@ class WorkflowGuiTests(unittest.TestCase):
         self.assertIn("'/tmp/PoseTag project'", preview)
         self.assertIn("OBJECT_FACE", preview)
 
+    def test_legacy_command_previews_use_selected_project_env(self) -> None:
+        project_root = Path("/tmp/PoseTag project")
+
+        annotate_preview = command_preview("annotate_faces", project_root)
+        collect_preview = command_preview("collect_dataset", project_root)
+
+        self.assertIn("env 'POSETAG_PROJECT=/tmp/PoseTag project'", annotate_preview)
+        self.assertIn("posetag-annotate --browse", annotate_preview)
+        self.assertIn("env 'POSETAG_PROJECT=/tmp/PoseTag project'", collect_preview)
+        self.assertIn("posetag-collect --mode live", collect_preview)
+
     def test_selected_stage_row_keeps_readable_text_style(self) -> None:
         style = _style_sheet()
 
