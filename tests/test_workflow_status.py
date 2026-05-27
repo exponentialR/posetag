@@ -132,6 +132,38 @@ class WorkflowStatusTests(unittest.TestCase):
             self.assertTrue(stage.errors)
             self.assertIn("Malformed calibration YAML", stage.errors[0])
 
+    def test_calib_color_yaml_missing_workflow_fields_needs_attention(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            project_root = Path(tmpdir) / "project"
+            calib_path = project_root / "calib" / "calib_color.yaml"
+            calib_path.parent.mkdir(parents=True)
+            calib_path.write_text(
+                yaml.safe_dump(
+                    {
+                        "camera_matrix": {
+                            "fx": 600.0,
+                            "fy": 610.0,
+                            "cx": 320.0,
+                            "cy": 240.0,
+                        },
+                        "distortion_coefficients": {
+                            "k1": 0.0,
+                            "k2": 0.0,
+                            "p1": 0.0,
+                            "p2": 0.0,
+                            "k3": 0.0,
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            stage = _stage_by_id(project_root, 1)
+
+            self.assertEqual(stage.status, WorkflowStatus.NEEDS_ATTENTION)
+            self.assertTrue(any("image_width" in error for error in stage.errors))
+            self.assertTrue(any("reproj_rms" in error for error in stage.errors))
+
     def test_valid_board_yaml_and_registry_mark_step2_complete(self) -> None:
         with TemporaryDirectory() as tmpdir:
             project_root = Path(tmpdir) / "project"
@@ -171,6 +203,54 @@ class WorkflowStatusTests(unittest.TestCase):
             self.assertEqual(stage.status, WorkflowStatus.NEEDS_ATTENTION)
             self.assertTrue(stage.errors)
             self.assertIn("was not found", stage.errors[0])
+
+    def test_registry_tag_missing_from_board_yaml_needs_attention(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            project_root = Path(tmpdir) / "project"
+            board_path = project_root / "boards" / "connection_plate_white_sideA.yaml"
+            registry_path = project_root / "boards" / "tag_registry.yaml"
+            board = build_board_yaml(
+                object_name="connection_plate_white_sideA",
+                family="tag36h11",
+                tag_size_mm=80.0,
+                origin_id=52,
+                entries=[{"id": 52, "cx": 0.0, "cy": 0.0, "yaw_deg": 0.0}],
+            )
+            write_board_yaml(board_path, board)
+            registry_path.write_text(
+                yaml.safe_dump(
+                    {
+                        "version": 1,
+                        "updated": "2026-05-27T12:00:00Z",
+                        "tags": {
+                            "99": {
+                                "object": "connection_plate_white_sideA",
+                                "yaml": str(board_path),
+                            }
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            stage = _stage_by_id(project_root, 2)
+
+            self.assertEqual(stage.status, WorkflowStatus.NEEDS_ATTENTION)
+            self.assertTrue(any("not present" in error for error in stage.errors))
+
+    def test_registry_object_mismatch_needs_attention(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            project_root = Path(tmpdir) / "project"
+            board_path, registry_path = _write_valid_board_and_registry(project_root)
+            registry = yaml.safe_load(registry_path.read_text(encoding="utf-8"))
+            registry["tags"]["52"]["object"] = "different_object"
+            registry_path.write_text(yaml.safe_dump(registry), encoding="utf-8")
+
+            stage = _stage_by_id(project_root, 2)
+
+            self.assertEqual(stage.status, WorkflowStatus.NEEDS_ATTENTION)
+            self.assertTrue(any("different_object" in error for error in stage.errors))
+            self.assertTrue(any(str(board_path) in error for error in stage.errors))
 
     def test_workflow_helpers_import_without_gui_dependency(self) -> None:
         code = (
