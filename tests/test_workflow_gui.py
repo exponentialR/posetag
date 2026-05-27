@@ -12,6 +12,8 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
+import yaml
+
 from posetag.gui import app as gui_app
 from posetag.gui.main_window import (
     _copy_confirmation_message,
@@ -119,6 +121,50 @@ class WorkflowGuiTests(unittest.TestCase):
         self.assertGreater(health.error_count, 0)
         self.assertEqual(health.next_stage_label, "Stage 1: Calibrate Camera")
         self.assertIn("calib_color.yaml", health.next_action)
+
+    def test_project_health_view_keeps_mixed_missing_outputs_incomplete(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            project_root = Path(tmpdir) / "project"
+            calib_path = project_root / "calib" / "calib_color.yaml"
+            calib_path.parent.mkdir(parents=True)
+            calib_path.write_text(
+                yaml.safe_dump(
+                    {
+                        "image_width": 640,
+                        "image_height": 480,
+                        "camera_matrix": {
+                            "fx": 600.0,
+                            "fy": 610.0,
+                            "cx": 320.0,
+                            "cy": 240.0,
+                            "data": [
+                                [600.0, 0.0, 320.0],
+                                [0.0, 610.0, 240.0],
+                                [0.0, 0.0, 1.0],
+                            ],
+                        },
+                        "distortion_coefficients": {
+                            "k1": 0.0,
+                            "k2": 0.0,
+                            "p1": 0.0,
+                            "p2": 0.0,
+                            "k3": 0.0,
+                            "data": [[0.0, 0.0, 0.0, 0.0, 0.0]],
+                        },
+                        "reproj_rms": 0.12,
+                        "model": "pinhole",
+                        "notes": "Synthetic calibration for GUI health tests.",
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            health = project_health_view(inspect_project_view(project_root))
+
+        self.assertEqual(health.status, "missing")
+        self.assertEqual(health.headline, "Workflow outputs missing")
+        self.assertEqual(health.next_stage_label, "Stage 0: Generate AprilTag Sheets")
+        self.assertIn("required outputs are still missing", health.message)
 
     def test_command_preview_quotes_project_paths(self) -> None:
         preview = command_preview(

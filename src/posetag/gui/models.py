@@ -167,6 +167,7 @@ def project_health_view(
     error_count = sum(len(model.errors) for model in stage_models)
     next_model = _first_actionable_model(stage_models)
     attention_model = _first_model_with_status(stage_models, "needs_attention")
+    missing_required_model = _first_missing_required_model(stage_models)
 
     if not stage_models:
         return _health(
@@ -199,6 +200,21 @@ def project_health_view(
             warning_count=warning_count,
             error_count=error_count,
             next_model=next_model,
+        )
+
+    if missing_required_model is not None:
+        return _health(
+            status="missing",
+            headline="Workflow outputs missing",
+            message=(
+                f"{complete_count} inspected stage"
+                f"{' is' if complete_count == 1 else 's are'} complete, "
+                "but required outputs are still missing."
+            ),
+            counts=counts,
+            warning_count=warning_count,
+            error_count=error_count,
+            next_model=missing_required_model,
         )
 
     if next_model is not None:
@@ -281,6 +297,15 @@ def _first_model_with_status(
 ) -> Optional[StageViewModel]:
     for model in models:
         if model.status == status:
+            return model
+    return None
+
+
+def _first_missing_required_model(
+    models: tuple[StageViewModel, ...],
+) -> Optional[StageViewModel]:
+    for model in models:
+        if model.status == "missing" and model.checked_paths:
             return model
     return None
 
