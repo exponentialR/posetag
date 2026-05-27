@@ -159,6 +159,79 @@ class GenerateCharucoStep1Tests(unittest.TestCase):
         self.assertIn("Unsupported ArUco dictionary", str(ctx.exception))
         self.assertIn("7X7_50", str(ctx.exception))
 
+    def test_dictionary_too_small_for_board_fails_before_outputs(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            out_dir = Path(tmpdir) / "out"
+            with self.assertRaises(generate_charuco.CharucoBoardGenerationError) as ctx:
+                self.run_with_isolated_config(
+                    tmpdir,
+                    [
+                        "--out_dir",
+                        str(out_dir),
+                        "--squares-x",
+                        "20",
+                        "--squares-y",
+                        "20",
+                        "--square-length-mm",
+                        "5",
+                        "--marker-length-mm",
+                        "3",
+                        "--dict",
+                        "4X4_50",
+                        "--paper-mm",
+                        "200x200",
+                        "--dpi",
+                        "150",
+                    ],
+                )
+
+            self.assertIn("provides 50 marker IDs", str(ctx.exception))
+            self.assertIn("requires 200", str(ctx.exception))
+            self.assertFalse(out_dir.exists())
+
+    def test_cli_dictionary_capacity_error_exits_without_traceback(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            out_dir = Path(tmpdir) / "out"
+            env = os.environ.copy()
+            env["PYTHONPATH"] = (
+                str(REPO_ROOT / "src") + os.pathsep + env.get("PYTHONPATH", "")
+            )
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "posetag.cli.gen_charuco",
+                    "--out_dir",
+                    str(out_dir),
+                    "--squares-x",
+                    "20",
+                    "--squares-y",
+                    "20",
+                    "--square-length-mm",
+                    "5",
+                    "--marker-length-mm",
+                    "3",
+                    "--dict",
+                    "4X4_50",
+                    "--paper-mm",
+                    "200x200",
+                    "--dpi",
+                    "150",
+                ],
+                cwd=REPO_ROOT,
+                env=env,
+                capture_output=True,
+                text=True,
+            )
+
+            self.assertEqual(result.returncode, 2)
+            self.assertIn(
+                "Error: Dictionary 4X4_50 provides 50 marker IDs",
+                result.stderr,
+            )
+            self.assertNotIn("Traceback", result.stderr)
+            self.assertFalse(out_dir.exists())
+
     def test_invalid_dimensions_and_lengths_fail_clearly(self) -> None:
         cases = [
             (

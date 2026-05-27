@@ -141,6 +141,7 @@ def validate_generation_inputs(
     paper_width_mm: float,
     paper_height_mm: float,
     dictionary: Any,
+    dictionary_name: str,
 ) -> None:
     """Validate user inputs before asking OpenCV to render a board."""
 
@@ -162,6 +163,15 @@ def validate_generation_inputs(
         )
     if dpi <= 0:
         raise CharucoBoardGenerationError("--dpi must be a positive integer.")
+
+    required_markers = required_charuco_marker_count(squares_x, squares_y)
+    available_markers = dictionary_marker_count(dictionary)
+    if required_markers > available_markers:
+        raise CharucoBoardGenerationError(
+            f"Dictionary {dictionary_name} provides {available_markers} marker IDs, "
+            f"but a {squares_x}x{squares_y} ChArUco board requires "
+            f"{required_markers}. Choose a larger dictionary or a smaller board."
+        )
 
     page_w_px = mm_to_px(paper_width_mm, dpi)
     page_h_px = mm_to_px(paper_height_mm, dpi)
@@ -187,6 +197,23 @@ def validate_generation_inputs(
         )
 
 
+def required_charuco_marker_count(squares_x: int, squares_y: int) -> int:
+    """Return the number of marker IDs OpenCV assigns to a ChArUco board."""
+
+    return (squares_x * squares_y) // 2
+
+
+def dictionary_marker_count(dictionary: Any) -> int:
+    """Return how many marker IDs are available in an OpenCV ArUco dictionary."""
+
+    bytes_list = getattr(dictionary, "bytesList", None)
+    if bytes_list is None:
+        raise CharucoBoardGenerationError(
+            "Could not determine selected dictionary capacity from OpenCV."
+        )
+    return int(np.asarray(bytes_list).shape[0])
+
+
 def create_charuco_board(
     squares_x: int,
     squares_y: int,
@@ -199,18 +226,34 @@ def create_charuco_board(
     aruco = cv2.aruco
     square_m = square_length_mm / 1000.0
     marker_m = marker_length_mm / 1000.0
-    if hasattr(aruco, "CharucoBoard") and callable(getattr(aruco, "CharucoBoard")):
-        return aruco.CharucoBoard((squares_x, squares_y), square_m, marker_m, dictionary)
-    if hasattr(aruco, "CharucoBoard_create"):
-        return aruco.CharucoBoard_create(
-            squares_x,
-            squares_y,
-            square_m,
-            marker_m,
-            dictionary,
-        )
+    try:
+        if hasattr(aruco, "CharucoBoard") and callable(getattr(aruco, "CharucoBoard")):
+            return aruco.CharucoBoard(
+                (squares_x, squares_y),
+                square_m,
+                marker_m,
+                dictionary,
+            )
+        if hasattr(aruco, "CharucoBoard_create"):
+            return aruco.CharucoBoard_create(
+                squares_x,
+                squares_y,
+                square_m,
+                marker_m,
+                dictionary,
+            )
+    except cv2.error as exc:
+        raise CharucoBoardGenerationError(
+            f"OpenCV could not create the ChArUco board: {exc}"
+        ) from exc
     raise CharucoBoardGenerationError(
         "Installed OpenCV build lacks ChArUco board generation support."
+    )
+
+
+def _wrap_opencv_draw_error(exc: cv2.error) -> CharucoBoardGenerationError:
+    return CharucoBoardGenerationError(
+        f"OpenCV could not draw the ChArUco board: {exc}"
     )
 
 
@@ -226,13 +269,23 @@ def draw_charuco_board(board: Any, width_px: int, height_px: int) -> np.ndarray:
                 borderBits=MARKER_BORDER_BITS,
             )
         except TypeError:
-            return board.generateImage(out_size, 0, MARKER_BORDER_BITS)
+            try:
+                return board.generateImage(out_size, 0, MARKER_BORDER_BITS)
+            except cv2.error as exc:
+                raise _wrap_opencv_draw_error(exc) from exc
+        except cv2.error as exc:
+            raise _wrap_opencv_draw_error(exc) from exc
 
     if hasattr(board, "draw"):
         try:
             return board.draw(out_size, marginSize=0, borderBits=MARKER_BORDER_BITS)
         except TypeError:
-            return board.draw(out_size, 0, MARKER_BORDER_BITS)
+            try:
+                return board.draw(out_size, 0, MARKER_BORDER_BITS)
+            except cv2.error as exc:
+                raise _wrap_opencv_draw_error(exc) from exc
+        except cv2.error as exc:
+            raise _wrap_opencv_draw_error(exc) from exc
 
     raise CharucoBoardGenerationError(
         "Installed OpenCV build cannot draw ChArUco boards."
@@ -409,6 +462,7 @@ def generate_charuco_board(
         paper_width_mm=paper_width_mm,
         paper_height_mm=paper_height_mm,
         dictionary=dictionary,
+        dictionary_name=normalized_dict,
     )
 
     out_dir.mkdir(parents=True, exist_ok=True)
