@@ -193,7 +193,26 @@ output; otherwise it reports that PDF output is optional and continues.
 
 ![calibration-grab](media/calibration.gif)
 
-Press `SPACE` to capture a sample and `ENTER` to solve. Outputs a
+First generate the exact ChArUco calibration board you will print:
+
+```bash
+posetag-gen-charuco --project_root my_project \
+  --squares-x 3 --squares-y 5 \
+  --square-length-mm 50 --marker-length-mm 37 --dict 7X7_50 \
+  --paper A4 --dpi 300
+```
+
+This writes a printable PNG, optional PDF, and metadata YAML under:
+
+```text
+my_project/calib/boards/
+```
+
+Print at **100%** / **Actual Size** and do not use “Fit to page”. Verify the
+printed square edge with a ruler before calibration.
+
+Then calibrate with the same board parameters. Press `SPACE` to capture a
+sample and `ENTER` to solve. The calibration command outputs
 `calib_color.yaml` containing `fx`, `fy`, `cx`, `cy`, distortion, image size,
 and reprojection RMS. With `--project_root`, the latest calibration defaults to
 `<root>/calib/calib_color.yaml`. Each run also stores raw calibration samples
@@ -222,11 +241,11 @@ posetag-calib-charuco --project_root my_project --source video --video sample.mp
   --squares-x 3 --squares-y 5 --square-length-mm 50 --marker-length-mm 37 --dict 7X7_50
 ```
 
-Keep print scale at `100%` / `Actual size`, and ensure `--squares-x`,
-`--squares-y`, `--square-length-mm`, `--marker-length-mm`, and `--dict` match
-the printed ChArUco board. OpenCV webcams treat `--width` / `--height` as
-best-effort; the YAML records the actual stream size used during calibration.
-Use the recorded `image_width` / `image_height` for downstream capture.
+Ensure `--squares-x`, `--squares-y`, `--square-length-mm`,
+`--marker-length-mm`, and `--dict` match the generated board metadata exactly.
+OpenCV webcams treat `--width` / `--height` as best-effort; the YAML records
+the actual stream size used during calibration. Use the recorded `image_width`
+/ `image_height` for downstream capture.
 
 For the full Step 1 contract, failure modes, and verification checklist, see
 [`docs/workflows/step1_calibrate_charuco.md`](docs/workflows/step1_calibrate_charuco.md).
@@ -805,6 +824,7 @@ module-invoked while packaging catches up. The current practical entry points
 are:
 
 - `posetag-gen-tags` -> AprilTag sheet generation
+- `posetag-gen-charuco` -> ChArUco calibration board generation
 - `posetag-calib-charuco` -> ChArUco colour calibration
 - `posetag-make-board` -> per-face board YAML and tag registry creation
 - `posetag-capture-face` -> face-shot capture

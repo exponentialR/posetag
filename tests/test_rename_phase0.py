@@ -29,6 +29,7 @@ class RenamePhase0Tests(unittest.TestCase):
         self.assertEqual(project["readme"], "README.md")
         self.assertEqual(scripts["posetag"], "posetag.cli.posetag:main")
         self.assertEqual(scripts["posetag-gen-tags"], "posetag.cli.gen_tags:main")
+        self.assertEqual(scripts["posetag-gen-charuco"], "posetag.cli.gen_charuco:main")
         self.assertEqual(scripts["posetag-gui"], "posetag.gui.app:main")
         self.assertEqual(scripts["gtat"], "gt6dof_atag.cli.gtat:main")
 
@@ -37,6 +38,7 @@ class RenamePhase0Tests(unittest.TestCase):
         expected = [
             "posetag",
             "posetag-gen-tags",
+            "posetag-gen-charuco",
             "posetag-calib-charuco",
             "posetag-make-board",
             "posetag-capture-face",
