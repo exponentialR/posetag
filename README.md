@@ -61,6 +61,7 @@ Optional extras:
 
 ```bash
 python3 -m pip install -e ".[apriltags]"
+python3 -m pip install -e ".[gui]"
 python3 -m pip install -e ".[realsense]"
 python3 -m pip install -e ".[scipy]"
 ```
@@ -93,6 +94,20 @@ posetag project home
 By default PoseTag uses `~/posetag` as the projects home. During the migration
 it still discovers legacy project homes under `~/gt-6dof` and still accepts the
 legacy `GTAT_PROJECT` / `GTAT_PROJECTS_DIR` environment variables.
+
+## Workflow Dashboard
+
+PoseTag includes an optional read-only PySide6 dashboard for inspecting workflow
+status from the same package helpers used by tests and command-line tools:
+
+```bash
+python3 -m pip install -e ".[gui]"
+posetag-gui --project_root my_project
+```
+
+The MVP dashboard shows the project root, stages 0-6, checked paths, warnings,
+errors, next recommended action, and copyable command previews. It does not
+launch camera, calibration, board-building, annotation, or dataset workflows.
 
 ## Scientific Contract
 
@@ -793,6 +808,7 @@ are:
 - `posetag-capture-face` -> face-shot capture
 - `posetag-annotate` -> single, batch, and browse annotation flows
 - `posetag-collect` -> dataset capture
+- `posetag-gui` -> optional read-only workflow status dashboard
 - `python3 -m gen_keypoints` -> canonical keypoint generation
 - `python3 -m view_keypoints` -> mesh/keypoint visualisation
 

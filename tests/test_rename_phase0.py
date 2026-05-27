@@ -29,6 +29,7 @@ class RenamePhase0Tests(unittest.TestCase):
         self.assertEqual(project["readme"], "README.md")
         self.assertEqual(scripts["posetag"], "posetag.cli.posetag:main")
         self.assertEqual(scripts["posetag-gen-tags"], "posetag.cli.gen_tags:main")
+        self.assertEqual(scripts["posetag-gui"], "posetag.gui.app:main")
         self.assertEqual(scripts["gtat"], "gt6dof_atag.cli.gtat:main")
 
     def test_script_targets_are_importable(self) -> None:
@@ -41,6 +42,7 @@ class RenamePhase0Tests(unittest.TestCase):
             "posetag-capture-face",
             "posetag-annotate",
             "posetag-collect",
+            "posetag-gui",
             "gtat",
             "gtat-gen-tags",
             "gtat-calib-charuco",

@@ -14,6 +14,7 @@ dependencies = ["numpy", "opencv-python>=4.5", "PyYAML"]
 
 [project.optional-dependencies]
 apriltags = ["pupil-apriltags"]
+gui = ["PySide6"]
 realsense = ["pyrealsense2"]
 scipy = ["scipy"]
 
@@ -25,6 +26,7 @@ posetag-make-board = "posetag.cli.make_board:main"
 posetag-capture-face = "posetag.cli.capture_face:main"
 posetag-annotate = "posetag.cli.annotate:main"
 posetag-collect = "posetag.cli.collect:main"
+posetag-gui = "posetag.gui.app:main"
 gtat = "gt6dof_atag.cli.gtat:main"
 gtat-gen-tags = "gt6dof_atag.cli.gen_tags:main"
 gtat-calib-charuco = "gt6dof_atag.cli.charuco:main"
@@ -41,6 +43,7 @@ packages = [
   "posetag.pipelines",
   "posetag.utils",
   "posetag.workflows",
+  "posetag.gui",
   "gt6dof_atag",
   "gt6dof_atag.cli",
   "gt6dof_atag.utils",
