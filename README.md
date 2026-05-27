@@ -105,9 +105,11 @@ python3 -m pip install -e ".[gui]"
 posetag-gui --project_root my_project
 ```
 
-The MVP dashboard shows the project root, stages 0-6, checked paths, warnings,
-errors, next recommended action, and copyable command previews. It does not
-launch camera, calibration, board-building, annotation, or dataset workflows.
+The dashboard shows the selected project root, stages 0-6, a project-health
+summary, checked paths, warnings, errors, next recommended action, and copyable
+command previews. It can open the selected project folder in the system file
+manager, but it does not launch camera, calibration, board-building,
+annotation, or dataset workflows.
 
 ## Scientific Contract
 

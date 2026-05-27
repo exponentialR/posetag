@@ -13,8 +13,12 @@ from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 from posetag.gui import app as gui_app
-from posetag.gui.main_window import _style_sheet
-from posetag.gui.models import inspect_project_view
+from posetag.gui.main_window import (
+    _copy_confirmation_message,
+    _project_root_hint,
+    _style_sheet,
+)
+from posetag.gui.models import inspect_project_view, project_health_view
 from posetag.workflows.commands import command_preview
 
 
@@ -90,6 +94,32 @@ class WorkflowGuiTests(unittest.TestCase):
         self.assertIn("--project_root", models[0].command_preview)
         self.assertEqual(models[6].command_preview, "")
 
+    def test_project_health_view_handles_empty_project_state(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            project_root = Path(tmpdir) / "empty-project"
+            health = project_health_view(inspect_project_view(project_root))
+
+        self.assertEqual(health.status, "missing")
+        self.assertEqual(health.headline, "No workflow outputs found")
+        self.assertEqual(health.error_count, 0)
+        self.assertEqual(health.next_stage_label, "Stage 0: Generate AprilTag Sheets")
+        self.assertIn("posetag-gen-tags", health.next_action)
+
+    def test_project_health_view_prioritizes_attention_states(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            project_root = Path(tmpdir) / "project"
+            calib_path = project_root / "calib" / "calib_color.yaml"
+            calib_path.parent.mkdir(parents=True)
+            calib_path.write_text("not_camera_matrix: true\n", encoding="utf-8")
+
+            health = project_health_view(inspect_project_view(project_root))
+
+        self.assertEqual(health.status, "needs_attention")
+        self.assertEqual(health.headline, "Needs attention")
+        self.assertGreater(health.error_count, 0)
+        self.assertEqual(health.next_stage_label, "Stage 1: Calibrate Camera")
+        self.assertIn("calib_color.yaml", health.next_action)
+
     def test_command_preview_quotes_project_paths(self) -> None:
         preview = command_preview(
             "build_boards",
@@ -111,11 +141,29 @@ class WorkflowGuiTests(unittest.TestCase):
         self.assertIn("env 'POSETAG_PROJECT=/tmp/PoseTag project'", collect_preview)
         self.assertIn("posetag-collect --mode live", collect_preview)
 
+    def test_command_copy_confirmation_text_is_explicit(self) -> None:
+        self.assertEqual(
+            _copy_confirmation_message("posetag-gen-tags --project_root project"),
+            "Copied command preview to the clipboard.",
+        )
+        self.assertEqual(
+            _copy_confirmation_message(""),
+            "No command preview is available for this stage.",
+        )
+
+    def test_project_root_hint_does_not_create_empty_project(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            missing_project = Path(tmpdir) / "project"
+            hint = _project_root_hint(missing_project)
+
+            self.assertIn("not found", hint)
+            self.assertFalse(missing_project.exists())
+
     def test_selected_stage_row_keeps_readable_text_style(self) -> None:
         style = _style_sheet()
 
         self.assertIn("QListWidget::item:selected", style)
-        self.assertIn("background: #e8f1fb", style)
+        self.assertIn("background: #e7f0fa", style)
         self.assertIn("color: #0b1724", style)
         self.assertIn("QListWidget::item:selected:!active", style)
 
