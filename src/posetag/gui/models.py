@@ -195,7 +195,10 @@ def project_health_view(
         return _health(
             status="missing",
             headline="No workflow outputs found",
-            message="Start by generating AprilTag sheets for this project.",
+            message=(
+                "Start by creating or selecting a project, then generate the "
+                "ChArUco calibration board."
+            ),
             counts=counts,
             warning_count=warning_count,
             error_count=error_count,

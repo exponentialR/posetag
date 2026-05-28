@@ -17,6 +17,10 @@ import yaml
 
 from posetag.gui import app as gui_app
 from posetag.gui.main_window import (
+    _command_button_label,
+    _command_card_note,
+    _command_card_title,
+    _command_ready_message,
     _copy_confirmation_message,
     _format_charuco_outputs,
     _format_health_counts,
@@ -115,12 +119,15 @@ class WorkflowGuiTests(unittest.TestCase):
             project_root = Path(tmpdir) / "project with spaces"
             models = inspect_project_view(project_root)
 
-        self.assertEqual(len(models), 7)
+        self.assertEqual(len(models), 9)
         self.assertEqual(models[0].stage_id, 0)
         self.assertEqual(models[0].status, "missing")
-        self.assertIn("posetag-gen-tags", models[0].command_preview)
-        self.assertIn("--project_root", models[0].command_preview)
-        self.assertEqual(models[6].command_preview, "")
+        self.assertIn("posetag project new", models[0].command_preview)
+        self.assertIn("posetag-gen-charuco", models[1].command_preview)
+        self.assertIn("posetag-calib-charuco", models[2].command_preview)
+        self.assertIn("posetag-gen-tags", models[3].command_preview)
+        self.assertIn("--project_root", models[3].command_preview)
+        self.assertEqual(models[8].command_preview, "")
 
     def test_project_health_view_handles_empty_project_state(self) -> None:
         with TemporaryDirectory() as tmpdir:
@@ -130,8 +137,8 @@ class WorkflowGuiTests(unittest.TestCase):
         self.assertEqual(health.status, "missing")
         self.assertEqual(health.headline, "No workflow outputs found")
         self.assertEqual(health.error_count, 0)
-        self.assertEqual(health.next_stage_label, "Stage 0: Generate AprilTag Sheets")
-        self.assertIn("posetag-gen-tags", health.next_action)
+        self.assertEqual(health.next_stage_label, "Stage 0: Project Setup")
+        self.assertIn("posetag project new", health.next_action)
 
     def test_project_health_view_prioritizes_attention_states(self) -> None:
         with TemporaryDirectory() as tmpdir:
@@ -145,7 +152,7 @@ class WorkflowGuiTests(unittest.TestCase):
         self.assertEqual(health.status, "needs_attention")
         self.assertEqual(health.headline, "Needs attention")
         self.assertGreater(health.error_count, 0)
-        self.assertEqual(health.next_stage_label, "Stage 1: Calibrate Camera")
+        self.assertEqual(health.next_stage_label, "Stage 2: Calibrate Camera")
         self.assertIn("calib_color.yaml", health.next_action)
 
     def test_project_health_view_keeps_mixed_missing_outputs_incomplete(self) -> None:
@@ -189,7 +196,10 @@ class WorkflowGuiTests(unittest.TestCase):
 
         self.assertEqual(health.status, "missing")
         self.assertEqual(health.headline, "Workflow outputs missing")
-        self.assertEqual(health.next_stage_label, "Stage 0: Generate AprilTag Sheets")
+        self.assertEqual(
+            health.next_stage_label,
+            "Stage 1: Generate ChArUco Calibration Board",
+        )
         self.assertIn("required outputs are still missing", health.message)
 
     def test_command_preview_quotes_project_paths(self) -> None:
@@ -219,8 +229,53 @@ class WorkflowGuiTests(unittest.TestCase):
             "Copied command preview to the clipboard.",
         )
         self.assertEqual(
+            _copy_confirmation_message(
+                "posetag-gen-tags --project_root project",
+                stage_complete=True,
+            ),
+            "Copied rerun command to the clipboard.",
+        )
+        self.assertEqual(
             _copy_confirmation_message(""),
             "No command preview is available for this stage.",
+        )
+
+    def test_complete_stage_command_copy_reads_as_secondary_rerun(self) -> None:
+        complete = SimpleNamespace(
+            status="complete",
+            command_preview="posetag-gen-charuco --project_root project",
+        )
+        missing = SimpleNamespace(
+            status="missing",
+            command_preview="posetag-gen-tags --project_root project",
+        )
+        no_command = SimpleNamespace(status="not_applicable", command_preview="")
+
+        self.assertEqual(_command_card_title(complete), "Rerun command")
+        self.assertEqual(_command_button_label(complete), "Copy Rerun")
+        self.assertIn("already complete", _command_card_note(complete))
+        self.assertIn("checked paths", _command_card_note(complete))
+        self.assertEqual(
+            _command_ready_message(
+                complete.command_preview,
+                stage_complete=True,
+            ),
+            "Stage complete. Copy only if you need to regenerate outputs.",
+        )
+
+        self.assertEqual(_command_card_title(missing), "Command preview")
+        self.assertEqual(_command_button_label(missing), "Copy Command")
+        self.assertIn("Copy the preview", _command_card_note(missing))
+        self.assertEqual(
+            _command_ready_message(missing.command_preview),
+            "Ready to copy. Replace placeholder values before running it.",
+        )
+
+        self.assertEqual(_command_card_title(no_command), "Command preview")
+        self.assertEqual(_command_button_label(no_command), "Copy Command")
+        self.assertEqual(
+            _command_card_note(no_command),
+            "No command preview is defined for this stage.",
         )
 
     def test_project_root_hint_does_not_create_empty_project(self) -> None:
@@ -289,7 +344,9 @@ class WorkflowGuiTests(unittest.TestCase):
         self.assertIn("AT A GLANCE", counts)
         self.assertIn("<table", counts)
         self.assertIn("<td>Missing</td>", counts)
-        self.assertIn("<b>3</b>", counts)
+        self.assertIn("<b>2</b>", counts)
+        self.assertIn("<td>Not applicable</td>", counts)
+        self.assertIn("<b>7</b>", counts)
 
         status_style = _health_status_style(
             foreground=health.status_color,
@@ -308,14 +365,16 @@ class WorkflowGuiTests(unittest.TestCase):
 
         self.assertEqual(
             _stage_list_label(stage0),
-            "Stage 0\nGenerate AprilTag Sheets\nMissing",
+            "Stage 0\nProject Setup\nMissing",
         )
         stage3 = models[3]
+        stage5 = models[5]
 
-        self.assertEqual(_stage_rail_name(stage0), "Tags")
+        self.assertEqual(_stage_rail_name(stage0), "Project")
         self.assertEqual(_stage_rail_status_label(stage0), "Missing")
-        self.assertEqual(_stage_rail_name(stage3), "Shots")
+        self.assertEqual(_stage_rail_name(stage3), "Tags")
         self.assertEqual(_stage_rail_status_label(stage3), "N/A")
+        self.assertEqual(_stage_rail_name(stage5), "Shots")
         self.assertIn("#eef8ff", _stage_rail_entry_style(stage0, selected=True))
         self.assertIn("#0b6f8f", _stage_rail_entry_style(stage0, selected=True))
         self.assertIn(
