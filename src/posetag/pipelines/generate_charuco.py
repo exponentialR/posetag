@@ -3,7 +3,7 @@
 Outputs
 -------
 - PNG is always written.
-- PDF is additionally written when Pillow is installed.
+- PDF is written by standard PoseTag installs.
 - YAML metadata records the board, paper, DPI, and output filenames.
 
 Project behavior
@@ -444,6 +444,7 @@ def generate_charuco_board(
     dpi: int,
     out_dir: Path,
     prefix: str = DEFAULT_PREFIX,
+    write_pdf: bool | None = None,
 ) -> CharucoBoardOutputs:
     """Generate a ChArUco board PNG/PDF and metadata YAML."""
 
@@ -488,7 +489,8 @@ def generate_charuco_board(
         dpi=dpi,
     )
     png_path = out_dir / f"{stem}.png"
-    pdf_path = out_dir / f"{stem}.pdf" if HAVE_PIL else None
+    should_write_pdf = HAVE_PIL if write_pdf is None else bool(write_pdf)
+    pdf_path = out_dir / f"{stem}.pdf" if should_write_pdf and HAVE_PIL else None
     yaml_path = out_dir / f"{stem}.yaml"
 
     write_png_with_dpi(png_path, page, dpi)
@@ -618,7 +620,7 @@ def main(argv: list[str] | None = None) -> int:
     if outputs.pdf is not None:
         print(f"  PDF:  {outputs.pdf}")
     else:
-        print("  PDF:  not written (install Pillow to enable PDF output)")
+        print("  PDF:  unavailable in this environment")
     print("Print at 100% / Actual Size. Do not use Fit to Page.")
     return 0
 

@@ -119,6 +119,25 @@ class WorkflowStatusTests(unittest.TestCase):
             self.assertEqual(stage.status, WorkflowStatus.COMPLETE)
             self.assertEqual(stage.errors, ())
 
+    def test_generated_charuco_metadata_is_reported_before_calibration(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            project_root = Path(tmpdir) / "project"
+            metadata_path = (
+                project_root
+                / "calib"
+                / "boards"
+                / "charuco_3x5_square50mm_marker37mm_7X7_50_A4_300dpi.yaml"
+            )
+            metadata_path.parent.mkdir(parents=True)
+            metadata_path.write_text("squares_x: 3\n", encoding="utf-8")
+
+            stage = _stage_by_id(project_root, 1)
+
+            self.assertEqual(stage.status, WorkflowStatus.MISSING)
+            self.assertIn(str(metadata_path), stage.checked_paths)
+            self.assertIn("generated ChArUco board metadata", stage.message)
+            self.assertIn("Actual Size", stage.next_action)
+
     def test_malformed_calib_color_yaml_needs_attention(self) -> None:
         with TemporaryDirectory() as tmpdir:
             project_root = Path(tmpdir) / "project"

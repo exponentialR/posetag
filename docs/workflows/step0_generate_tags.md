@@ -10,9 +10,8 @@ posetag-gen-tags --project_root <path> --tag-size-mm <N> --ids <ids>
 
 - Resolves or initializes a PoseTag project when `--project_root` is supplied.
 - Writes printable AprilTag 36h11 sheets.
-- Always writes PNG sheets.
+- Writes PNG and PDF sheets in standard PoseTag installs.
 - Splits output across multiple sheets when the requested IDs do not fit on one page.
-- Also writes PDF sheets when Pillow is installed.
 
 ## Inputs
 
@@ -73,17 +72,14 @@ Explicit output override:
 posetag-gen-tags --project_root my_project --tag-size-mm 40 --ids 1-3,7,9-10 --out_dir exported_patterns
 ```
 
-## Guaranteed Vs Optional Outputs
+## Outputs
 
-- Guaranteed: PNG output.
+- PNG output.
   PNG files include the requested DPI metadata.
-- Optional: PDF output when Pillow is installed.
+- PDF output.
 - Multiple pages: when the requested IDs exceed one sheet, PoseTag writes
   deterministic page-numbered outputs such as `page01of03`, `page02of03`, and
   `page03of03`.
-
-If Pillow is missing, PoseTag still completes the run and reports that the PDF
-was skipped.
 
 ## Failure Modes
 

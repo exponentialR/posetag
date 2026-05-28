@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import importlib
+import signal
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -73,11 +74,12 @@ def run_gui(project_root: str | Path, qt_modules: QtModules | None = None) -> in
 
     app.setApplicationName("PoseTag")
     app.setOrganizationName("PoseTag")
+    _install_terminal_shutdown_handlers(app, qt.QtCore)
 
     from posetag.gui.main_window import build_main_window
 
     window = build_main_window(qt, Path(project_root).expanduser())
-    window.resize(1180, 740)
+    window.resize(1280, 800)
     window.show()
     return int(app.exec())
 
@@ -93,6 +95,30 @@ def _load_qt_modules() -> QtModules:
         raise MissingGuiDependency(
             "PySide6 is required to launch the PoseTag GUI."
         ) from exc
+
+
+def _install_terminal_shutdown_handlers(app: Any, qt_core: Any) -> None:
+    """Ask Qt to quit when the launching terminal sends a shutdown signal."""
+
+    def quit_from_signal(_signum: int, _frame: Any) -> None:
+        app.quit()
+
+    signals = [signal.SIGINT, signal.SIGTERM]
+    sighup = getattr(signal, "SIGHUP", None)
+    if sighup is not None:
+        signals.append(sighup)
+
+    for signum in signals:
+        try:
+            signal.signal(signum, quit_from_signal)
+        except (OSError, RuntimeError, ValueError):
+            continue
+
+    timer = qt_core.QTimer()
+    timer.setInterval(200)
+    timer.timeout.connect(lambda: None)
+    timer.start()
+    app._posetag_signal_timer = timer
 
 
 if __name__ == "__main__":

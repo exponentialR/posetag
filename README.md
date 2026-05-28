@@ -97,8 +97,8 @@ legacy `GTAT_PROJECT` / `GTAT_PROJECTS_DIR` environment variables.
 
 ## Workflow Dashboard
 
-PoseTag includes an optional read-only PySide6 dashboard for inspecting workflow
-status from the same package helpers used by tests and command-line tools:
+PoseTag includes an optional PySide6 dashboard for inspecting workflow status
+from the same package helpers used by tests and command-line tools:
 
 ```bash
 python3 -m pip install -e ".[gui]"
@@ -107,9 +107,11 @@ posetag-gui --project_root my_project
 
 The dashboard shows the selected project root, stages 0-6, a project-health
 summary, checked paths, warnings, errors, next recommended action, and copyable
-command previews. It can open the selected project folder in the system file
-manager, but it does not launch camera, calibration, board-building,
-annotation, or dataset workflows.
+command previews. In Step 1 it can generate the ChArUco board PNG, PDF, and
+metadata YAML using the same package helper as `posetag-gen-charuco`.
+It can open selected folders in the system file manager, but it does not launch
+camera capture, calibration solving, board-building, annotation, or dataset
+workflows.
 
 ## Scientific Contract
 
@@ -184,8 +186,7 @@ posetag-gen-tags --project_root my_project --tag-size-mm 40 --paper-mm 80x80 --i
 Options you might tweak later: `--paper {A4,LETTER,LEGAL}`, `--paper-mm WxH`,
 `--orientation`, `--dpi`, and `--out_dir`.
 
-PNG output is guaranteed. If Pillow is installed, PoseTag also writes PDF
-output; otherwise it reports that PDF output is optional and continues.
+Standard PoseTag installs write both PNG and PDF sheets.
 
 ---
 
@@ -202,7 +203,7 @@ posetag-gen-charuco --project_root my_project \
   --paper A4 --dpi 300
 ```
 
-This writes a printable PNG, optional PDF, and metadata YAML under:
+This writes a printable PNG, PDF, and metadata YAML under:
 
 ```text
 my_project/calib/boards/
@@ -210,6 +211,9 @@ my_project/calib/boards/
 
 Print at **100%** / **Actual Size** and do not use “Fit to page”. Verify the
 printed square edge with a ruler before calibration.
+
+The optional `posetag-gui` dashboard provides the same ChArUco board setup from
+the Step 1 panel and refreshes project status after writing the files.
 
 Then calibrate with the same board parameters. Press `SPACE` to capture a
 sample and `ENTER` to solve. The calibration command outputs
