@@ -142,15 +142,36 @@ def inspect_step1(project_root: Union[Path, str]) -> StageSummary:
 
     root = Path(project_root).expanduser()
     calib_path = root / "calib" / "calib_color.yaml"
-    checked_paths = _path_tuple([calib_path])
+    charuco_metadata_paths = _generated_charuco_metadata_paths(root)
+    checked_paths = _path_tuple([calib_path, *charuco_metadata_paths])
 
     if not calib_path.exists():
+        if charuco_metadata_paths:
+            count = len(charuco_metadata_paths)
+            return _stage(
+                stage_id=1,
+                status=WorkflowStatus.MISSING,
+                message=(
+                    f"Found {count} generated ChArUco board metadata "
+                    f"file{'s' if count != 1 else ''}, but colour-camera "
+                    "calibration YAML was not found."
+                ),
+                checked_paths=checked_paths,
+                next_action=(
+                    "Print the generated ChArUco board at 100% / Actual Size, "
+                    "verify the square length, then run posetag-calib-charuco "
+                    "to create calib/calib_color.yaml."
+                ),
+            )
         return _stage(
             stage_id=1,
             status=WorkflowStatus.MISSING,
             message="Colour-camera calibration YAML was not found.",
             checked_paths=checked_paths,
-            next_action="Run posetag-calib-charuco to create calib/calib_color.yaml.",
+            next_action=(
+                "Generate and print a ChArUco board if needed, then run "
+                "posetag-calib-charuco to create calib/calib_color.yaml."
+            ),
         )
 
     try:
@@ -368,6 +389,13 @@ def _placeholder_summaries(step2_complete: bool) -> list[StageSummary]:
             next_action="Complete Step 5 before checking Step 6.",
         ),
     ]
+
+
+def _generated_charuco_metadata_paths(project_root: Path) -> tuple[Path, ...]:
+    boards_dir = project_root / "calib" / "boards"
+    return tuple(
+        sorted(path for path in boards_dir.glob("charuco_*.yaml") if path.is_file())
+    )
 
 
 def _validate_calibration_workflow_schema(path: Path) -> tuple[str, ...]:

@@ -10,7 +10,7 @@ readme = "README.md"
 license = { file = "LICENSE" }
 authors = [{ name = "Samuel Adebayo" }]
 requires-python = ">=3.9"
-dependencies = ["numpy", "opencv-python>=4.5", "PyYAML"]
+dependencies = ["numpy", "opencv-python>=4.5", "Pillow", "PyYAML"]
 
 [project.optional-dependencies]
 apriltags = ["pupil-apriltags"]

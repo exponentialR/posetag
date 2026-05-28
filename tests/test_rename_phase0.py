@@ -27,6 +27,7 @@ class RenamePhase0Tests(unittest.TestCase):
 
         self.assertEqual(project["name"], "posetag")
         self.assertEqual(project["readme"], "README.md")
+        self.assertIn("Pillow", project["dependencies"])
         self.assertEqual(scripts["posetag"], "posetag.cli.posetag:main")
         self.assertEqual(scripts["posetag-gen-tags"], "posetag.cli.gen_tags:main")
         self.assertEqual(scripts["posetag-gen-charuco"], "posetag.cli.gen_charuco:main")

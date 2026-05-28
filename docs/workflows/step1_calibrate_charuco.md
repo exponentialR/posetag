@@ -49,11 +49,11 @@ Default project-root outputs:
 <project_root>/calib/boards/
   charuco_3x5_square50mm_marker37mm_7X7_50_A4_300dpi.png
   charuco_3x5_square50mm_marker37mm_7X7_50_A4_300dpi.yaml
-  charuco_3x5_square50mm_marker37mm_7X7_50_A4_300dpi.pdf  # when Pillow is installed
+  charuco_3x5_square50mm_marker37mm_7X7_50_A4_300dpi.pdf
 ```
 
-The PNG is guaranteed. PDF output is optional and is written when Pillow is
-available. The metadata YAML round-trips with `yaml.safe_load` and records:
+Standard PoseTag installs write both PNG and PDF output. The metadata YAML
+round-trips with `yaml.safe_load` and records:
 
 ```yaml
 squares_x: 3
@@ -80,6 +80,11 @@ scaled, reprint before calibration.
 Use `--out_dir <path>` to write the PNG/PDF/YAML somewhere other than
 `<project_root>/calib/boards/`. Custom paper can be supplied with
 `--paper-mm WxH`, for example `--paper-mm 210x297`.
+
+The optional `posetag-gui` dashboard exposes this setup as a guided Step 1
+panel. It calls the same package generator as `posetag-gen-charuco`, displays
+the generated PNG/YAML/PDF paths, and refreshes workflow status. It does not
+start camera capture or run `posetag-calib-charuco`.
 
 ## Command Examples
 

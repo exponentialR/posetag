@@ -3,7 +3,7 @@
 Outputs
 -------
 - PNG is always written.
-- PDF is additionally written when Pillow is installed.
+- PDF is written by standard PoseTag installs.
 
 Project behavior
 ----------------
@@ -468,7 +468,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--pil-text",
         action="store_true",
-        help="Use Pillow for nicer text when available. Pillow also enables PDF output.",
+        help="Use Pillow for nicer text rendering.",
     )
     parser.add_argument(
         "--margin-frac",
@@ -509,7 +509,7 @@ def build_parser() -> argparse.ArgumentParser:
 def run(args: argparse.Namespace) -> tuple[list[Path], list[Path]]:
     if args.pil_text and not HAVE_PIL:
         print(
-            "Note: Pillow not found; continuing with OpenCV text and PNG-only output.",
+            "Note: PDF output is unavailable in this environment; continuing with PNG output.",
             file=sys.stderr,
         )
 
@@ -550,7 +550,7 @@ def main(argv: list[str] | None = None) -> int:
     if pdf_paths:
         print(f"Saved {len(png_paths)} PNG sheet(s) and {len(pdf_paths)} PDF sheet(s):")
     else:
-        print(f"Saved {len(png_paths)} PNG sheet(s) (install Pillow to also produce PDF):")
+        print(f"Saved {len(png_paths)} PNG sheet(s); PDF output is unavailable in this environment:")
     for png_path in png_paths:
         print(f"  {png_path}")
     for pdf_path in pdf_paths:
