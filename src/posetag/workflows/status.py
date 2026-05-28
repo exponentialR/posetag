@@ -1,8 +1,8 @@
 """Read-only workflow status inspection for PoseTag project directories.
 
-The helpers in this module are GUI-independent.  They report whether the
-validated PoseTag workflow artifacts for Steps 0-2 are present and readable,
-while leaving camera capture, calibration, board construction, annotation, and
+The helpers in this module are GUI-independent. They report whether the
+calibration-first GUI workflow artifacts are present and readable, while
+leaving camera capture, calibration, board construction, annotation, and
 pose-estimation algorithms in their existing pipeline modules.
 """
 
@@ -64,13 +64,15 @@ class _BoardSchema:
 
 
 _STAGE_NAMES = {
-    0: ("generate_tags", "Generate AprilTag Sheets"),
-    1: ("calibrate_camera", "Calibrate Camera"),
-    2: ("build_boards", "Build Boards"),
-    3: ("capture_face_shots", "Capture Face Shots"),
-    4: ("annotate_faces", "Annotate Faces"),
-    5: ("collect_dataset", "Collect Dataset"),
-    6: ("review_export", "Review and Export"),
+    0: ("project_setup", "Project Setup"),
+    1: ("generate_charuco_board", "Generate ChArUco Calibration Board"),
+    2: ("calibrate_camera", "Calibrate Camera"),
+    3: ("generate_object_tags", "Generate Object AprilTags"),
+    4: ("build_object_boards", "Build Object Board Definitions"),
+    5: ("capture_face_shots", "Capture Face Shots"),
+    6: ("annotate_faces", "Annotate Faces / Board-To-Object Transforms"),
+    7: ("collect_dataset", "Collect Dataset / Estimate Poses"),
+    8: ("review_export", "Review And Export"),
 }
 
 _CALIBRATION_REQUIRED_FIELDS = (
@@ -97,21 +99,193 @@ def inspect_project(project_root: Union[Path, str]) -> list[StageSummary]:
     """
 
     root = Path(project_root).expanduser()
+    project_setup = inspect_project_setup(root)
+    charuco_board = inspect_charuco_board(root)
+    camera_calibration = inspect_camera_calibration(root)
+    object_tags = inspect_object_tags(
+        root,
+        calibration_complete=camera_calibration.status == WorkflowStatus.COMPLETE,
+    )
+    board_definitions = inspect_board_definitions(
+        root,
+        calibration_complete=camera_calibration.status == WorkflowStatus.COMPLETE,
+        object_tags_complete=object_tags.status == WorkflowStatus.COMPLETE,
+    )
     summaries = [
-        inspect_step0(root),
-        inspect_step1(root),
-        inspect_step2(root),
+        project_setup,
+        charuco_board,
+        camera_calibration,
+        object_tags,
+        board_definitions,
     ]
     summaries.extend(
         _placeholder_summaries(
-            step2_complete=summaries[2].status == WorkflowStatus.COMPLETE
+            board_definitions_complete=board_definitions.status
+            == WorkflowStatus.COMPLETE
         )
     )
     return summaries
 
 
-def inspect_step0(project_root: Union[Path, str]) -> StageSummary:
-    """Inspect Step 0 AprilTag sheet outputs."""
+def inspect_project_setup(project_root: Union[Path, str]) -> StageSummary:
+    """Inspect Stage 0 project-root readiness."""
+
+    root = Path(project_root).expanduser()
+    checked_paths = _path_tuple([root])
+
+    if root.is_dir():
+        return _stage(
+            stage_id=0,
+            status=WorkflowStatus.COMPLETE,
+            message="Project folder exists and can be inspected.",
+            checked_paths=checked_paths,
+            next_action=(
+                "Generate the ChArUco calibration board for this project."
+            ),
+        )
+
+    if root.exists():
+        return _stage(
+            stage_id=0,
+            status=WorkflowStatus.NEEDS_ATTENTION,
+            message="Selected project root exists but is not a directory.",
+            checked_paths=checked_paths,
+            next_action="Choose a directory or create a new PoseTag project root.",
+        )
+
+    return _stage(
+        stage_id=0,
+        status=WorkflowStatus.MISSING,
+        message="Project folder was not found.",
+        checked_paths=checked_paths,
+        next_action=(
+            "Create the project with posetag project new --root, or select "
+            "an existing PoseTag project folder."
+        ),
+    )
+
+
+def inspect_charuco_board(project_root: Union[Path, str]) -> StageSummary:
+    """Inspect Stage 1 generated ChArUco calibration-board metadata."""
+
+    root = Path(project_root).expanduser()
+    boards_dir = root / "calib" / "boards"
+    metadata_paths = _generated_charuco_metadata_paths(root)
+    checked_paths = _path_tuple([boards_dir, *metadata_paths])
+
+    if metadata_paths:
+        count = len(metadata_paths)
+        return _stage(
+            stage_id=1,
+            status=WorkflowStatus.COMPLETE,
+            message=(
+                f"Found {count} generated ChArUco calibration board metadata "
+                f"file{'s' if count != 1 else ''}."
+            ),
+            checked_paths=checked_paths,
+            next_action=(
+                "Print the generated ChArUco board at 100% / Actual Size, "
+                "verify the square length, then calibrate the camera."
+            ),
+        )
+
+    return _stage(
+        stage_id=1,
+        status=WorkflowStatus.MISSING,
+        message="No generated ChArUco calibration board metadata files were found.",
+        checked_paths=checked_paths,
+        next_action=(
+            "Generate a ChArUco calibration board with posetag-gen-charuco, "
+            "print it at 100% / Actual Size, and verify the square length."
+        ),
+    )
+
+
+def inspect_camera_calibration(project_root: Union[Path, str]) -> StageSummary:
+    """Inspect Stage 2 colour-camera calibration output."""
+
+    root = Path(project_root).expanduser()
+    calib_path = root / "calib" / "calib_color.yaml"
+    charuco_metadata_paths = _generated_charuco_metadata_paths(root)
+    checked_paths = _path_tuple([calib_path, *charuco_metadata_paths])
+
+    if not calib_path.exists() and not charuco_metadata_paths:
+        return _stage(
+            stage_id=2,
+            status=WorkflowStatus.NOT_APPLICABLE,
+            message=(
+                "Camera calibration follows ChArUco board generation in the "
+                "guided workflow."
+            ),
+            checked_paths=checked_paths,
+            next_action="Complete Stage 1 before checking Stage 2.",
+        )
+
+    if not calib_path.exists():
+        count = len(charuco_metadata_paths)
+        return _stage(
+            stage_id=2,
+            status=WorkflowStatus.MISSING,
+            message=(
+                f"Found {count} generated ChArUco board metadata "
+                f"file{'s' if count != 1 else ''}, but colour-camera "
+                "calibration YAML was not found."
+            ),
+            checked_paths=checked_paths,
+            next_action=(
+                "Print the generated ChArUco board at 100% / Actual Size, "
+                "verify the square length, then run posetag-calib-charuco "
+                "to create calib/calib_color.yaml."
+            ),
+        )
+
+    try:
+        load_calibration_yaml(calib_path)
+    except MakeBoardError as exc:
+        return _stage(
+            stage_id=2,
+            status=WorkflowStatus.NEEDS_ATTENTION,
+            message=(
+                "Colour-camera calibration YAML exists but did not pass "
+                "schema checks."
+            ),
+            checked_paths=checked_paths,
+            errors=(str(exc),),
+            next_action=(
+                "Regenerate or repair calib/calib_color.yaml before "
+                "generating object AprilTags."
+            ),
+        )
+
+    workflow_errors = _validate_calibration_workflow_schema(calib_path)
+    if workflow_errors:
+        return _stage(
+            stage_id=2,
+            status=WorkflowStatus.NEEDS_ATTENTION,
+            message="Colour-camera calibration YAML exists but is incomplete.",
+            checked_paths=checked_paths,
+            errors=workflow_errors,
+            next_action=(
+                "Regenerate or repair calib/calib_color.yaml before "
+                "generating object AprilTags."
+            ),
+        )
+
+    return _stage(
+        stage_id=2,
+        status=WorkflowStatus.COMPLETE,
+        message="Colour-camera calibration YAML exists and passed schema checks.",
+        checked_paths=checked_paths,
+        next_action="Proceed to Stage 3 object AprilTag generation.",
+    )
+
+
+def inspect_object_tags(
+    project_root: Union[Path, str],
+    *,
+    calibration_complete: bool = False,
+) -> StageSummary:
+    """Inspect Stage 3 object AprilTag sheet outputs."""
 
     root = Path(project_root).expanduser()
     patterns_dir = root / "boards" / "patterns"
@@ -121,112 +295,77 @@ def inspect_step0(project_root: Union[Path, str]) -> StageSummary:
     if png_paths:
         count = len(png_paths)
         return _stage(
-            stage_id=0,
+            stage_id=3,
             status=WorkflowStatus.COMPLETE,
-            message=f"Found {count} AprilTag sheet PNG file{'s' if count != 1 else ''}.",
-            checked_paths=checked_paths,
-            next_action="Proceed to Step 1 camera calibration.",
-        )
-
-    return _stage(
-        stage_id=0,
-        status=WorkflowStatus.MISSING,
-        message="No generated AprilTag sheet PNG files were found.",
-        checked_paths=checked_paths,
-        next_action="Run posetag-gen-tags to write sheets under boards/patterns/.",
-    )
-
-
-def inspect_step1(project_root: Union[Path, str]) -> StageSummary:
-    """Inspect Step 1 colour-camera calibration output."""
-
-    root = Path(project_root).expanduser()
-    calib_path = root / "calib" / "calib_color.yaml"
-    charuco_metadata_paths = _generated_charuco_metadata_paths(root)
-    checked_paths = _path_tuple([calib_path, *charuco_metadata_paths])
-
-    if not calib_path.exists():
-        if charuco_metadata_paths:
-            count = len(charuco_metadata_paths)
-            return _stage(
-                stage_id=1,
-                status=WorkflowStatus.MISSING,
-                message=(
-                    f"Found {count} generated ChArUco board metadata "
-                    f"file{'s' if count != 1 else ''}, but colour-camera "
-                    "calibration YAML was not found."
-                ),
-                checked_paths=checked_paths,
-                next_action=(
-                    "Print the generated ChArUco board at 100% / Actual Size, "
-                    "verify the square length, then run posetag-calib-charuco "
-                    "to create calib/calib_color.yaml."
-                ),
-            )
-        return _stage(
-            stage_id=1,
-            status=WorkflowStatus.MISSING,
-            message="Colour-camera calibration YAML was not found.",
-            checked_paths=checked_paths,
-            next_action=(
-                "Generate and print a ChArUco board if needed, then run "
-                "posetag-calib-charuco to create calib/calib_color.yaml."
+            message=(
+                f"Found {count} object AprilTag sheet PNG "
+                f"file{'s' if count != 1 else ''}."
             ),
+            checked_paths=checked_paths,
+            next_action="Proceed to Stage 4 object board definition.",
         )
 
-    try:
-        load_calibration_yaml(calib_path)
-    except MakeBoardError as exc:
+    if not calibration_complete:
         return _stage(
-            stage_id=1,
-            status=WorkflowStatus.NEEDS_ATTENTION,
-            message="Colour-camera calibration YAML exists but did not pass schema checks.",
+            stage_id=3,
+            status=WorkflowStatus.NOT_APPLICABLE,
+            message="Object AprilTag generation follows camera calibration in the GUI.",
             checked_paths=checked_paths,
-            errors=(str(exc),),
-            next_action="Regenerate or repair calib/calib_color.yaml before building boards.",
-        )
-
-    workflow_errors = _validate_calibration_workflow_schema(calib_path)
-    if workflow_errors:
-        return _stage(
-            stage_id=1,
-            status=WorkflowStatus.NEEDS_ATTENTION,
-            message="Colour-camera calibration YAML exists but is incomplete.",
-            checked_paths=checked_paths,
-            errors=workflow_errors,
-            next_action="Regenerate or repair calib/calib_color.yaml before building boards.",
+            next_action="Complete Stage 2 before checking Stage 3.",
         )
 
     return _stage(
-        stage_id=1,
-        status=WorkflowStatus.COMPLETE,
-        message="Colour-camera calibration YAML exists and passed schema checks.",
+        stage_id=3,
+        status=WorkflowStatus.MISSING,
+        message="No generated object AprilTag sheet PNG files were found.",
         checked_paths=checked_paths,
-        next_action="Proceed to Step 2 board building.",
+        next_action=(
+            "Run posetag-gen-tags to write object tag sheets under "
+            "boards/patterns/."
+        ),
     )
 
 
-def inspect_step2(project_root: Union[Path, str]) -> StageSummary:
-    """Inspect Step 2 board YAML files and tag registry output."""
+def inspect_board_definitions(
+    project_root: Union[Path, str],
+    *,
+    calibration_complete: bool = False,
+    object_tags_complete: bool = False,
+) -> StageSummary:
+    """Inspect Stage 4 board YAML files and tag registry output."""
 
     root = Path(project_root).expanduser()
     registry_path = root / "boards" / "tag_registry.yaml"
     checked_paths: list[Path] = [registry_path]
 
     if not registry_path.exists():
+        if not (calibration_complete and object_tags_complete):
+            return _stage(
+                stage_id=4,
+                status=WorkflowStatus.NOT_APPLICABLE,
+                message=(
+                    "Object board definitions depend on camera calibration "
+                    "and printed object AprilTags."
+                ),
+                checked_paths=_path_tuple(checked_paths),
+                next_action="Complete Stages 2 and 3 before checking Stage 4.",
+            )
         return _stage(
-            stage_id=2,
+            stage_id=4,
             status=WorkflowStatus.MISSING,
             message="Tag registry YAML was not found.",
             checked_paths=_path_tuple(checked_paths),
-            next_action="Run posetag-make-board after completing camera calibration.",
+            next_action=(
+                "Run posetag-make-board after completing camera calibration "
+                "and printing object AprilTags."
+            ),
         )
 
     try:
         registry = load_registry(registry_path)
     except MakeBoardError as exc:
         return _stage(
-            stage_id=2,
+            stage_id=4,
             status=WorkflowStatus.NEEDS_ATTENTION,
             message="Tag registry YAML exists but did not pass schema checks.",
             checked_paths=_path_tuple(checked_paths),
@@ -237,7 +376,7 @@ def inspect_step2(project_root: Union[Path, str]) -> StageSummary:
     tags = registry.get("tags", {})
     if not tags:
         return _stage(
-            stage_id=2,
+            stage_id=4,
             status=WorkflowStatus.NEEDS_ATTENTION,
             message="Tag registry YAML has no tag mappings.",
             checked_paths=_path_tuple(checked_paths),
@@ -306,10 +445,11 @@ def inspect_step2(project_root: Union[Path, str]) -> StageSummary:
         if valid_board_paths:
             warnings.append(
                 f"Found {len(valid_board_paths)} valid referenced board YAML file"
-                f"{'s' if len(valid_board_paths) != 1 else ''}, but the registry also has errors."
+                f"{'s' if len(valid_board_paths) != 1 else ''}, but the "
+                "registry also has errors."
             )
         return _stage(
-            stage_id=2,
+            stage_id=4,
             status=WorkflowStatus.NEEDS_ATTENTION,
             message="Tag registry or referenced board YAML files need attention.",
             checked_paths=_path_tuple(checked_paths),
@@ -323,7 +463,7 @@ def inspect_step2(project_root: Union[Path, str]) -> StageSummary:
 
     if not valid_board_paths:
         return _stage(
-            stage_id=2,
+            stage_id=4,
             status=WorkflowStatus.NEEDS_ATTENTION,
             message="No referenced board YAML files passed schema checks.",
             checked_paths=_path_tuple(checked_paths),
@@ -331,62 +471,71 @@ def inspect_step2(project_root: Union[Path, str]) -> StageSummary:
                 "At least one referenced board YAML must exist and match the "
                 "Step 2 schema.",
             ),
-            next_action="Run posetag-make-board to create a board YAML and registry mapping.",
+            next_action=(
+                "Run posetag-make-board to create a board YAML and registry "
+                "mapping."
+            ),
         )
 
     count = len(valid_board_paths)
     return _stage(
-        stage_id=2,
+        stage_id=4,
         status=WorkflowStatus.COMPLETE,
         message=(
             f"Tag registry maps tags to {count} valid board YAML "
             f"file{'s' if count != 1 else ''}."
         ),
         checked_paths=_path_tuple(checked_paths),
-        next_action="Proceed to Step 3 face-shot capture.",
+        next_action="Proceed to Stage 5 face-shot capture.",
     )
 
 
-def _placeholder_summaries(step2_complete: bool) -> list[StageSummary]:
-    if step2_complete:
-        step3 = _stage(
-            stage_id=3,
+def _placeholder_summaries(board_definitions_complete: bool) -> list[StageSummary]:
+    if board_definitions_complete:
+        stage5 = _stage(
+            stage_id=5,
             status=WorkflowStatus.MISSING,
             message="Face-shot capture status validation is not implemented yet.",
             checked_paths=(),
-            next_action="Run the Step 3 capture workflow after confirming board coverage.",
+            next_action=(
+                "Run the Stage 5 capture workflow after confirming board "
+                "coverage."
+            ),
         )
     else:
-        step3 = _stage(
-            stage_id=3,
+        stage5 = _stage(
+            stage_id=5,
             status=WorkflowStatus.NOT_APPLICABLE,
             message="Face-shot capture depends on a valid tag registry and board YAML.",
             checked_paths=(),
-            next_action="Complete Step 2 before checking Step 3.",
+            next_action="Complete Stage 4 before checking Stage 5.",
         )
 
     return [
-        step3,
-        _stage(
-            stage_id=4,
-            status=WorkflowStatus.NOT_APPLICABLE,
-            message="Face annotation depends on captured face shots.",
-            checked_paths=(),
-            next_action="Complete Step 3 before checking Step 4.",
-        ),
-        _stage(
-            stage_id=5,
-            status=WorkflowStatus.NOT_APPLICABLE,
-            message="Dataset collection depends on calibration, boards, and annotations.",
-            checked_paths=(),
-            next_action="Complete Steps 1-4 before checking Step 5.",
-        ),
+        stage5,
         _stage(
             stage_id=6,
             status=WorkflowStatus.NOT_APPLICABLE,
+            message="Face annotation depends on captured face shots.",
+            checked_paths=(),
+            next_action="Complete Stage 5 before checking Stage 6.",
+        ),
+        _stage(
+            stage_id=7,
+            status=WorkflowStatus.NOT_APPLICABLE,
+            message=(
+                "Dataset collection depends on calibration, boards, and "
+                "annotations."
+            ),
+            checked_paths=(),
+            next_action="Complete Stages 2-6 before checking Stage 7.",
+        ),
+        _stage(
+            stage_id=8,
+            status=WorkflowStatus.NOT_APPLICABLE,
             message="Review and export depends on generated dataset outputs.",
             checked_paths=(),
-            next_action="Complete Step 5 before checking Step 6.",
+            next_action="Complete Stage 7 before checking Stage 8.",
         ),
     ]
 

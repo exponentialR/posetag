@@ -330,20 +330,16 @@ def build_main_window(qt: Any, project_root: Path) -> Any:
             command_layout = QtWidgets.QVBoxLayout(command_card)
             command_layout.setContentsMargins(14, 12, 14, 12)
             command_layout.setSpacing(8)
-            command_title = QtWidgets.QLabel("Command preview")
-            command_title.setObjectName("CardTitle")
-            command_note = QtWidgets.QLabel(
-                "Copy the preview into a terminal. Camera, calibration, "
-                "board-building, annotation, and dataset workflows are not "
-                "executed by the dashboard."
-            )
-            command_note.setObjectName("MutedText")
-            command_note.setWordWrap(True)
+            self._command_title = QtWidgets.QLabel("Command preview")
+            self._command_title.setObjectName("CardTitle")
+            self._command_note = QtWidgets.QLabel()
+            self._command_note.setObjectName("MutedText")
+            self._command_note.setWordWrap(True)
             command_row = QtWidgets.QHBoxLayout()
             command_row.addWidget(self._command_preview, 1)
             command_row.addWidget(self._copy_button)
-            command_layout.addWidget(command_title)
-            command_layout.addWidget(command_note)
+            command_layout.addWidget(self._command_title)
+            command_layout.addWidget(self._command_note)
             command_layout.addLayout(command_row)
             command_layout.addWidget(self._copy_feedback)
 
@@ -358,7 +354,7 @@ def build_main_window(qt: Any, project_root: Path) -> Any:
             charuco_title = QtWidgets.QLabel("ChArUco board setup")
             charuco_title.setObjectName("CardTitle")
             charuco_note = QtWidgets.QLabel(
-                "Generate the printed board for Step 1. Calibration capture "
+                "Generate the printed board for Stage 1. Calibration capture "
                 "and solve stay in posetag-calib-charuco."
             )
             charuco_note.setObjectName("MutedText")
@@ -858,11 +854,17 @@ def build_main_window(qt: Any, project_root: Path) -> Any:
             self._warnings_card.setVisible(bool(model.warnings))
             self._errors_card.setVisible(bool(model.errors))
             self._next_action_label.setText(model.next_action)
+            self._command_title.setText(_command_card_title(model))
+            self._command_note.setText(_command_card_note(model))
             self._command_preview.setText(model.command_preview)
             self._command_preview.setCursorPosition(0)
+            self._copy_button.setText(_command_button_label(model))
             self._copy_button.setEnabled(bool(model.command_preview))
             self._copy_feedback.setText(
-                _command_ready_message(model.command_preview)
+                _command_ready_message(
+                    model.command_preview,
+                    stage_complete=model.status == "complete",
+                )
             )
             self._charuco_card.setVisible(model.stage_id == 1)
             self._render_stage_rail_selection()
@@ -935,7 +937,11 @@ def build_main_window(qt: Any, project_root: Path) -> Any:
             command = self._command_preview.text()
             if command:
                 QtWidgets.QApplication.clipboard().setText(command)
-            message = _copy_confirmation_message(command)
+            model = self._model_by_stage_id(self._selected_stage_id)
+            message = _copy_confirmation_message(
+                command,
+                stage_complete=bool(model and model.status == "complete"),
+            )
             self._copy_feedback.setText(message)
             self.statusBar().showMessage(message, 3000)
 
@@ -989,13 +995,15 @@ def _stage_list_label(model: StageViewModel) -> str:
 
 
 _RAIL_STAGE_NAMES = {
-    0: "Tags",
-    1: "Calib",
-    2: "Boards",
-    3: "Shots",
-    4: "Annotate",
-    5: "Dataset",
-    6: "Review",
+    0: "Project",
+    1: "ChArUco",
+    2: "Calib",
+    3: "Tags",
+    4: "Boards",
+    5: "Shots",
+    6: "Annotate",
+    7: "Dataset",
+    8: "Export",
 }
 
 _RAIL_STATUS_LABELS = {
@@ -1143,14 +1151,46 @@ def _format_health_issues(health: ProjectHealthViewModel) -> str:
     )
 
 
-def _command_ready_message(command: str) -> str:
+def _command_card_title(model: StageViewModel) -> str:
+    if model.status == "complete" and model.command_preview:
+        return "Rerun command"
+    return "Command preview"
+
+
+def _command_card_note(model: StageViewModel) -> str:
+    if model.status == "complete" and model.command_preview:
+        return (
+            "This stage is already complete. The checked paths above are the "
+            "evidence for this stage; copy this command only if you need to "
+            "regenerate outputs."
+        )
+    if model.command_preview:
+        return (
+            "Copy the preview into a terminal. Camera calibration, "
+            "object-board building, annotation, and dataset workflows are not "
+            "executed by the dashboard."
+        )
+    return "No command preview is defined for this stage."
+
+
+def _command_button_label(model: StageViewModel) -> str:
+    if model.status == "complete" and model.command_preview:
+        return "Copy Rerun"
+    return "Copy Command"
+
+
+def _command_ready_message(command: str, *, stage_complete: bool = False) -> str:
     if command:
+        if stage_complete:
+            return "Stage complete. Copy only if you need to regenerate outputs."
         return "Ready to copy. Replace placeholder values before running it."
     return "No command preview is available for this stage."
 
 
-def _copy_confirmation_message(command: str) -> str:
+def _copy_confirmation_message(command: str, *, stage_complete: bool = False) -> str:
     if command:
+        if stage_complete:
+            return "Copied rerun command to the clipboard."
         return "Copied command preview to the clipboard."
     return "No command preview is available for this stage."
 
@@ -1158,13 +1198,13 @@ def _copy_confirmation_message(command: str) -> str:
 def _project_root_hint(root: Path) -> str:
     if root.is_dir():
         return (
-            "Project folder found. Status checks are read-only except Step 1 "
+            "Project folder found. Status checks are read-only except Stage 1 "
             "board generation."
         )
     if root.exists():
         return "Selected path exists but is not a folder."
     return (
-        "Project folder not found. Status checks are read-only; Step 1 board "
+        "Project folder not found. Status checks are read-only; Stage 1 board "
         "generation can create the selected project layout."
     )
 

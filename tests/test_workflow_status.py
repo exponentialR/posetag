@@ -70,7 +70,7 @@ def _write_valid_board_and_registry(project_root: Path) -> tuple[Path, Path]:
 
 
 class WorkflowStatusTests(unittest.TestCase):
-    def test_empty_project_reports_steps_0_to_2_missing(self) -> None:
+    def test_empty_project_reports_calibration_first_gui_order(self) -> None:
         with TemporaryDirectory() as tmpdir:
             project_root = Path(tmpdir) / "project"
             summaries = inspect_project(project_root)
@@ -78,8 +78,24 @@ class WorkflowStatusTests(unittest.TestCase):
 
             self.assertEqual(by_id[0].status, WorkflowStatus.MISSING)
             self.assertEqual(by_id[1].status, WorkflowStatus.MISSING)
-            self.assertEqual(by_id[2].status, WorkflowStatus.MISSING)
-            self.assertEqual(len(summaries), 7)
+            self.assertEqual(by_id[2].status, WorkflowStatus.NOT_APPLICABLE)
+            self.assertEqual(by_id[3].status, WorkflowStatus.NOT_APPLICABLE)
+            self.assertEqual(by_id[4].status, WorkflowStatus.NOT_APPLICABLE)
+            self.assertEqual(len(summaries), 9)
+            self.assertEqual(
+                [summary.name for summary in summaries],
+                [
+                    "Project Setup",
+                    "Generate ChArUco Calibration Board",
+                    "Calibrate Camera",
+                    "Generate Object AprilTags",
+                    "Build Object Board Definitions",
+                    "Capture Face Shots",
+                    "Annotate Faces / Board-To-Object Transforms",
+                    "Collect Dataset / Estimate Poses",
+                    "Review And Export",
+                ],
+            )
             for summary in summaries:
                 rendered = summary.to_dict()
                 for key in (
@@ -95,7 +111,7 @@ class WorkflowStatusTests(unittest.TestCase):
                 ):
                     self.assertIn(key, rendered)
 
-    def test_patterns_png_marks_step0_complete(self) -> None:
+    def test_patterns_png_marks_object_tag_stage_complete(self) -> None:
         with TemporaryDirectory() as tmpdir:
             project_root = Path(tmpdir) / "project"
             patterns_dir = project_root / "boards" / "patterns"
@@ -104,22 +120,22 @@ class WorkflowStatusTests(unittest.TestCase):
                 b"not-an-image-but-a-png-path"
             )
 
-            stage = _stage_by_id(project_root, 0)
+            stage = _stage_by_id(project_root, 3)
 
             self.assertEqual(stage.status, WorkflowStatus.COMPLETE)
             self.assertIn(str(patterns_dir / "apriltag_sheet.png"), stage.checked_paths)
 
-    def test_valid_calib_color_yaml_marks_step1_complete(self) -> None:
+    def test_valid_calib_color_yaml_marks_calibration_stage_complete(self) -> None:
         with TemporaryDirectory() as tmpdir:
             project_root = Path(tmpdir) / "project"
             _write_valid_calibration(project_root / "calib" / "calib_color.yaml")
 
-            stage = _stage_by_id(project_root, 1)
+            stage = _stage_by_id(project_root, 2)
 
             self.assertEqual(stage.status, WorkflowStatus.COMPLETE)
             self.assertEqual(stage.errors, ())
 
-    def test_generated_charuco_metadata_is_reported_before_calibration(self) -> None:
+    def test_generated_charuco_metadata_is_stage_before_calibration(self) -> None:
         with TemporaryDirectory() as tmpdir:
             project_root = Path(tmpdir) / "project"
             metadata_path = (
@@ -131,12 +147,18 @@ class WorkflowStatusTests(unittest.TestCase):
             metadata_path.parent.mkdir(parents=True)
             metadata_path.write_text("squares_x: 3\n", encoding="utf-8")
 
-            stage = _stage_by_id(project_root, 1)
+            charuco_stage = _stage_by_id(project_root, 1)
+            calibration_stage = _stage_by_id(project_root, 2)
 
-            self.assertEqual(stage.status, WorkflowStatus.MISSING)
-            self.assertIn(str(metadata_path), stage.checked_paths)
-            self.assertIn("generated ChArUco board metadata", stage.message)
-            self.assertIn("Actual Size", stage.next_action)
+            self.assertEqual(charuco_stage.status, WorkflowStatus.COMPLETE)
+            self.assertIn(str(metadata_path), charuco_stage.checked_paths)
+            self.assertIn(
+                "generated ChArUco calibration board metadata",
+                charuco_stage.message,
+            )
+            self.assertIn("Actual Size", charuco_stage.next_action)
+            self.assertEqual(calibration_stage.status, WorkflowStatus.MISSING)
+            self.assertIn(str(metadata_path), calibration_stage.checked_paths)
 
     def test_malformed_calib_color_yaml_needs_attention(self) -> None:
         with TemporaryDirectory() as tmpdir:
@@ -145,7 +167,7 @@ class WorkflowStatusTests(unittest.TestCase):
             calib_path.parent.mkdir(parents=True)
             calib_path.write_text("not_camera_matrix: true\n", encoding="utf-8")
 
-            stage = _stage_by_id(project_root, 1)
+            stage = _stage_by_id(project_root, 2)
 
             self.assertEqual(stage.status, WorkflowStatus.NEEDS_ATTENTION)
             self.assertTrue(stage.errors)
@@ -177,18 +199,20 @@ class WorkflowStatusTests(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            stage = _stage_by_id(project_root, 1)
+            stage = _stage_by_id(project_root, 2)
 
             self.assertEqual(stage.status, WorkflowStatus.NEEDS_ATTENTION)
             self.assertTrue(any("image_width" in error for error in stage.errors))
             self.assertTrue(any("reproj_rms" in error for error in stage.errors))
 
-    def test_valid_board_yaml_and_registry_mark_step2_complete(self) -> None:
+    def test_valid_board_yaml_and_registry_mark_board_definition_stage_complete(
+        self,
+    ) -> None:
         with TemporaryDirectory() as tmpdir:
             project_root = Path(tmpdir) / "project"
             board_path, registry_path = _write_valid_board_and_registry(project_root)
 
-            stage = _stage_by_id(project_root, 2)
+            stage = _stage_by_id(project_root, 4)
 
             self.assertEqual(stage.status, WorkflowStatus.COMPLETE)
             self.assertEqual(stage.errors, ())
@@ -217,7 +241,7 @@ class WorkflowStatusTests(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            stage = _stage_by_id(project_root, 2)
+            stage = _stage_by_id(project_root, 4)
 
             self.assertEqual(stage.status, WorkflowStatus.NEEDS_ATTENTION)
             self.assertTrue(stage.errors)
@@ -252,7 +276,7 @@ class WorkflowStatusTests(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            stage = _stage_by_id(project_root, 2)
+            stage = _stage_by_id(project_root, 4)
 
             self.assertEqual(stage.status, WorkflowStatus.NEEDS_ATTENTION)
             self.assertTrue(any("not present" in error for error in stage.errors))
@@ -265,7 +289,7 @@ class WorkflowStatusTests(unittest.TestCase):
             registry["tags"]["52"]["object"] = "different_object"
             registry_path.write_text(yaml.safe_dump(registry), encoding="utf-8")
 
-            stage = _stage_by_id(project_root, 2)
+            stage = _stage_by_id(project_root, 4)
 
             self.assertEqual(stage.status, WorkflowStatus.NEEDS_ATTENTION)
             self.assertTrue(any("different_object" in error for error in stage.errors))

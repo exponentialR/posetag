@@ -81,10 +81,11 @@ Use `--out_dir <path>` to write the PNG/PDF/YAML somewhere other than
 `<project_root>/calib/boards/`. Custom paper can be supplied with
 `--paper-mm WxH`, for example `--paper-mm 210x297`.
 
-The optional `posetag-gui` dashboard exposes this setup as a guided Step 1
-panel. It calls the same package generator as `posetag-gen-charuco`, displays
-the generated PNG/YAML/PDF paths, and refreshes workflow status. It does not
-start camera capture or run `posetag-calib-charuco`.
+The optional `posetag-gui` dashboard exposes this setup as the guided Stage 1
+ChArUco board panel, before the Stage 2 camera-calibration command preview. It
+calls the same package generator as `posetag-gen-charuco`, displays the
+generated PNG/YAML/PDF paths, and refreshes workflow status. It does not start
+camera capture or run `posetag-calib-charuco`.
 
 ## Command Examples
 

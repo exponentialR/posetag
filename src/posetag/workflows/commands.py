@@ -8,7 +8,42 @@ from typing import Iterable, Union
 
 
 _COMMAND_TEMPLATES = {
+    "project_setup": (
+        "posetag",
+        "project",
+        "new",
+        "--root",
+        "{project_root}",
+    ),
+    "generate_charuco_board": (
+        "posetag-gen-charuco",
+        "--project_root",
+        "{project_root}",
+        "--squares-x",
+        "3",
+        "--squares-y",
+        "5",
+        "--square-length-mm",
+        "50",
+        "--marker-length-mm",
+        "37",
+        "--dict",
+        "7X7_50",
+        "--paper",
+        "A4",
+        "--dpi",
+        "300",
+    ),
     "generate_tags": (
+        "posetag-gen-tags",
+        "--project_root",
+        "{project_root}",
+        "--tag-size-mm",
+        "TAG_SIZE_MM",
+        "--ids",
+        "TAG_IDS",
+    ),
+    "generate_object_tags": (
         "posetag-gen-tags",
         "--project_root",
         "{project_root}",
@@ -27,6 +62,15 @@ _COMMAND_TEMPLATES = {
         "0",
     ),
     "build_boards": (
+        "posetag-make-board",
+        "--project_root",
+        "{project_root}",
+        "--object_name",
+        "OBJECT_FACE",
+        "--calib",
+        "calib_color.yaml",
+    ),
+    "build_object_boards": (
         "posetag-make-board",
         "--project_root",
         "{project_root}",

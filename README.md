@@ -105,13 +105,15 @@ python3 -m pip install -e ".[gui]"
 posetag-gui --project_root my_project
 ```
 
-The dashboard shows the selected project root, stages 0-6, a project-health
+The dashboard shows the selected project root, stages 0-8, a project-health
 summary, checked paths, warnings, errors, next recommended action, and copyable
-command previews. In Step 1 it can generate the ChArUco board PNG, PDF, and
-metadata YAML using the same package helper as `posetag-gen-charuco`.
-It can open selected folders in the system file manager, but it does not launch
-camera capture, calibration solving, board-building, annotation, or dataset
-workflows.
+command previews. The GUI order is project setup, ChArUco board generation,
+camera calibration, object AprilTag generation, board definitions, face-shot
+capture, annotation, dataset collection, and review/export. In Stage 1 it can
+generate the ChArUco board PNG, PDF, and metadata YAML using the same package
+helper as `posetag-gen-charuco`. It can open selected folders in the system
+file manager, but it does not launch camera capture, calibration solving,
+board-building, annotation, or dataset workflows.
 
 ## Scientific Contract
 
@@ -213,7 +215,7 @@ Print at **100%** / **Actual Size** and do not use “Fit to page”. Verify the
 printed square edge with a ruler before calibration.
 
 The optional `posetag-gui` dashboard provides the same ChArUco board setup from
-the Step 1 panel and refreshes project status after writing the files.
+the Stage 1 ChArUco panel and refreshes project status after writing the files.
 
 Then calibrate with the same board parameters. Press `SPACE` to capture a
 sample and `ENTER` to solve. The calibration command outputs
