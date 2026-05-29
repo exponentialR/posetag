@@ -87,10 +87,42 @@ camera calibration. The Stage 2 panel autofills `--squares-x`, `--squares-y`,
 `--square-length-mm`, `--marker-length-mm`, and `--dict`, lets you choose
 webcam/OpenCV, RealSense, or video source settings, shows the expected
 `<project_root>/calib/calib_color.yaml` output, and prepares a copyable
-`posetag-calib-charuco` command. It also reports missing metadata, missing
-video path, unavailable RealSense dependency, and missing calibration output
-states. It does not start camera capture, detect ChArUco corners, solve
-calibration, or write calibration YAML itself.
+`posetag-calib-charuco` command. When readiness checks pass, the panel can also
+launch the existing calibration command with `Run Calibration` using the same
+Python environment as the GUI. The launch keeps a process state indicator,
+streams stdout/stderr into a compact log, and refreshes status when the process
+exits or when `calib/calib_color.yaml` appears. Success is based on the
+expected YAML passing the current status/schema checks, not only the child
+process exit code. It does not detect ChArUco corners, solve calibration, or
+write calibration YAML itself; those remain in the existing calibration
+workflow and OpenCV window.
+
+The OpenCV calibration window provides state-driven capture guidance while the
+workflow is running. It summarizes detected ChArUco corners into frame coverage
+and scale-diversity state, then prompts for a measured next action such as
+moving the board toward a missing corner/edge, changing board distance, or
+pressing `ENTER` once coverage is balanced. Guided auto-capture is enabled by
+default: it saves a frame only when the current observation improves grid
+coverage, adds useful scale diversity, or helps balance the remaining required
+sample count. These prompts and capture decisions are deterministic; they are
+selected from current observations and accepted samples rather than rotated
+randomly.
+
+The Stage 2 GUI exposes coverage rows, coverage columns, and samples-per-cell
+controls. The same settings are included in the copyable command preview and in
+the `Run Calibration` child-process launch.
+
+When `calib/calib_color.yaml` exists, Stage 2 shows a parsed calibration result
+summary in the right panel instead of making users read raw YAML by default.
+The summary includes validity, image size, model, reprojection RMS, intrinsics,
+distortion coefficients, output path, and latest run snapshot. Use `View Raw`
+or `Open YAML` when the exact artifact is needed for debugging or
+reproducibility.
+
+Native in-app camera/video rendering is intentionally deferred to issue #61.
+Do not dock or embed the OpenCV HighGUI window into Qt; the future native
+calibration canvas should share package-level calibration runtime logic while
+preserving the CLI/OpenCV fallback.
 
 ## Command Examples
 
@@ -153,6 +185,26 @@ The same board arguments are used by `posetag-gen-charuco` and
 The command fails before opening hardware if the dictionary name is not
 supported by the installed OpenCV build.
 
+## Manual GUI Launch Check
+
+The GUI launch path is hardware-dependent and is not covered by automated unit
+tests. To check it manually:
+
+```bash
+python3 -m pip install -e ".[gui]"
+posetag-gui --project_root my_project
+```
+
+Generate or select a ChArUco metadata YAML in Stage 1, open Stage 2, choose the
+source, and press `Run Calibration` once the readiness panel says it is ready.
+The button is disabled while the child process is running. Use the OpenCV
+calibration window exactly as the CLI uses it: guided auto-capture saves good
+samples as you move the board through the grid, `SPACE` adds a manual sample,
+`ENTER` solves, and `q` quits. Confirm the OpenCV preview shows guidance text
+and a coverage grid with collected cells turning green, the GUI log receives
+process output, and Stage 2 refreshes after
+`<project_root>/calib/calib_color.yaml` appears.
+
 The generation command fails clearly if:
 
 - the dictionary name is not supported by the installed OpenCV build
@@ -165,13 +217,43 @@ The generation command fails clearly if:
 
 ## Controls
 
-- `SPACE`: save the current frame as a calibration sample when enough ChArUco
-  corners are detected.
+- Guided auto-capture: save good frames as they improve coverage, scale
+  diversity, or balanced sample count.
+- `SPACE`: force-save the current frame as a manual calibration sample when
+  enough ChArUco corners are detected.
 - `ENTER`: solve calibration from the collected samples.
 - `q`: quit cleanly without solving or writing a calibration YAML.
 
 Use diverse views: move and tilt the board so it appears across the frame,
 including near corners and edges, while avoiding blur and glare.
+
+Guided capture options:
+
+- `--coverage-grid 3x3`: split the image into target regions for coverage
+  guidance. Rectangular grids such as `4x5` are accepted.
+- `--samples-per-cell 1`: require at least this many accepted samples in each
+  grid cell before coverage is considered complete.
+- `--no-guided-auto`: keep the guidance overlay but disable automatic sample
+  saving.
+- `--guided-auto-cooldown 8`: wait this many frames after each guided automatic
+  sample before another guided sample can be saved.
+- `--auto --auto-interval N`: legacy timed auto-sampling fallback; guided
+  auto-capture is preferred.
+
+The preview window now makes that guidance explicit:
+
+- If no board is detected, bring the ChArUco board fully into view.
+- If too few corners are detected, move closer, hold still, or reduce glare.
+- If the center is over-represented, move the board toward the next missing
+  edge or corner.
+- If frame coverage is balanced but all samples are at one apparent scale,
+  change the board distance.
+- Once coverage, scale diversity, and sample count are sufficient, press
+  `ENTER` to solve.
+
+The guidance and auto-capture policy decide when to add existing detected
+ChArUco corners to the sample set. They do not change the OpenCV calibration
+solver, accepted calibration YAML schema, units, or coordinate conventions.
 
 ## Project Directory Side Effects
 

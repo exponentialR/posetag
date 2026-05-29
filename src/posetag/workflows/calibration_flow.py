@@ -10,6 +10,7 @@ from __future__ import annotations
 import importlib.util
 import math
 import shlex
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Optional, Union
@@ -21,6 +22,8 @@ from posetag.pipelines.charuco_calibration import (
     get_dictionary,
     validate_capture_args,
 )
+from posetag.pipelines.make_board import MakeBoardError, load_calibration_yaml
+from posetag.workflows.calibration_guidance import parse_grid_shape
 from posetag.workflows.charuco_setup import (
     DEFAULT_DICTIONARY,
     DEFAULT_MARKER_LENGTH_MM,
@@ -28,6 +31,7 @@ from posetag.workflows.charuco_setup import (
     DEFAULT_SQUARES_X,
     DEFAULT_SQUARES_Y,
 )
+from posetag.workflows.status import WorkflowStatus, inspect_camera_calibration
 
 
 SOURCE_OPENCV = "opencv"
@@ -40,6 +44,13 @@ CALIBRATION_SOURCE_LABELS = {
     SOURCE_VIDEO: "video",
 }
 DEFAULT_CAMERA_INDEX = 0
+DEFAULT_COVERAGE_GRID = "3x3"
+DEFAULT_SAMPLES_PER_CELL = 1
+DEFAULT_GUIDED_AUTO_COOLDOWN = 8
+CALIBRATION_PROCESS_NOT_STARTED = "not_started"
+CALIBRATION_PROCESS_RUNNING = "running"
+CALIBRATION_PROCESS_FINISHED = "finished"
+CALIBRATION_PROCESS_FAILED_CANCELLED = "failed_cancelled"
 
 
 class CameraCalibrationFlowError(ValueError):
@@ -88,6 +99,10 @@ class CameraCalibrationConfig:
     square_length_mm: float = DEFAULT_SQUARE_LENGTH_MM
     marker_length_mm: float = DEFAULT_MARKER_LENGTH_MM
     dictionary_name: str = DEFAULT_DICTIONARY
+    coverage_grid: str = DEFAULT_COVERAGE_GRID
+    samples_per_cell: int = DEFAULT_SAMPLES_PER_CELL
+    guided_auto: bool = True
+    guided_auto_cooldown: int = DEFAULT_GUIDED_AUTO_COOLDOWN
 
 
 @dataclass(frozen=True)
@@ -103,6 +118,46 @@ class CameraCalibrationReadiness:
     checked_paths: tuple[Path, ...]
     warnings: tuple[str, ...]
     errors: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class CameraCalibrationLaunchSpec:
+    """Editable-install-safe process launch details for calibration."""
+
+    program: str
+    arguments: tuple[str, ...]
+    display_command: str
+    expected_output: Path
+
+
+@dataclass(frozen=True)
+class CameraCalibrationProcessState:
+    """GUI-independent calibration child-process state."""
+
+    state: str
+    label: str
+    message: str
+    running: bool = False
+    success: bool = False
+    expected_output: Optional[Path] = None
+    exit_code: Optional[int] = None
+
+
+@dataclass(frozen=True)
+class CameraCalibrationOutputSummary:
+    """Parsed status for an existing calibration YAML artifact."""
+
+    path: Path
+    exists: bool
+    valid: bool
+    message: str
+    image_width: Optional[int] = None
+    image_height: Optional[int] = None
+    model: Optional[str] = None
+    reproj_rms: Optional[float] = None
+    camera_params: Optional[tuple[float, float, float, float]] = None
+    distortion_coefficients: tuple[tuple[str, float], ...] = ()
+    latest_run_dir: Optional[Path] = None
 
 
 def generated_charuco_metadata_paths(project_root: Union[Path, str]) -> tuple[Path, ...]:
@@ -295,6 +350,7 @@ def inspect_camera_calibration_readiness(
     except CharucoCalibrationError as exc:
         errors.append(str(exc))
     errors.extend(_camera_calibration_board_errors(config))
+    errors.extend(_camera_calibration_guidance_errors(config))
 
     command_preview = ""
     if not errors:
@@ -319,6 +375,35 @@ def inspect_camera_calibration_readiness(
 def build_camera_calibration_command(config: CameraCalibrationConfig) -> str:
     """Build a copyable ``posetag-calib-charuco`` command from GUI state."""
 
+    return shlex.join(
+        ("posetag-calib-charuco", *build_camera_calibration_arguments(config))
+    )
+
+
+def build_camera_calibration_launch(
+    config: CameraCalibrationConfig,
+    *,
+    python_executable: Optional[Union[Path, str]] = None,
+) -> CameraCalibrationLaunchSpec:
+    """Build process launch details for the existing calibration workflow."""
+
+    arguments = build_camera_calibration_arguments(config)
+    executable = str(python_executable) if python_executable else sys.executable
+    return CameraCalibrationLaunchSpec(
+        program=executable,
+        arguments=("-m", "posetag.cli.charuco", *arguments),
+        display_command=build_camera_calibration_command(config),
+        expected_output=Path(config.project_root).expanduser()
+        / "calib"
+        / "calib_color.yaml",
+    )
+
+
+def build_camera_calibration_arguments(
+    config: CameraCalibrationConfig,
+) -> tuple[str, ...]:
+    """Build argv items for ``posetag-calib-charuco`` without a shell."""
+
     source = normalize_source(config.source)
     video = _video_arg(config.video_path)
     if source == SOURCE_VIDEO and video is None:
@@ -326,9 +411,11 @@ def build_camera_calibration_command(config: CameraCalibrationConfig) -> str:
             "--video path is required when --source=video"
         )
     _validate_camera_calibration_board(config)
+    coverage_grid, samples_per_cell, guided_auto_cooldown = (
+        _validate_camera_calibration_guidance(config)
+    )
 
     parts: list[str] = [
-        "posetag-calib-charuco",
         "--project_root",
         str(Path(config.project_root).expanduser()),
         "--source",
@@ -352,9 +439,193 @@ def build_camera_calibration_command(config: CameraCalibrationConfig) -> str:
             _format_number(config.marker_length_mm),
             "--dict",
             str(config.dictionary_name).strip(),
+            "--coverage-grid",
+            coverage_grid,
+            "--samples-per-cell",
+            str(samples_per_cell),
+            "--guided-auto-cooldown",
+            str(guided_auto_cooldown),
         ]
     )
-    return shlex.join(parts)
+    if not bool(config.guided_auto):
+        parts.append("--no-guided-auto")
+    return tuple(parts)
+
+
+def calibration_process_not_started(
+    expected_output: Optional[Union[Path, str]] = None,
+) -> CameraCalibrationProcessState:
+    """Return the initial calibration process state."""
+
+    return CameraCalibrationProcessState(
+        state=CALIBRATION_PROCESS_NOT_STARTED,
+        label="not started",
+        message="Calibration has not been launched from this dashboard session.",
+        expected_output=_optional_path(expected_output),
+    )
+
+
+def calibration_process_running(
+    expected_output: Union[Path, str],
+) -> CameraCalibrationProcessState:
+    """Return the active calibration process state."""
+
+    target = Path(expected_output).expanduser()
+    return CameraCalibrationProcessState(
+        state=CALIBRATION_PROCESS_RUNNING,
+        label="running",
+        message=(
+            "Calibration is running in the existing OpenCV window. Guided "
+            "auto-capture saves useful samples; SPACE manually adds a sample, "
+            "ENTER solves, and q quits."
+        ),
+        running=True,
+        expected_output=target,
+    )
+
+
+def calibration_process_failed(
+    message: str,
+    *,
+    expected_output: Optional[Union[Path, str]] = None,
+    exit_code: Optional[int] = None,
+) -> CameraCalibrationProcessState:
+    """Return a failed/cancelled calibration process state."""
+
+    return CameraCalibrationProcessState(
+        state=CALIBRATION_PROCESS_FAILED_CANCELLED,
+        label="failed/cancelled",
+        message=message,
+        expected_output=_optional_path(expected_output),
+        exit_code=exit_code,
+    )
+
+
+def summarize_camera_calibration_process_result(
+    project_root: Union[Path, str],
+    *,
+    exit_code: int,
+    crashed: bool = False,
+    expected_output: Optional[Union[Path, str]] = None,
+    previous_output_mtime_ns: Optional[int] = None,
+    require_output_update: bool = False,
+) -> CameraCalibrationProcessState:
+    """Summarize process completion using the calibration YAML status checks."""
+
+    root = Path(project_root).expanduser()
+    target = _optional_path(expected_output) or root / "calib" / "calib_color.yaml"
+    stage = inspect_camera_calibration(root)
+    output_exists = target.exists()
+    output_updated = (
+        not require_output_update
+        or _path_mtime_ns(target) != previous_output_mtime_ns
+    )
+    if (
+        exit_code == 0
+        and not crashed
+        and output_exists
+        and output_updated
+        and stage.status == WorkflowStatus.COMPLETE
+    ):
+        return CameraCalibrationProcessState(
+            state=CALIBRATION_PROCESS_FINISHED,
+            label="finished",
+            message=(
+                "Calibration finished and calib/calib_color.yaml passed the "
+                "current status checks."
+            ),
+            success=True,
+            expected_output=target,
+            exit_code=exit_code,
+        )
+
+    if crashed:
+        message = "Calibration process crashed or was cancelled."
+    elif exit_code != 0:
+        message = f"Calibration process exited with code {exit_code}."
+    elif output_exists and not output_updated:
+        message = (
+            "Calibration process exited, but calib/calib_color.yaml was not "
+            "updated during this launch."
+        )
+    else:
+        message = (
+            "Calibration process exited, but calib/calib_color.yaml is missing "
+            "or did not pass the current status checks."
+        )
+
+    detail = _process_status_detail(stage)
+    if detail:
+        message = f"{message} {detail}"
+    return calibration_process_failed(
+        message,
+        expected_output=target,
+        exit_code=exit_code,
+    )
+
+
+def inspect_camera_calibration_output(
+    project_root: Union[Path, str],
+    *,
+    expected_output: Optional[Union[Path, str]] = None,
+) -> CameraCalibrationOutputSummary:
+    """Return parsed calibration result fields for GUI/result summaries."""
+
+    root = Path(project_root).expanduser()
+    target = _optional_path(expected_output) or root / "calib" / "calib_color.yaml"
+    if not target.exists():
+        return CameraCalibrationOutputSummary(
+            path=target,
+            exists=False,
+            valid=False,
+            message=f"Calibration output is missing: {target}",
+            latest_run_dir=_latest_calibration_run_dir(root),
+        )
+
+    try:
+        data = _load_yaml_mapping(target)
+        calibration = load_calibration_yaml(target)
+    except (CameraCalibrationFlowError, MakeBoardError) as exc:
+        return CameraCalibrationOutputSummary(
+            path=target,
+            exists=True,
+            valid=False,
+            message=str(exc),
+            latest_run_dir=_latest_calibration_run_dir(root),
+        )
+
+    stage = inspect_camera_calibration(root)
+    valid = stage.status == WorkflowStatus.COMPLETE
+    message = (
+        stage.message
+        if valid
+        else (_process_status_detail(stage) or stage.message)
+    )
+    return CameraCalibrationOutputSummary(
+        path=target,
+        exists=True,
+        valid=valid,
+        message=message,
+        image_width=_optional_int(data.get("image_width")),
+        image_height=_optional_int(data.get("image_height")),
+        model=_optional_string(data.get("model")),
+        reproj_rms=_optional_float(data.get("reproj_rms")),
+        camera_params=tuple(float(value) for value in calibration.camera_params),
+        distortion_coefficients=_distortion_coefficients(data),
+        latest_run_dir=_latest_calibration_run_dir(root),
+    )
+
+
+def read_camera_calibration_yaml_text(path: Union[Path, str]) -> str:
+    """Read calibration YAML text for a raw artifact view."""
+
+    target = Path(path).expanduser()
+    try:
+        return target.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise CameraCalibrationFlowError(
+            f"Could not read calibration YAML: {exc}"
+        ) from exc
 
 
 def normalize_source(source: str) -> str:
@@ -391,8 +662,93 @@ def _latest_path(paths: tuple[Path, ...]) -> Path:
     return max(paths, key=lambda path: (path.stat().st_mtime_ns, path.name))
 
 
+def _latest_calibration_run_dir(project_root: Path) -> Optional[Path]:
+    runs_dir = project_root / "calib" / "runs"
+    if not runs_dir.is_dir():
+        return None
+    run_dirs = tuple(path for path in runs_dir.iterdir() if path.is_dir())
+    if not run_dirs:
+        return None
+    return _latest_path(run_dirs)
+
+
 def _path_tuple(paths: Iterable[Path]) -> tuple[Path, ...]:
     return tuple(dict.fromkeys(paths))
+
+
+def _optional_path(path: Optional[Union[Path, str]]) -> Optional[Path]:
+    if path is None:
+        return None
+    return Path(path).expanduser()
+
+
+def _path_mtime_ns(path: Path) -> Optional[int]:
+    try:
+        return path.stat().st_mtime_ns
+    except OSError:
+        return None
+
+
+def _process_status_detail(stage: Any) -> str:
+    details = tuple(stage.errors or stage.warnings or (stage.message,))
+    return " ".join(str(detail) for detail in details if str(detail).strip())
+
+
+def _load_yaml_mapping(path: Path) -> Mapping[str, Any]:
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            data = yaml.safe_load(handle)
+    except yaml.YAMLError as exc:
+        raise CameraCalibrationFlowError(
+            f"Malformed calibration YAML: {exc}"
+        ) from exc
+    except OSError as exc:
+        raise CameraCalibrationFlowError(
+            f"Could not read calibration YAML: {exc}"
+        ) from exc
+    if not isinstance(data, Mapping):
+        raise CameraCalibrationFlowError("Calibration YAML must contain a mapping.")
+    return data
+
+
+def _optional_int(value: Any) -> Optional[int]:
+    if isinstance(value, bool) or value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _optional_float(value: Any) -> Optional[float]:
+    if isinstance(value, bool) or value is None:
+        return None
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(parsed):
+        return None
+    return parsed
+
+
+def _optional_string(value: Any) -> Optional[str]:
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    return text or None
+
+
+def _distortion_coefficients(data: Mapping[str, Any]) -> tuple[tuple[str, float], ...]:
+    distortion = data.get("distortion_coefficients")
+    if not isinstance(distortion, Mapping):
+        return ()
+    values: list[tuple[str, float]] = []
+    for name in ("k1", "k2", "p1", "p2", "k3"):
+        parsed = _optional_float(distortion.get(name))
+        if parsed is not None:
+            values.append((name, parsed))
+    return tuple(values)
 
 
 def _realsense_module_token(realsense_available: Optional[bool]) -> Any:
@@ -417,6 +773,20 @@ def _validate_camera_calibration_board(config: CameraCalibrationConfig) -> None:
     errors = _camera_calibration_board_errors(config)
     if errors:
         raise CameraCalibrationFlowError(" ".join(errors))
+
+
+def _validate_camera_calibration_guidance(
+    config: CameraCalibrationConfig,
+) -> tuple[str, int, int]:
+    errors = _camera_calibration_guidance_errors(config)
+    if errors:
+        raise CameraCalibrationFlowError(" ".join(errors))
+    rows, cols = parse_grid_shape(config.coverage_grid)
+    return (
+        f"{rows}x{cols}",
+        int(config.samples_per_cell),
+        int(config.guided_auto_cooldown),
+    )
 
 
 def _camera_calibration_board_errors(
@@ -459,6 +829,32 @@ def _camera_calibration_board_errors(
         except CharucoCalibrationError as exc:
             errors.append(str(exc))
 
+    return errors
+
+
+def _camera_calibration_guidance_errors(
+    config: CameraCalibrationConfig,
+) -> list[str]:
+    errors: list[str] = []
+    try:
+        parse_grid_shape(config.coverage_grid)
+    except ValueError as exc:
+        errors.append(str(exc))
+
+    samples_per_cell = _coerce_int(
+        config.samples_per_cell,
+        "--samples-per-cell",
+        errors,
+    )
+    guided_auto_cooldown = _coerce_int(
+        config.guided_auto_cooldown,
+        "--guided-auto-cooldown",
+        errors,
+    )
+    if samples_per_cell is not None and samples_per_cell < 1:
+        errors.append("--samples-per-cell must be at least 1.")
+    if guided_auto_cooldown is not None and guided_auto_cooldown < 0:
+        errors.append("--guided-auto-cooldown must be zero or greater.")
     return errors
 
 
