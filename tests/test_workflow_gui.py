@@ -17,15 +17,23 @@ import yaml
 
 from posetag.gui import app as gui_app
 from posetag.gui.main_window import (
+    _board_building_command_card_note,
+    _board_building_command_ready_message,
+    _board_building_run_button_label,
     _command_button_label,
     _command_card_note,
     _command_card_title,
     _command_ready_message,
     _copy_confirmation_message,
     _calibration_run_button_label,
+    _checked_tag_ids_for_update,
     _format_calibration_result_summary,
     _format_calibration_result_summary_html,
     _format_calibration_process_state,
+    _format_board_building_outputs,
+    _format_board_building_process_state,
+    _format_board_building_readiness,
+    _format_board_batch_preview,
     _format_charuco_outputs,
     _format_health_counts,
     _format_object_tag_expected_output,
@@ -46,6 +54,14 @@ from posetag.workflows.calibration_flow import (
     CameraCalibrationOutputSummary,
     calibration_process_not_started,
     calibration_process_running,
+)
+from posetag.workflows.board_building import (
+    BoardBatchItem,
+    BoardBuildingOutputStatus,
+    BoardBuildingProcessState,
+    BoardBuildingReadiness,
+    board_building_process_not_started,
+    board_building_process_running,
 )
 from posetag.workflows.object_tags import (
     ObjectTagGenerationReadiness,
@@ -143,6 +159,7 @@ class WorkflowGuiTests(unittest.TestCase):
         self.assertIn("posetag-calib-charuco", models[2].command_preview)
         self.assertIn("posetag-gen-tags", models[3].command_preview)
         self.assertIn("--project_root", models[3].command_preview)
+        self.assertIn("posetag-make-board", models[4].command_preview)
         self.assertEqual(models[8].command_preview, "")
 
     def test_project_health_view_handles_empty_project_state(self) -> None:
@@ -310,6 +327,16 @@ class WorkflowGuiTests(unittest.TestCase):
         self.assertIn("color: #0b1724", style)
         self.assertIn("QListWidget::item:selected:!active", style)
 
+    def test_batch_capture_queue_has_visible_selection_style(self) -> None:
+        style = _style_sheet()
+
+        self.assertIn("QListWidget#BatchCaptureQueue", style)
+        self.assertIn("QListWidget#BatchCaptureQueue::item:selected", style)
+        self.assertIn("QListWidget#BoardObjectRows", style)
+        self.assertIn("QListWidget#BoardObjectRows::item:selected", style)
+        self.assertIn("background: #d9efff", style)
+        self.assertIn("border: 2px solid #0b6f8f", style)
+
     def test_dashboard_style_uses_professional_instrumentation_layout(self) -> None:
         style = _style_sheet()
 
@@ -324,6 +351,7 @@ class WorkflowGuiTests(unittest.TestCase):
         self.assertIn("QFrame#HealthPanel", style)
         self.assertIn("QScrollArea#HealthScroll", style)
         self.assertIn("QFrame#ObjectTagPreviewColumn", style)
+        self.assertIn("QGroupBox#CollapsibleGroup", style)
         self.assertIn("background: #f2f7fb", style)
         self.assertIn("background: #f6fafc", style)
         self.assertIn("QLabel#StageTitle", style)
@@ -394,6 +422,174 @@ class WorkflowGuiTests(unittest.TestCase):
         self.assertIn("Printer scaling", summary)
         self.assertIn("boards/patterns", output)
         self.assertIn("Status: missing", output)
+
+    def test_board_building_readiness_summary_reports_outputs(self) -> None:
+        outputs = BoardBuildingOutputStatus(
+            board_yaml_path=Path("/tmp/project/boards/sideA.yaml"),
+            registry_path=Path("/tmp/project/boards/tag_registry.yaml"),
+            shots_dir=Path("/tmp/project/boards/shots"),
+            board_yaml_exists=False,
+            registry_exists=False,
+            shots_dir_exists=False,
+            checked_paths=(
+                Path("/tmp/project/boards/sideA.yaml"),
+                Path("/tmp/project/boards/tag_registry.yaml"),
+                Path("/tmp/project/boards/shots"),
+            ),
+        )
+        readiness = BoardBuildingReadiness(
+            ready=False,
+            command_preview="",
+            calibration_path=Path("/tmp/project/calib/calib_color.yaml"),
+            output_status=outputs,
+            checked_paths=(
+                Path("/tmp/project/calib/calib_color.yaml"),
+                Path("/tmp/project/boards/sideA.yaml"),
+                Path("/tmp/project/boards/tag_registry.yaml"),
+            ),
+            warnings=("Custom registry paths may not mark Stage 4 complete.",),
+            errors=("Complete Stage 3 object AprilTag generation first.",),
+        )
+
+        summary = _format_board_building_readiness(readiness)
+        output = _format_board_building_outputs(readiness)
+
+        self.assertIn("Not ready yet", summary)
+        self.assertIn("Complete Stage 3", summary)
+        self.assertIn("Custom registry", summary)
+        self.assertIn("Calibration YAML", output)
+        self.assertIn("Board YAML", output)
+        self.assertIn("Tag registry", output)
+        self.assertIn("Audit shots", output)
+        self.assertIn("Status: missing", output)
+
+    def test_board_batch_preview_summarizes_queue(self) -> None:
+        items = tuple(
+            BoardBatchItem(
+                object_label="connection_plate",
+                instance_label=f"{index:02d}",
+                side_label="sideA",
+                object_name=f"connection_plate_{index:02d}_sideA",
+            )
+            for index in range(1, 11)
+        )
+
+        preview = _format_board_batch_preview(items)
+
+        self.assertIn("10 boards queued", preview)
+        self.assertIn("connection_plate_01_sideA", preview)
+        self.assertIn("2 more", preview)
+
+    def test_board_batch_preview_shows_per_side_tag_sizes(self) -> None:
+        items = (
+            BoardBatchItem(
+                object_label="column",
+                instance_label="01",
+                side_label="sideA",
+                object_name="column_01_sideA",
+                tag_size_mm=40.0,
+            ),
+            BoardBatchItem(
+                object_label="column",
+                instance_label="01",
+                side_label="sideC",
+                object_name="column_01_sideC",
+                tag_size_mm=80.0,
+            ),
+        )
+
+        preview = _format_board_batch_preview(items)
+
+        self.assertIn("column_01_sideA (40 mm)", preview)
+        self.assertIn("column_01_sideC (80 mm)", preview)
+
+    def test_captured_board_ids_default_to_all_pose_ready_tags(self) -> None:
+        live_preserved = _checked_tag_ids_for_update(
+            (2, 3),
+            {2},
+            force_all=False,
+        )
+        captured = _checked_tag_ids_for_update(
+            (2, 3),
+            {2},
+            force_all=True,
+        )
+        changed_ids = _checked_tag_ids_for_update(
+            (0, 1),
+            {2},
+            force_all=False,
+        )
+
+        self.assertEqual(live_preserved, {2})
+        self.assertEqual(captured, {2, 3})
+        self.assertEqual(changed_ids, {0, 1})
+
+    def test_board_building_command_note_keeps_existing_workflow_boundary(self) -> None:
+        outputs = BoardBuildingOutputStatus(
+            board_yaml_path=Path("/tmp/project/boards/sideA.yaml"),
+            registry_path=Path("/tmp/project/boards/tag_registry.yaml"),
+            shots_dir=Path("/tmp/project/boards/shots"),
+            board_yaml_exists=False,
+            registry_exists=False,
+            shots_dir_exists=False,
+            checked_paths=(),
+        )
+        readiness = BoardBuildingReadiness(
+            ready=True,
+            command_preview="posetag-make-board --project_root /tmp/project",
+            calibration_path=Path("/tmp/project/calib/calib_color.yaml"),
+            output_status=outputs,
+            checked_paths=(),
+            warnings=(),
+            errors=(),
+        )
+        active = SimpleNamespace(status="missing")
+        complete = SimpleNamespace(status="complete")
+
+        note = _board_building_command_card_note(readiness, active)
+        complete_note = _board_building_command_card_note(readiness, complete)
+
+        self.assertIn("Guided Capture", note)
+        self.assertIn("Start Batch", note)
+        self.assertIn("Run Board Builder", note)
+        self.assertIn("posetag-make-board", note)
+        self.assertIn("ENTER", note)
+        self.assertIn("selected-ID", note)
+        self.assertIn("origin-ID", note)
+        self.assertIn("prompt box", note)
+        self.assertIn("already pass", complete_note)
+        self.assertEqual(
+            _board_building_command_ready_message(readiness),
+            "Ready for batch capture, single-board capture, CLI launch, or copy.",
+        )
+
+    def test_board_building_process_state_text_and_run_button_labels(self) -> None:
+        board_yaml = Path("/tmp/project/boards/sideA.yaml")
+        registry = Path("/tmp/project/boards/tag_registry.yaml")
+        idle = board_building_process_not_started(board_yaml, registry)
+        running = board_building_process_running(board_yaml, registry)
+        success = BoardBuildingProcessState(
+            state="finished",
+            label="finished",
+            message="Board outputs are present.",
+            success=True,
+            expected_board_yaml=board_yaml,
+            expected_registry=registry,
+            exit_code=0,
+        )
+
+        self.assertEqual(_board_building_run_button_label(idle), "Run Board Builder")
+        self.assertEqual(
+            _board_building_run_button_label(running),
+            "Board Builder Running...",
+        )
+        self.assertEqual(
+            _board_building_run_button_label(success),
+            "Run Board Builder Again",
+        )
+        self.assertIn("not started", _format_board_building_process_state(idle))
+        self.assertIn("Expected board:", _format_board_building_process_state(idle))
+        self.assertIn("selected tag IDs", _format_board_building_process_state(running))
 
     def test_calibration_process_state_text_and_run_button_labels(self) -> None:
         expected_output = Path("/tmp/project/calib/calib_color.yaml")

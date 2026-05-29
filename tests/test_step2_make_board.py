@@ -16,10 +16,13 @@ import yaml
 import make_board as legacy_make_board
 from posetag.cli import make_board as make_board_cli
 from posetag.pipelines.make_board import (
+    annotate_detections,
+    board_entries_from_detections,
     build_board_yaml,
     load_registry,
     prepare_project_paths,
     resolve_calibration_path,
+    save_board_definition,
     save_registry,
     update_registry_entries,
     write_board_yaml,
@@ -60,6 +63,17 @@ class FakeDetector:
 
     def detect(self, *args, **kwargs):
         return []
+
+
+class FakePoseDetection:
+    def __init__(self, tag_id: int, xyz: tuple[float, float, float]) -> None:
+        self.tag_id = tag_id
+        self.pose_R = np.eye(3, dtype=float)
+        self.pose_t = np.array(xyz, dtype=float).reshape(3, 1)
+        self.corners = np.array(
+            [[0.0, 0.0], [20.0, 0.0], [20.0, 20.0], [0.0, 20.0]],
+            dtype=float,
+        )
 
 
 class MakeBoardStep2Tests(unittest.TestCase):
@@ -368,6 +382,80 @@ class MakeBoardStep2Tests(unittest.TestCase):
                 for key in ("id", "cx", "cy", "yaw_deg"):
                     self.assertIn(key, entry)
 
+    def test_board_entries_from_pose_detections_preserve_origin_frame_math(self) -> None:
+        layout = board_entries_from_detections(
+            [
+                FakePoseDetection(52, (0.0, 0.0, 1.0)),
+                FakePoseDetection(53, (0.1, -0.2, 1.0)),
+            ],
+            selected_ids=(52, 53),
+            origin_id=52,
+            z_threshold_m=0.01,
+        )
+
+        self.assertEqual([entry["id"] for entry in layout.entries], [52, 53])
+        origin_entry = layout.entries[0]
+        offset_entry = layout.entries[1]
+        self.assertAlmostEqual(origin_entry["cx"], 0.0)
+        self.assertAlmostEqual(origin_entry["cy"], 0.0)
+        self.assertAlmostEqual(offset_entry["cx"], 0.1)
+        self.assertAlmostEqual(offset_entry["cy"], -0.2)
+        self.assertEqual(layout.nonplanar_tags, ())
+
+    def test_board_entries_report_nonplanar_selected_tags(self) -> None:
+        layout = board_entries_from_detections(
+            [
+                FakePoseDetection(52, (0.0, 0.0, 1.0)),
+                FakePoseDetection(53, (0.0, 0.0, 1.03)),
+            ],
+            selected_ids=(52, 53),
+            origin_id=52,
+            z_threshold_m=0.01,
+        )
+
+        self.assertEqual(len(layout.nonplanar_tags), 1)
+        self.assertEqual(layout.nonplanar_tags[0].tag_id, 53)
+
+    def test_preview_guidance_overlay_wraps_inside_frame(self) -> None:
+        frame = np.zeros((180, 320, 3), dtype=np.uint8)
+        annotated = annotate_detections(
+            frame,
+            (),
+            guidance_lines=(
+                "Need at least 2 pose-estimated tags. Move the object so more "
+                "attached tags are visible.",
+                "Detected IDs: none",
+            ),
+        )
+
+        self.assertEqual(annotated.shape, frame.shape)
+        self.assertTrue(np.any(annotated != frame))
+        self.assertTrue(np.any(annotated[12:110, 12:285, :] != 0))
+        self.assertFalse(np.any(annotated[:, 300:, :] != 0))
+
+    def test_save_board_definition_writes_yaml_and_registry(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            paths = prepare_project_paths(
+                project_root=Path(tmpdir) / "project",
+                object_name="connection_plate_white_sideA",
+            )
+
+            saved = save_board_definition(
+                paths,
+                object_name="connection_plate_white_sideA",
+                family="tag36h11",
+                tag_size_mm=80.0,
+                origin_id=52,
+                entries=({"id": 52, "cx": 0.0, "cy": 0.0, "yaw_deg": 0.0},),
+            )
+
+            board = yaml.safe_load(saved.board_yaml_path.read_text(encoding="utf-8"))
+            registry = yaml.safe_load(saved.registry_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(board["object"], "connection_plate_white_sideA")
+        self.assertEqual(registry["tags"]["52"]["yaml"], str(saved.board_yaml_path))
+        self.assertEqual(saved.registry_update.updated, 1)
+
     def test_tag_registry_creation_and_update(self) -> None:
         with TemporaryDirectory() as tmpdir:
             registry_path = Path(tmpdir) / "boards" / "tag_registry.yaml"
@@ -391,6 +479,45 @@ class MakeBoardStep2Tests(unittest.TestCase):
                 {"object": "connection_plate_white_sideA", "yaml": str(board_path)},
             )
             self.assertIn("updated", loaded)
+
+    def test_tag_registry_update_prunes_stale_entries_for_same_board(self) -> None:
+        registry = {
+            "version": 1,
+            "updated": None,
+            "tags": {
+                "0": {
+                    "object": "connection_plate_white_sideA",
+                    "yaml": "/tmp/connection_plate_white_sideA.yaml",
+                },
+                "1": {
+                    "object": "connection_plate_white_sideA",
+                    "yaml": "/tmp/connection_plate_white_sideA.yaml",
+                },
+                "9": {
+                    "object": "other_board",
+                    "yaml": "/tmp/other_board.yaml",
+                },
+            },
+        }
+
+        update = update_registry_entries(
+            registry,
+            [{"id": 1}, {"id": 2}],
+            "connection_plate_white_sideA",
+            "/tmp/connection_plate_white_sideA.yaml",
+        )
+
+        self.assertEqual(update.updated, 2)
+        self.assertNotIn("0", registry["tags"])
+        self.assertEqual(
+            registry["tags"]["1"]["yaml"],
+            "/tmp/connection_plate_white_sideA.yaml",
+        )
+        self.assertEqual(
+            registry["tags"]["2"]["yaml"],
+            "/tmp/connection_plate_white_sideA.yaml",
+        )
+        self.assertEqual(registry["tags"]["9"]["yaml"], "/tmp/other_board.yaml")
 
     def test_tag_registry_conflict_does_not_silently_overwrite(self) -> None:
         registry = {
