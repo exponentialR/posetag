@@ -22,6 +22,10 @@ from posetag.gui.main_window import (
     _command_card_title,
     _command_ready_message,
     _copy_confirmation_message,
+    _calibration_run_button_label,
+    _format_calibration_result_summary,
+    _format_calibration_result_summary_html,
+    _format_calibration_process_state,
     _format_charuco_outputs,
     _format_health_counts,
     _health_status_style,
@@ -34,6 +38,11 @@ from posetag.gui.main_window import (
     _stage_rail_number_style,
     _stage_status_chip_style,
     _style_sheet,
+)
+from posetag.workflows.calibration_flow import (
+    CameraCalibrationOutputSummary,
+    calibration_process_not_started,
+    calibration_process_running,
 )
 from posetag.gui.models import inspect_project_view, project_health_view
 from posetag.workflows.commands import command_preview
@@ -306,8 +315,12 @@ class WorkflowGuiTests(unittest.TestCase):
         self.assertIn("QFrame#HeaderPanel", style)
         self.assertIn("QFrame#RailPanel", style)
         self.assertIn("QFrame#HealthPanel", style)
+        self.assertIn("QScrollArea#HealthScroll", style)
+        self.assertIn("background: #f2f7fb", style)
+        self.assertIn("background: #f6fafc", style)
         self.assertIn("QLabel#StageTitle", style)
         self.assertIn("QLineEdit#CommandPreview", style)
+        self.assertIn("QPlainTextEdit#CalibrationLog", style)
         self.assertIn("QLabel#HealthMessage", style)
         self.assertIn("QLabel#HealthSectionTitle", style)
         self.assertIn("QLabel#HealthSectionBody", style)
@@ -316,6 +329,7 @@ class WorkflowGuiTests(unittest.TestCase):
         self.assertIn("QLabel#RailStageDot", style)
         self.assertIn("QLabel#RailStageStatus", style)
         self.assertIn("QLabel#CharucoPreviewCanvas", style)
+        self.assertIn("QPlainTextEdit#CalibrationYamlView", style)
         self.assertIn("monospace", style)
         self.assertIn("font-weight: 800", style)
         self.assertIn("border-left: 3px solid #54708a", style)
@@ -335,6 +349,52 @@ class WorkflowGuiTests(unittest.TestCase):
         self.assertIn("PNG:    board.png", summary)
         self.assertIn("YAML:   board.yaml", summary)
         self.assertIn("PDF:    not requested", summary)
+
+    def test_calibration_process_state_text_and_run_button_labels(self) -> None:
+        expected_output = Path("/tmp/project/calib/calib_color.yaml")
+        idle = calibration_process_not_started(expected_output)
+        running = calibration_process_running(expected_output)
+
+        self.assertEqual(_calibration_run_button_label(idle), "Run Calibration")
+        self.assertEqual(
+            _calibration_run_button_label(running),
+            "Calibration Running...",
+        )
+        self.assertIn("not started", _format_calibration_process_state(idle))
+        self.assertIn("Expected output:", _format_calibration_process_state(idle))
+        self.assertIn("Guided auto-capture", _format_calibration_process_state(running))
+
+    def test_calibration_result_summary_is_human_readable(self) -> None:
+        summary = CameraCalibrationOutputSummary(
+            path=Path("/tmp/project/calib/calib_color.yaml"),
+            exists=True,
+            valid=True,
+            message="Colour-camera calibration YAML exists and passed schema checks.",
+            image_width=640,
+            image_height=480,
+            model="plumb_bob",
+            reproj_rms=0.1234,
+            camera_params=(600.0, 610.0, 320.0, 240.0),
+            distortion_coefficients=(("k1", -0.1), ("k2", 0.02)),
+            latest_run_dir=Path("/tmp/project/calib/runs/2026-05-29T08-19-06Z"),
+        )
+
+        text = _format_calibration_result_summary(summary)
+
+        self.assertIn("Calibration valid", text)
+        self.assertIn("640 x 480", text)
+        self.assertIn("RMS", text)
+        self.assertIn("0.123 px", text)
+        self.assertIn("fx=600.000", text)
+        self.assertIn("k1=-0.1", text)
+        self.assertIn("Run snapshot", text)
+
+        html = _format_calibration_result_summary_html(summary)
+
+        self.assertIn("font-family", html)
+        self.assertIn("Menlo", html)
+        self.assertIn("fx=600.000", html)
+        self.assertIn("Calibration valid", html)
 
     def test_health_panel_counts_and_status_are_compact(self) -> None:
         with TemporaryDirectory() as tmpdir:

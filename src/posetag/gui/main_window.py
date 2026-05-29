@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import html
 from pathlib import Path
 from typing import Any, Optional
 
@@ -30,17 +31,30 @@ from posetag.workflows.charuco_setup import (
     generate_charuco_board_setup,
 )
 from posetag.workflows.calibration_flow import (
+    CALIBRATION_PROCESS_NOT_STARTED,
     CALIBRATION_SOURCE_CHOICES,
     CALIBRATION_SOURCE_LABELS,
+    DEFAULT_GUIDED_AUTO_COOLDOWN,
+    DEFAULT_SAMPLES_PER_CELL,
     SOURCE_OPENCV,
     SOURCE_REALSENSE,
     SOURCE_VIDEO,
     CameraCalibrationConfig,
+    CameraCalibrationFlowError,
+    CameraCalibrationOutputSummary,
+    CameraCalibrationProcessState,
     CameraCalibrationReadiness,
+    build_camera_calibration_launch,
     camera_calibration_config_from_project,
+    calibration_process_failed,
+    calibration_process_not_started,
+    calibration_process_running,
+    inspect_camera_calibration_output,
     inspect_camera_calibration_readiness,
     inspect_charuco_metadata,
     normalize_source,
+    read_camera_calibration_yaml_text,
+    summarize_camera_calibration_process_result,
 )
 
 
@@ -224,6 +238,19 @@ def build_main_window(qt: Any, project_root: Path) -> Any:
             self._models: tuple[StageViewModel, ...] = ()
             self._selected_stage_id = 0
             self._stage_widgets: dict[int, Any] = {}
+            self._calibration_process: Any = None
+            self._calibration_process_state = calibration_process_not_started()
+            self._calibration_running_project_root: Optional[Path] = None
+            self._calibration_running_expected_output: Optional[Path] = None
+            self._calibration_previous_output_mtime_ns: Optional[int] = None
+            self._calibration_output_existed_at_launch = False
+            self._calibration_output_seen = False
+
+            self._calibration_output_timer = QtCore.QTimer(self)
+            self._calibration_output_timer.setInterval(1000)
+            self._calibration_output_timer.timeout.connect(
+                self._poll_calibration_output
+            )
 
             self.setWindowTitle("PoseTag Workflow Dashboard")
 
@@ -639,6 +666,17 @@ def build_main_window(qt: Any, project_root: Path) -> Any:
             self._calibration_dictionary.addItems(list(_safe_dictionary_choices()))
             self._calibration_dictionary.setCurrentText(DEFAULT_DICTIONARY)
             self._calibration_dictionary.setMinimumWidth(180)
+            self._calibration_grid_rows = _make_int_spin(1, 9, 3)
+            self._calibration_grid_cols = _make_int_spin(1, 9, 3)
+            self._calibration_samples_per_cell = _make_int_spin(
+                1,
+                20,
+                DEFAULT_SAMPLES_PER_CELL,
+            )
+            self._calibration_guided_auto = QtWidgets.QCheckBox(
+                "Guided auto-capture"
+            )
+            self._calibration_guided_auto.setChecked(True)
 
             for field in (
                 self._calibration_camera_index,
@@ -646,9 +684,15 @@ def build_main_window(qt: Any, project_root: Path) -> Any:
                 self._calibration_squares_y,
                 self._calibration_square_length,
                 self._calibration_marker_length,
+                self._calibration_grid_rows,
+                self._calibration_grid_cols,
+                self._calibration_samples_per_cell,
             ):
                 field.valueChanged.connect(self._update_calibration_flow)
             self._calibration_dictionary.currentTextChanged.connect(
+                self._update_calibration_flow
+            )
+            self._calibration_guided_auto.stateChanged.connect(
                 self._update_calibration_flow
             )
 
@@ -699,6 +743,22 @@ def build_main_window(qt: Any, project_root: Path) -> Any:
                 1,
                 2,
             )
+            calibration_grid.addWidget(
+                _make_field("Coverage rows", self._calibration_grid_rows),
+                5,
+                0,
+            )
+            calibration_grid.addWidget(
+                _make_field("Coverage cols", self._calibration_grid_cols),
+                5,
+                1,
+            )
+            calibration_grid.addWidget(
+                _make_field("Samples / cell", self._calibration_samples_per_cell),
+                6,
+                0,
+            )
+            calibration_grid.addWidget(self._calibration_guided_auto, 6, 1)
             calibration_grid.setColumnStretch(0, 1)
             calibration_grid.setColumnStretch(1, 1)
 
@@ -733,6 +793,9 @@ def build_main_window(qt: Any, project_root: Path) -> Any:
             self._calibration_copy_button.clicked.connect(
                 self._copy_calibration_command
             )
+            self._calibration_run_button = QtWidgets.QPushButton("Run Calibration")
+            self._calibration_run_button.setObjectName("PrimaryActionButton")
+            self._calibration_run_button.clicked.connect(self._run_calibration)
             self._calibration_copy_feedback = QtWidgets.QLabel()
             self._calibration_copy_feedback.setObjectName("MutedText")
             self._calibration_copy_feedback.setWordWrap(True)
@@ -744,8 +807,9 @@ def build_main_window(qt: Any, project_root: Path) -> Any:
             calibration_command_widget.setLayout(calibration_command_row)
 
             calibration_controls = QtWidgets.QLabel(
-                "Controls: SPACE adds a sample; ENTER solves calibration; "
-                "q quits without writing calibration output."
+                "Controls: guided auto-capture saves useful samples; SPACE "
+                "manually adds a sample; ENTER solves calibration; q quits "
+                "without writing calibration output."
             )
             calibration_controls.setObjectName("GuidanceText")
             calibration_controls.setWordWrap(True)
@@ -753,7 +817,22 @@ def build_main_window(qt: Any, project_root: Path) -> Any:
             calibration_refresh_button = QtWidgets.QPushButton("Refresh Status")
             calibration_refresh_button.setObjectName("SecondaryActionButton")
             calibration_refresh_button.clicked.connect(self._refresh)
+            self._calibration_process_state_label = QtWidgets.QLabel()
+            self._calibration_process_state_label.setObjectName("OutputText")
+            self._calibration_process_state_label.setWordWrap(True)
+            self._calibration_process_state_label.setTextInteractionFlags(
+                QtCore.Qt.TextInteractionFlag.TextSelectableByMouse
+            )
+            self._calibration_log = QtWidgets.QPlainTextEdit()
+            self._calibration_log.setObjectName("CalibrationLog")
+            self._calibration_log.setReadOnly(True)
+            self._calibration_log.setMaximumHeight(118)
+            self._calibration_log.setPlaceholderText(
+                "Calibration stdout/stderr will appear here after launch."
+            )
+            self._calibration_log.document().setMaximumBlockCount(250)
             calibration_action_row = QtWidgets.QHBoxLayout()
+            calibration_action_row.addWidget(self._calibration_run_button)
             calibration_action_row.addWidget(calibration_refresh_button)
             calibration_action_row.addStretch(1)
 
@@ -781,6 +860,20 @@ def build_main_window(qt: Any, project_root: Path) -> Any:
             calibration_status_grid.addWidget(
                 _make_field("Command preview", calibration_command_widget),
                 2,
+                0,
+                1,
+                2,
+            )
+            calibration_status_grid.addWidget(
+                _make_field("Process state", self._calibration_process_state_label),
+                3,
+                0,
+                1,
+                2,
+            )
+            calibration_status_grid.addWidget(
+                _make_field("Process log", self._calibration_log),
+                4,
                 0,
                 1,
                 2,
@@ -856,16 +949,76 @@ def build_main_window(qt: Any, project_root: Path) -> Any:
                 QtCore.Qt.TextInteractionFlag.TextSelectableByMouse
             )
 
-            self._health_panel = QtWidgets.QFrame()
-            self._health_panel.setObjectName("HealthPanel")
-            self._health_panel.setMinimumWidth(280)
-            self._health_panel.setMaximumWidth(340)
-            health_layout = QtWidgets.QVBoxLayout(self._health_panel)
+            self._calibration_result_label = QtWidgets.QLabel()
+            self._calibration_result_label.setObjectName("HealthSectionBody")
+            self._calibration_result_label.setTextFormat(
+                QtCore.Qt.TextFormat.RichText
+            )
+            self._calibration_result_label.setWordWrap(True)
+            self._calibration_result_label.setTextInteractionFlags(
+                QtCore.Qt.TextInteractionFlag.TextSelectableByMouse
+            )
+            self._open_calibration_yaml_button = QtWidgets.QPushButton("Open YAML")
+            self._open_calibration_yaml_button.setObjectName("SecondaryActionButton")
+            self._open_calibration_yaml_button.clicked.connect(
+                self._open_calibration_yaml
+            )
+            self._view_calibration_yaml_button = QtWidgets.QPushButton("View Raw")
+            self._view_calibration_yaml_button.setObjectName("SecondaryActionButton")
+            self._view_calibration_yaml_button.clicked.connect(
+                self._view_calibration_yaml
+            )
+            self._copy_calibration_summary_button = QtWidgets.QPushButton(
+                "Copy Summary"
+            )
+            self._copy_calibration_summary_button.setObjectName(
+                "SecondaryActionButton"
+            )
+            self._copy_calibration_summary_button.clicked.connect(
+                self._copy_calibration_summary
+            )
+            self._calibration_result_actions = QtWidgets.QWidget()
+            calibration_result_actions_layout = QtWidgets.QVBoxLayout(
+                self._calibration_result_actions
+            )
+            calibration_result_actions_layout.setContentsMargins(0, 0, 0, 0)
+            calibration_result_actions_layout.setSpacing(6)
+            calibration_result_actions_layout.addWidget(
+                self._open_calibration_yaml_button
+            )
+            calibration_result_actions_layout.addWidget(
+                self._view_calibration_yaml_button
+            )
+            calibration_result_actions_layout.addWidget(
+                self._copy_calibration_summary_button
+            )
+            self._calibration_result_divider = _divider(QtWidgets)
+            self._project_health_title = QtWidgets.QLabel("Project Health")
+            self._project_health_title.setObjectName("HealthSectionTitle")
+
+            health_content = QtWidgets.QFrame()
+            health_content.setObjectName("HealthPanel")
+            health_layout = QtWidgets.QVBoxLayout(health_content)
             health_layout.setContentsMargins(16, 16, 16, 16)
             health_layout.setSpacing(10)
-            health_title = QtWidgets.QLabel("Project Health")
-            health_title.setObjectName("PanelTitle")
-            health_layout.addWidget(health_title)
+
+            self._health_panel = QtWidgets.QScrollArea()
+            self._health_panel.setObjectName("HealthScroll")
+            self._health_panel.setMinimumWidth(280)
+            self._health_panel.setMaximumWidth(340)
+            self._health_panel.setWidgetResizable(True)
+            self._health_panel.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
+            self._health_panel.setHorizontalScrollBarPolicy(
+                QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+            )
+            self._health_panel.setWidget(health_content)
+            self._side_panel_title = QtWidgets.QLabel("Project Health")
+            self._side_panel_title.setObjectName("PanelTitle")
+            health_layout.addWidget(self._side_panel_title)
+            health_layout.addWidget(self._calibration_result_label)
+            health_layout.addWidget(self._calibration_result_actions)
+            health_layout.addWidget(self._calibration_result_divider)
+            health_layout.addWidget(self._project_health_title)
             health_layout.addWidget(self._health_status_label)
             health_layout.addWidget(self._health_message_label)
             health_layout.addWidget(self._health_counts_label)
@@ -1030,6 +1183,68 @@ def build_main_window(qt: Any, project_root: Path) -> Any:
             )
             self.statusBar().showMessage(message, 4000)
 
+        def _open_calibration_yaml(self) -> None:
+            summary = inspect_camera_calibration_output(self._current_project_root())
+            if not summary.exists:
+                message = "Calibration YAML is not available to open."
+                self.statusBar().showMessage(message, 4000)
+                return
+
+            opened = QtGui.QDesktopServices.openUrl(
+                QtCore.QUrl.fromLocalFile(str(summary.path.resolve()))
+            )
+            message = "Opened calibration YAML." if opened else "Could not open YAML."
+            self.statusBar().showMessage(message, 4000)
+
+        def _view_calibration_yaml(self) -> None:
+            summary = inspect_camera_calibration_output(self._current_project_root())
+            if not summary.exists:
+                message = "Calibration YAML is not available to view."
+                self.statusBar().showMessage(message, 4000)
+                return
+            try:
+                raw_text = read_camera_calibration_yaml_text(summary.path)
+            except CameraCalibrationFlowError as exc:
+                self.statusBar().showMessage(str(exc), 5000)
+                return
+
+            dialog = QtWidgets.QDialog(self)
+            dialog.setWindowTitle("Calibration YAML")
+            dialog.resize(760, 560)
+            layout = QtWidgets.QVBoxLayout(dialog)
+            layout.setContentsMargins(12, 12, 12, 12)
+            layout.setSpacing(8)
+            path_label = QtWidgets.QLabel(_display_path(summary.path))
+            path_label.setObjectName("MutedText")
+            path_label.setWordWrap(True)
+            editor = QtWidgets.QPlainTextEdit()
+            editor.setObjectName("CalibrationYamlView")
+            editor.setReadOnly(True)
+            editor.setPlainText(raw_text)
+            close_button = QtWidgets.QPushButton("Close")
+            close_button.clicked.connect(dialog.accept)
+            button_row = QtWidgets.QHBoxLayout()
+            button_row.addStretch(1)
+            button_row.addWidget(close_button)
+            layout.addWidget(path_label)
+            layout.addWidget(editor, 1)
+            layout.addLayout(button_row)
+            dialog.exec()
+
+        def _copy_calibration_summary(self) -> None:
+            summary = inspect_camera_calibration_output(self._current_project_root())
+            if not summary.exists:
+                message = "Calibration summary is not available to copy."
+                self.statusBar().showMessage(message, 4000)
+                return
+            QtWidgets.QApplication.clipboard().setText(
+                _format_calibration_result_summary(summary)
+            )
+            self.statusBar().showMessage(
+                "Copied calibration summary to the clipboard.",
+                3000,
+            )
+
         def _refresh(self) -> None:
             root = Path(self._root_input.text()).expanduser()
             self._render_project_context(root)
@@ -1125,6 +1340,7 @@ def build_main_window(qt: Any, project_root: Path) -> Any:
             if model.stage_id == 2:
                 self._sync_calibration_from_project_metadata()
                 self._update_calibration_flow()
+            self._render_side_panel_calibration_result()
             self._render_stage_rail_selection()
 
         def _render_health(self) -> None:
@@ -1149,6 +1365,30 @@ def build_main_window(qt: Any, project_root: Path) -> Any:
             self._health_next_body.setText(
                 f"{health.next_stage_label}\n\n{health.next_action}"
             )
+            self._render_side_panel_calibration_result()
+
+        def _render_side_panel_calibration_result(self) -> None:
+            show_calibration = self._selected_stage_id == 2
+            self._side_panel_title.setText(
+                "Calibration Result" if show_calibration else "Project Health"
+            )
+            self._calibration_result_label.setVisible(show_calibration)
+            self._calibration_result_actions.setVisible(show_calibration)
+            self._calibration_result_divider.setVisible(show_calibration)
+            self._project_health_title.setVisible(show_calibration)
+            if not show_calibration:
+                return
+
+            summary = inspect_camera_calibration_output(self._current_project_root())
+            self._calibration_result_label.setText(
+                _format_calibration_result_summary_html(summary)
+            )
+            for button in (
+                self._open_calibration_yaml_button,
+                self._view_calibration_yaml_button,
+                self._copy_calibration_summary_button,
+            ):
+                button.setEnabled(summary.exists)
 
         def _render_error(self, root: Path, exc: Exception) -> None:
             self._render_project_context(root)
@@ -1283,7 +1523,9 @@ def build_main_window(qt: Any, project_root: Path) -> Any:
             )
 
             model = self._model_by_stage_id(self._selected_stage_id)
-            stage_complete = bool(model and model.stage_id == 2 and model.status == "complete")
+            stage_complete = bool(
+                model and model.stage_id == 2 and model.status == "complete"
+            )
             self._calibration_command_preview.setText(readiness.command_preview)
             self._calibration_command_preview.setCursorPosition(0)
             self._calibration_copy_button.setEnabled(bool(readiness.command_preview))
@@ -1292,6 +1534,20 @@ def build_main_window(qt: Any, project_root: Path) -> Any:
                     readiness,
                     stage_complete=stage_complete,
                 )
+            )
+            if (
+                self._calibration_process_state.state
+                == CALIBRATION_PROCESS_NOT_STARTED
+            ):
+                self._set_calibration_process_state(
+                    calibration_process_not_started(readiness.expected_output)
+                )
+            process_running = self._calibration_process_is_running()
+            self._calibration_run_button.setEnabled(
+                readiness.ready and not process_running
+            )
+            self._calibration_run_button.setText(
+                _calibration_run_button_label(self._calibration_process_state)
             )
 
             if model is None or model.stage_id != 2:
@@ -1324,6 +1580,182 @@ def build_main_window(qt: Any, project_root: Path) -> Any:
             self._calibration_copy_feedback.setText(message)
             self.statusBar().showMessage(message, 3000)
 
+        def _run_calibration(self) -> None:
+            if self._calibration_process_is_running():
+                message = "Calibration is already running."
+                self.statusBar().showMessage(message, 3000)
+                return
+
+            config = self._calibration_config()
+            readiness = inspect_camera_calibration_readiness(config)
+            if not readiness.ready:
+                message = "Resolve calibration readiness messages before running."
+                self._calibration_copy_feedback.setText(message)
+                self.statusBar().showMessage(message, 5000)
+                self._update_calibration_flow()
+                return
+
+            try:
+                launch = build_camera_calibration_launch(config)
+            except Exception as exc:
+                message = f"Could not prepare calibration launch: {exc}"
+                self._set_calibration_process_state(
+                    calibration_process_failed(
+                        message,
+                        expected_output=readiness.expected_output,
+                    )
+                )
+                self._append_calibration_log(f"[gui] {message}")
+                self.statusBar().showMessage(message, 6000)
+                self._update_calibration_flow()
+                return
+
+            process = QtCore.QProcess(self)
+            process.setProgram(launch.program)
+            process.setArguments(list(launch.arguments))
+            process.setProcessChannelMode(
+                QtCore.QProcess.ProcessChannelMode.SeparateChannels
+            )
+            if hasattr(QtCore, "QProcessEnvironment"):
+                env = QtCore.QProcessEnvironment.systemEnvironment()
+                env.insert("PYTHONUNBUFFERED", "1")
+                process.setProcessEnvironment(env)
+            process.readyReadStandardOutput.connect(self._read_calibration_stdout)
+            process.readyReadStandardError.connect(self._read_calibration_stderr)
+            process.finished.connect(self._calibration_process_finished)
+            process.errorOccurred.connect(self._calibration_process_error)
+
+            self._calibration_process = process
+            self._calibration_running_project_root = self._current_project_root()
+            self._calibration_running_expected_output = launch.expected_output
+            self._calibration_output_existed_at_launch = (
+                launch.expected_output.exists()
+            )
+            self._calibration_previous_output_mtime_ns = _path_mtime_ns(
+                launch.expected_output
+            )
+            self._calibration_output_seen = self._calibration_output_existed_at_launch
+            self._calibration_log.clear()
+            self._append_calibration_log(f"$ {launch.display_command}")
+            self._append_calibration_log(
+                "[gui] Launching with the current Python interpreter."
+            )
+            self._set_calibration_process_state(
+                calibration_process_running(launch.expected_output)
+            )
+            self._calibration_output_timer.start()
+            self._update_calibration_flow()
+            process.start()
+            self.statusBar().showMessage("Calibration process started.", 4000)
+
+        def _read_calibration_stdout(self) -> None:
+            process = self._calibration_process
+            if process is None:
+                return
+            self._append_calibration_output(process.readAllStandardOutput(), "")
+
+        def _read_calibration_stderr(self) -> None:
+            process = self._calibration_process
+            if process is None:
+                return
+            self._append_calibration_output(process.readAllStandardError(), "stderr")
+
+        def _calibration_process_finished(
+            self,
+            exit_code: int,
+            exit_status: Any,
+        ) -> None:
+            self._read_calibration_stdout()
+            self._read_calibration_stderr()
+            root = (
+                self._calibration_running_project_root
+                or self._current_project_root()
+            )
+            expected_output = self._calibration_running_expected_output
+            crashed = exit_status == QtCore.QProcess.ExitStatus.CrashExit
+            state = summarize_camera_calibration_process_result(
+                root,
+                exit_code=int(exit_code),
+                crashed=crashed,
+                expected_output=expected_output,
+                previous_output_mtime_ns=self._calibration_previous_output_mtime_ns,
+                require_output_update=self._calibration_output_existed_at_launch,
+            )
+            self._calibration_process = None
+            self._calibration_output_timer.stop()
+            self._set_calibration_process_state(state)
+            self._append_calibration_log(f"[gui] {state.message}")
+            self._refresh()
+            self.statusBar().showMessage(state.message, 7000)
+
+        def _calibration_process_error(self, error: Any) -> None:
+            process = self._calibration_process
+            error_name = _qt_enum_name(error)
+            detail = process.errorString() if process is not None else error_name
+            self._append_calibration_log(f"[gui] Process error: {detail}")
+            failed_to_start = QtCore.QProcess.ProcessError.FailedToStart
+            if error != failed_to_start:
+                return
+
+            state = calibration_process_failed(
+                f"Calibration process failed to start: {detail}",
+                expected_output=self._calibration_running_expected_output,
+            )
+            self._calibration_process = None
+            self._calibration_output_timer.stop()
+            self._set_calibration_process_state(state)
+            self._update_calibration_flow()
+            self.statusBar().showMessage(state.message, 7000)
+
+        def _poll_calibration_output(self) -> None:
+            target = self._calibration_running_expected_output
+            if target is None or self._calibration_output_seen:
+                return
+            if not target.exists():
+                return
+            self._calibration_output_seen = True
+            self._append_calibration_log(
+                f"[gui] Detected calibration output: {_display_path(target)}"
+            )
+            self._refresh()
+
+        def _append_calibration_output(self, data: Any, prefix: str) -> None:
+            text = bytes(data).decode("utf-8", errors="replace")
+            if not text:
+                return
+            if prefix:
+                for line in text.rstrip().splitlines():
+                    self._append_calibration_log(f"[{prefix}] {line}")
+            else:
+                self._append_calibration_log(text.rstrip())
+
+        def _append_calibration_log(self, text: str) -> None:
+            if not text:
+                return
+            self._calibration_log.appendPlainText(text)
+            scrollbar = self._calibration_log.verticalScrollBar()
+            scrollbar.setValue(scrollbar.maximum())
+
+        def _set_calibration_process_state(
+            self,
+            state: CameraCalibrationProcessState,
+        ) -> None:
+            self._calibration_process_state = state
+            if hasattr(self, "_calibration_process_state_label"):
+                self._calibration_process_state_label.setText(
+                    _format_calibration_process_state(state)
+                )
+            if hasattr(self, "_calibration_run_button"):
+                self._calibration_run_button.setText(
+                    _calibration_run_button_label(state)
+                )
+
+        def _calibration_process_is_running(self) -> bool:
+            process = self._calibration_process
+            if process is None:
+                return False
+            return process.state() != QtCore.QProcess.ProcessState.NotRunning
+
         def _render_calibration_source_fields(self) -> None:
             source = self._calibration_source_value()
             is_webcam = source == SOURCE_OPENCV
@@ -1344,6 +1776,13 @@ def build_main_window(qt: Any, project_root: Path) -> Any:
                 square_length_mm=float(self._calibration_square_length.value()),
                 marker_length_mm=float(self._calibration_marker_length.value()),
                 dictionary_name=self._calibration_dictionary.currentText(),
+                coverage_grid=(
+                    f"{int(self._calibration_grid_rows.value())}x"
+                    f"{int(self._calibration_grid_cols.value())}"
+                ),
+                samples_per_cell=int(self._calibration_samples_per_cell.value()),
+                guided_auto=bool(self._calibration_guided_auto.isChecked()),
+                guided_auto_cooldown=DEFAULT_GUIDED_AUTO_COOLDOWN,
             )
 
         def _calibration_source_value(self) -> str:
@@ -1546,6 +1985,166 @@ def _format_calibration_readiness(
     return "\n".join(lines)
 
 
+def _format_calibration_process_state(
+    state: CameraCalibrationProcessState,
+) -> str:
+    lines = [state.label, "", state.message]
+    if state.expected_output is not None:
+        lines.extend(["", f"Expected output: {_display_path(state.expected_output)}"])
+    if state.exit_code is not None:
+        lines.append(f"Exit code: {state.exit_code}")
+    return "\n".join(lines)
+
+
+def _format_calibration_result_summary(
+    summary: CameraCalibrationOutputSummary,
+) -> str:
+    if not summary.exists:
+        return "\n".join(
+            [
+                "No calibration YAML yet.",
+                "",
+                "Expected output",
+                _display_path(summary.path),
+            ]
+        )
+
+    lines = [
+        "Calibration valid" if summary.valid else "Calibration needs attention",
+        summary.message,
+        "",
+        "Output",
+        _display_path(summary.path),
+    ]
+    if summary.image_width is not None and summary.image_height is not None:
+        lines.extend(
+            [
+                "",
+                "Image size",
+                f"{summary.image_width} x {summary.image_height}",
+            ]
+        )
+    if summary.model:
+        lines.extend(["", "Model", summary.model])
+    if summary.reproj_rms is not None:
+        lines.extend(["", "RMS", f"{summary.reproj_rms:.3f} px"])
+    if summary.camera_params is not None:
+        fx, fy, cx, cy = summary.camera_params
+        lines.extend(
+            [
+                "",
+                "Intrinsics",
+                f"fx={fx:.3f}",
+                f"fy={fy:.3f}",
+                f"cx={cx:.3f}",
+                f"cy={cy:.3f}",
+            ]
+        )
+    if summary.distortion_coefficients:
+        distortion = "  ".join(
+            f"{name}={value:.6g}"
+            for name, value in summary.distortion_coefficients
+        )
+        lines.extend(["", "Distortion", distortion])
+    if summary.latest_run_dir is not None:
+        lines.extend(["", "Run snapshot", _display_path(summary.latest_run_dir)])
+    return "\n".join(lines)
+
+
+def _format_calibration_result_summary_html(
+    summary: CameraCalibrationOutputSummary,
+) -> str:
+    if not summary.exists:
+        return "".join(
+            [
+                "<div>No calibration YAML yet.</div>",
+                _result_block_html("Expected output", _display_path(summary.path)),
+            ]
+        )
+
+    lines = [
+        (
+            "<div><b>"
+            + html.escape(
+                "Calibration valid"
+                if summary.valid
+                else "Calibration needs attention"
+            )
+            + "</b></div>"
+        ),
+        f"<div>{html.escape(summary.message)}</div>",
+        _result_block_html("Output", _display_path(summary.path)),
+    ]
+    if summary.image_width is not None and summary.image_height is not None:
+        lines.append(
+            _result_block_html(
+                "Image size",
+                f"{summary.image_width} x {summary.image_height}",
+            )
+        )
+    if summary.model:
+        lines.append(_result_block_html("Model", summary.model))
+    if summary.reproj_rms is not None:
+        lines.append(_result_block_html("RMS", f"{summary.reproj_rms:.3f} px"))
+    if summary.camera_params is not None:
+        fx, fy, cx, cy = summary.camera_params
+        lines.append(
+            _result_block_html(
+                "Intrinsics",
+                "<br>".join(
+                    html.escape(value)
+                    for value in (
+                        f"fx={fx:.3f}",
+                        f"fy={fy:.3f}",
+                        f"cx={cx:.3f}",
+                        f"cy={cy:.3f}",
+                    )
+                ),
+                already_escaped=True,
+            )
+        )
+    if summary.distortion_coefficients:
+        distortion = "  ".join(
+            f"{name}={value:.6g}"
+            for name, value in summary.distortion_coefficients
+        )
+        lines.append(_result_block_html("Distortion", distortion))
+    if summary.latest_run_dir is not None:
+        lines.append(
+            _result_block_html("Run snapshot", _display_path(summary.latest_run_dir))
+        )
+    return "".join(lines)
+
+
+def _result_block_html(
+    label: str,
+    value: str,
+    *,
+    already_escaped: bool = False,
+) -> str:
+    rendered_value = value if already_escaped else html.escape(value)
+    return (
+        "<p style='margin:10px 0 0 0;'>"
+        "<span style='color:#405367; font-weight:600;'>"
+        f"{html.escape(label)}</span><br>"
+        "<span style='font-family:\"Menlo\", \"Consolas\", "
+        "\"Courier New\", monospace;'>"
+        f"{rendered_value}</span></p>"
+    )
+
+
+def _calibration_run_button_label(state: CameraCalibrationProcessState) -> str:
+    if state.running:
+        return "Calibration Running..."
+    if state.success:
+        return "Run Calibration Again"
+    return "Run Calibration"
+
+
+def _qt_enum_name(value: Any) -> str:
+    return str(getattr(value, "name", value))
+
+
 def _display_path(path: Path) -> str:
     home = Path.home()
     try:
@@ -1654,8 +2253,10 @@ def _calibration_command_card_note(
             "need to rerun the existing posetag-calib-charuco workflow."
         )
     return (
-        "Copy the preview into a terminal. The command opens the existing "
-        "calibration window; SPACE adds samples, ENTER solves, and q quits."
+        "Run Calibration starts the existing calibration workflow; Copy Command "
+        "keeps the terminal fallback. Guided auto-capture saves useful samples; "
+        "SPACE manually adds a sample, ENTER solves, and q quits in the OpenCV "
+        "window."
     )
 
 
@@ -1668,7 +2269,7 @@ def _calibration_command_ready_message(
         return "No runnable calibration command is available yet."
     if stage_complete:
         return "Calibration output exists. Copy only if you need to rerun it."
-    return "Ready to copy a calibration command."
+    return "Ready to run or copy a calibration command."
 
 
 def _project_root_hint(root: Path) -> str:
@@ -1738,6 +2339,16 @@ QLineEdit#CommandPreview {
     font-family: "Menlo", "Consolas", "Courier New", monospace;
     font-size: 12px;
 }
+QPlainTextEdit#CalibrationLog,
+QPlainTextEdit#CalibrationYamlView {
+    color: #263545;
+    background: #f7fafc;
+    border: 1px solid #d4e1ea;
+    border-radius: 6px;
+    padding: 7px;
+    font-family: "Menlo", "Consolas", "Courier New", monospace;
+    font-size: 11px;
+}
 QScrollArea#DetailScroll {
     background: transparent;
     border: none;
@@ -1773,12 +2384,24 @@ QPushButton#SecondaryActionButton {
     background: #49697f;
     border-color: #365467;
 }
-QFrame#HeaderPanel,
-QFrame#RailPanel,
-QFrame#HealthPanel {
+QFrame#HeaderPanel {
     background: #fbfdff;
     border: 1px solid #dfe9f1;
     border-radius: 8px;
+}
+QFrame#RailPanel {
+    background: #f2f7fb;
+    border: 1px solid #d8e5ee;
+    border-radius: 8px;
+}
+QFrame#HealthPanel {
+    background: #f6fafc;
+    border: 1px solid #d8e5ee;
+    border-radius: 8px;
+}
+QScrollArea#HealthScroll {
+    background: transparent;
+    border: none;
 }
 QFrame#Card {
     background: #fbfdff;
@@ -1876,8 +2499,8 @@ QLabel#CharucoPreviewCanvas {
 }
 QLabel#HealthCounts {
     color: #263545;
-    background: #f6f9fc;
-    border: 1px solid #d9e5ee;
+    background: #eef5f9;
+    border: 1px solid #d3e1ea;
     border-radius: 7px;
     padding: 9px 10px;
 }

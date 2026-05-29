@@ -113,11 +113,18 @@ capture, annotation, dataset collection, and review/export. In Stage 1 it can
 generate the ChArUco board PNG, PDF, and metadata YAML using the same package
 helper as `posetag-gen-charuco`. In Stage 2 it reads the generated ChArUco
 metadata, autofills the calibration board parameters, lets you choose webcam,
-RealSense, or video source settings, and prepares a copyable
-`posetag-calib-charuco` command with the expected
+RealSense, or video source settings, and can launch the existing
+`posetag-calib-charuco` workflow with a `Run Calibration` button when
+readiness checks pass. The panel keeps a copyable command fallback, streams
+process output into a compact log, and watches for the expected
 `<project_root>/calib/calib_color.yaml` output path. It can open selected
-folders in the system file manager, but it does not reimplement camera
-capture, calibration solving, board-building, annotation, or dataset workflows.
+folders in the system file manager. The calibration capture window also shows
+state-driven guidance based on detected ChArUco corners and accepted sample
+coverage, such as moving the board toward missing frame edges/corners or
+changing distance. Guided auto-capture saves good frames as the board covers
+the grid, while `SPACE` remains available as a manual override. The GUI does
+not reimplement camera capture, calibration solving, board-building,
+annotation, or dataset workflows.
 
 ## Scientific Contract
 
@@ -222,12 +229,27 @@ The optional `posetag-gui` dashboard provides the same ChArUco board setup from
 the Stage 1 ChArUco panel and refreshes project status after writing the files.
 The Stage 2 calibration panel then reads the generated metadata, autofills the
 matching board arguments, lets you choose webcam/OpenCV, RealSense, or video
-source settings, shows the `SPACE` / `ENTER` / `q` controls, and prepares a
-copyable `posetag-calib-charuco` command. Refresh the dashboard after
-`calib/calib_color.yaml` appears to update workflow status.
+source settings, shows the guided auto-capture / `SPACE` / `ENTER` / `q`
+controls, and can run the existing calibration command as a child process. The
+OpenCV calibration window still owns capture and solving: guided auto-capture
+saves good frames as the board covers missing grid cells, `SPACE` manually adds
+a sample, `ENTER` solves, and `q` quits. During capture, PoseTag overlays
+deterministic guidance derived from the current ChArUco observation and
+accepted sample coverage, rather than randomly rotating prompts. The Stage 2
+panel exposes coverage rows, coverage columns, and samples-per-cell controls,
+and passes those settings to the same command shown in the copy-command
+preview. It refreshes status after the process exits or after
+`calib/calib_color.yaml` appears, and it only marks the launch successful when
+that YAML passes the current status/schema checks. When the calibration YAML is
+present, the right panel shows a parsed calibration result summary with image
+size, RMS, intrinsics, distortion, output path, and latest run snapshot, while
+keeping raw YAML available through an explicit view/open action.
 
-Then calibrate with the same board parameters. Press `SPACE` to capture a
-sample and `ENTER` to solve. The calibration command outputs
+Then calibrate with the same board parameters. Move the board through the
+coverage grid; guided auto-capture saves useful samples and `SPACE` can still
+force a manual sample. Press `ENTER` to solve once the guidance says coverage
+looks good. The
+calibration command outputs
 `calib_color.yaml` containing `fx`, `fy`, `cx`, `cy`, distortion, image size,
 and reprojection RMS. With `--project_root`, the latest calibration defaults to
 `<root>/calib/calib_color.yaml`. Each run also stores raw calibration samples
@@ -845,7 +867,8 @@ are:
 - `posetag-capture-face` -> face-shot capture
 - `posetag-annotate` -> single, batch, and browse annotation flows
 - `posetag-collect` -> dataset capture
-- `posetag-gui` -> optional read-only workflow status dashboard
+- `posetag-gui` -> optional workflow dashboard for status, ChArUco board
+  setup, and guided calibration launch
 - `python3 -m gen_keypoints` -> canonical keypoint generation
 - `python3 -m view_keypoints` -> mesh/keypoint visualisation
 

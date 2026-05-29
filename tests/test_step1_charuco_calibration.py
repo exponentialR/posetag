@@ -53,6 +53,20 @@ class CharucoCalibrationStep1Tests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, msg=result.stderr)
         self.assertIn("Colour ChArUco calibration", result.stdout)
 
+    def test_module_invocation_help_resolves_for_gui_launch(self) -> None:
+        env = os.environ.copy()
+        env["PYTHONPATH"] = str(Path(__file__).resolve().parents[1] / "src")
+        result = subprocess.run(
+            [sys.executable, "-m", "posetag.cli.charuco", "--help"],
+            check=False,
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+
+        self.assertEqual(result.returncode, 0, msg=result.stderr)
+        self.assertIn("Colour ChArUco calibration", result.stdout)
+
     def test_direct_legacy_script_help_resolves_from_checkout(self) -> None:
         result = subprocess.run(
             [sys.executable, "utils/charuco_calibrate.py", "--help"],
@@ -233,6 +247,64 @@ class CharucoCalibrationStep1Tests(unittest.TestCase):
         args = charuco_calibrate.parse_args([])
 
         self.assertEqual(args.min_corners, 4)
+
+    def test_guided_capture_arguments_validate_to_grid_shape(self) -> None:
+        args = charuco_calibrate.parse_args(
+            [
+                "--coverage-grid",
+                "4x5",
+                "--samples-per-cell",
+                "2",
+                "--guided-auto-cooldown",
+                "3",
+                "--no-guided-auto",
+            ]
+        )
+
+        charuco_calibrate._validate_guided_capture_args(args)
+
+        self.assertEqual(args.coverage_grid_shape, (4, 5))
+        self.assertEqual(args.samples_per_cell, 2)
+        self.assertEqual(args.guided_auto_cooldown, 3)
+        self.assertFalse(args.guided_auto)
+
+    def test_invalid_guided_capture_args_fail_before_project_artifacts(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            base = Path(tmpdir)
+            project_root = base / "project"
+            env = {
+                "HOME": str(base / "home"),
+                "XDG_CONFIG_HOME": str(base / ".config"),
+            }
+
+            with patch.dict(os.environ, env, clear=False):
+                with self.assertRaises(SystemExit) as ctx:
+                    charuco_cli.main(
+                        [
+                            "--project_root",
+                            str(project_root),
+                            "--coverage-grid",
+                            "0x3",
+                        ]
+                    )
+
+            self.assertIn("--coverage-grid values must be positive", str(ctx.exception))
+            self.assertFalse((project_root / "calib").exists())
+
+    def test_guided_minimum_samples_reflect_grid_and_samples_per_cell(self) -> None:
+        args = charuco_calibrate.parse_args(
+            [
+                "--coverage-grid",
+                "4x4",
+                "--samples-per-cell",
+                "2",
+                "--min-samples",
+                "10",
+            ]
+        )
+        charuco_calibrate._validate_guided_capture_args(args)
+
+        self.assertEqual(charuco_calibrate._minimum_required_samples(args), 32)
 
     def test_project_io_preparation_creates_calibration_layout(self) -> None:
         with TemporaryDirectory() as tmpdir:
