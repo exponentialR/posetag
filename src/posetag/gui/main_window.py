@@ -23,7 +23,7 @@ from posetag.workflows.charuco_setup import (
     ORIENTATION_CHOICES,
     OUTPUT_FORMAT_CHOICES,
     PAPER_CHOICES,
-    PRINT_GUIDANCE,
+    PRINT_GUIDANCE as CHARUCO_PRINT_GUIDANCE,
     CharucoBoardSetupConfig,
     CharucoBoardSetupError,
     default_output_dir,
@@ -55,6 +55,31 @@ from posetag.workflows.calibration_flow import (
     normalize_source,
     read_camera_calibration_yaml_text,
     summarize_camera_calibration_process_result,
+)
+from posetag.workflows.object_tags import (
+    DEFAULT_DPI as DEFAULT_OBJECT_TAG_DPI,
+    DEFAULT_FAMILY as DEFAULT_OBJECT_TAG_FAMILY,
+    DEFAULT_ID_COUNT as DEFAULT_OBJECT_TAG_ID_COUNT,
+    DEFAULT_ID_START as DEFAULT_OBJECT_TAG_ID_START,
+    DEFAULT_IDS as DEFAULT_OBJECT_TAG_IDS,
+    DEFAULT_PREFIX as DEFAULT_OBJECT_TAG_PREFIX,
+    DEFAULT_TAG_SIZE_MM as DEFAULT_OBJECT_TAG_SIZE_MM,
+    FAMILY_CHOICES as OBJECT_TAG_FAMILY_CHOICES,
+    ID_MODE_CHOICES as OBJECT_TAG_ID_MODE_CHOICES,
+    ID_MODE_LABELS as OBJECT_TAG_ID_MODE_LABELS,
+    ID_MODE_LIST as OBJECT_TAG_ID_MODE_LIST,
+    ID_MODE_RANGE as OBJECT_TAG_ID_MODE_RANGE,
+    MAX_TAG_ID as OBJECT_TAG_MAX_ID,
+    ORIENTATION_CHOICES as OBJECT_TAG_ORIENTATION_CHOICES,
+    PAPER_CHOICES as OBJECT_TAG_PAPER_CHOICES,
+    PAPER_CUSTOM as OBJECT_TAG_PAPER_CUSTOM,
+    PRINT_GUIDANCE as OBJECT_TAG_PRINT_GUIDANCE,
+    ObjectTagGenerationConfig,
+    ObjectTagGenerationError,
+    ObjectTagGenerationReadiness,
+    default_output_dir as default_object_tag_output_dir,
+    generate_object_tags,
+    inspect_object_tag_generation,
 )
 
 
@@ -190,20 +215,26 @@ def build_main_window(qt: Any, project_root: Path) -> Any:
         layout.addLayout(copy, 1)
         return entry
 
-    class _CharucoPreviewCanvas(QtWidgets.QLabel):
-        def __init__(self) -> None:
-            super().__init__("No generated board yet.")
+    class _ImagePreviewCanvas(QtWidgets.QLabel):
+        def __init__(
+            self,
+            empty_message: str,
+            *,
+            object_name: str = "ImagePreviewCanvas",
+        ) -> None:
+            super().__init__(empty_message)
+            self._empty_message = empty_message
             self._source_pixmap: Any = None
-            self.setObjectName("CharucoPreviewCanvas")
+            self.setObjectName(object_name)
             self.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
             self.setMinimumSize(300, 300)
             self.setMaximumHeight(330)
             self.setWordWrap(True)
 
-        def clear_preview(self, message: str = "No generated board yet.") -> None:
+        def clear_preview(self, message: Optional[str] = None) -> None:
             self._source_pixmap = None
             self.clear()
-            self.setText(message)
+            self.setText(message or self._empty_message)
 
         def show_preview(self, path: Path) -> bool:
             pixmap = QtGui.QPixmap(str(path))
@@ -534,7 +565,7 @@ def build_main_window(qt: Any, project_root: Path) -> Any:
             charuco_file_action_row.addWidget(self._charuco_open_folder_button)
             charuco_file_action_row.addStretch(1)
 
-            self._charuco_guidance = QtWidgets.QLabel(PRINT_GUIDANCE)
+            self._charuco_guidance = QtWidgets.QLabel(CHARUCO_PRINT_GUIDANCE)
             self._charuco_guidance.setObjectName("GuidanceText")
             self._charuco_guidance.setWordWrap(True)
 
@@ -552,7 +583,10 @@ def build_main_window(qt: Any, project_root: Path) -> Any:
                 QtCore.Qt.TextInteractionFlag.TextSelectableByMouse
             )
 
-            self._charuco_preview = _CharucoPreviewCanvas()
+            self._charuco_preview = _ImagePreviewCanvas(
+                "No generated board yet.",
+                object_name="CharucoPreviewCanvas",
+            )
             charuco_preview_title = QtWidgets.QLabel("Preview")
             charuco_preview_title.setObjectName("FieldLabel")
             charuco_outputs_title = QtWidgets.QLabel("Generated files")
@@ -889,6 +923,367 @@ def build_main_window(qt: Any, project_root: Path) -> Any:
             calibration_layout.addWidget(self._calibration_copy_feedback)
             calibration_layout.addLayout(calibration_action_row)
 
+            self._last_object_tag_output_dir: Optional[Path] = None
+            self._last_object_tag_sheet_file: Optional[Path] = None
+            self._object_tags_card = QtWidgets.QFrame()
+            self._object_tags_card.setObjectName("ActionCard")
+            object_tags_layout = QtWidgets.QVBoxLayout(self._object_tags_card)
+            object_tags_layout.setContentsMargins(14, 12, 14, 12)
+            object_tags_layout.setSpacing(9)
+
+            object_tags_title = QtWidgets.QLabel("Object AprilTag sheets")
+            object_tags_title.setObjectName("CardTitle")
+            object_tags_note = QtWidgets.QLabel(
+                "Generate the printable tags for object faces using the same "
+                "package workflow as posetag-gen-tags."
+            )
+            object_tags_note.setObjectName("MutedText")
+            object_tags_note.setWordWrap(True)
+
+            self._object_tags_family = QtWidgets.QComboBox()
+            self._object_tags_family.addItems(list(OBJECT_TAG_FAMILY_CHOICES))
+            self._object_tags_family.setCurrentText(DEFAULT_OBJECT_TAG_FAMILY)
+            self._object_tags_family.setMinimumWidth(180)
+
+            self._object_tags_tag_size = _make_float_spin(
+                0.1,
+                1000.0,
+                DEFAULT_OBJECT_TAG_SIZE_MM,
+                " mm",
+            )
+
+            self._object_tags_id_mode = QtWidgets.QComboBox()
+            for mode in OBJECT_TAG_ID_MODE_CHOICES:
+                self._object_tags_id_mode.addItem(
+                    OBJECT_TAG_ID_MODE_LABELS[mode],
+                    mode,
+                )
+            self._object_tags_id_mode.setMinimumWidth(180)
+            self._object_tags_id_mode.currentIndexChanged.connect(
+                self._object_tag_mode_changed
+            )
+
+            self._object_tags_ids = QtWidgets.QLineEdit(DEFAULT_OBJECT_TAG_IDS)
+            self._object_tags_ids.setPlaceholderText("Examples: 1-4 or 1-3,7,9-10")
+            self._object_tags_id_start = _make_int_spin(
+                0,
+                OBJECT_TAG_MAX_ID,
+                DEFAULT_OBJECT_TAG_ID_START,
+            )
+            self._object_tags_id_count = _make_int_spin(
+                1,
+                OBJECT_TAG_MAX_ID + 1,
+                DEFAULT_OBJECT_TAG_ID_COUNT,
+            )
+
+            self._object_tags_paper = QtWidgets.QComboBox()
+            self._object_tags_paper.addItems(list(OBJECT_TAG_PAPER_CHOICES))
+            self._object_tags_paper.setCurrentText("A4")
+            self._object_tags_paper.setMinimumWidth(180)
+            self._object_tags_paper.currentTextChanged.connect(
+                self._object_tag_paper_changed
+            )
+            self._object_tags_paper_mm = QtWidgets.QLineEdit()
+            self._object_tags_paper_mm.setPlaceholderText("Custom paper, e.g. 210x297")
+            self._object_tags_orientation = QtWidgets.QComboBox()
+            self._object_tags_orientation.addItems(
+                list(OBJECT_TAG_ORIENTATION_CHOICES)
+            )
+            self._object_tags_orientation.setCurrentText("portrait")
+            self._object_tags_orientation.setMinimumWidth(180)
+            self._object_tags_dpi = _make_int_spin(
+                1,
+                2400,
+                DEFAULT_OBJECT_TAG_DPI,
+            )
+            self._object_tags_prefix = QtWidgets.QLineEdit(
+                DEFAULT_OBJECT_TAG_PREFIX
+            )
+            self._object_tags_margin_frac = _make_float_spin(
+                0.0,
+                0.44,
+                0.05,
+            )
+            self._object_tags_margin_frac.setSingleStep(0.01)
+            self._object_tags_label_gap_frac = _make_float_spin(
+                0.0,
+                0.99,
+                0.05,
+            )
+            self._object_tags_label_gap_frac.setSingleStep(0.01)
+            self._object_tags_pil_text = QtWidgets.QCheckBox("Use Pillow labels")
+
+            self._object_tags_out_dir = QtWidgets.QLineEdit()
+            self._object_tags_out_dir.setPlaceholderText(
+                "Default: <project_root>/boards/patterns/"
+            )
+            object_tags_browse_button = QtWidgets.QPushButton("Browse")
+            object_tags_browse_button.clicked.connect(
+                self._browse_object_tags_output_dir
+            )
+            object_tags_out_row = QtWidgets.QHBoxLayout()
+            object_tags_out_row.setContentsMargins(0, 0, 0, 0)
+            object_tags_out_row.addWidget(self._object_tags_out_dir, 1)
+            object_tags_out_row.addWidget(object_tags_browse_button)
+            object_tags_out_widget = QtWidgets.QWidget()
+            object_tags_out_widget.setLayout(object_tags_out_row)
+
+            self._object_tags_list_field = _make_field(
+                "IDs / ranges",
+                self._object_tags_ids,
+            )
+            self._object_tags_start_field = _make_field(
+                "Start ID",
+                self._object_tags_id_start,
+            )
+            self._object_tags_count_field = _make_field(
+                "ID count",
+                self._object_tags_id_count,
+            )
+            self._object_tags_paper_mm_field = _make_field(
+                "Custom paper",
+                self._object_tags_paper_mm,
+            )
+
+            object_tags_grid = QtWidgets.QGridLayout()
+            object_tags_grid.setContentsMargins(0, 0, 0, 0)
+            object_tags_grid.setHorizontalSpacing(14)
+            object_tags_grid.setVerticalSpacing(10)
+            object_tags_grid.addWidget(
+                _make_field("Family", self._object_tags_family),
+                0,
+                0,
+            )
+            object_tags_grid.addWidget(
+                _make_field("Tag size", self._object_tags_tag_size),
+                0,
+                1,
+            )
+            object_tags_grid.addWidget(
+                _make_field("ID entry", self._object_tags_id_mode),
+                1,
+                0,
+            )
+            object_tags_grid.addWidget(self._object_tags_list_field, 1, 1)
+            object_tags_grid.addWidget(self._object_tags_start_field, 2, 0)
+            object_tags_grid.addWidget(self._object_tags_count_field, 2, 1)
+            object_tags_grid.addWidget(
+                _make_field("Paper size", self._object_tags_paper),
+                3,
+                0,
+            )
+            object_tags_grid.addWidget(self._object_tags_paper_mm_field, 3, 1)
+            object_tags_grid.addWidget(
+                _make_field("Orientation", self._object_tags_orientation),
+                4,
+                0,
+            )
+            object_tags_grid.addWidget(
+                _make_field("DPI", self._object_tags_dpi),
+                4,
+                1,
+            )
+            object_tags_grid.addWidget(
+                _make_field("Filename prefix", self._object_tags_prefix),
+                5,
+                0,
+                1,
+                2,
+            )
+            object_tags_grid.addWidget(
+                _make_field("Margin fraction", self._object_tags_margin_frac),
+                6,
+                0,
+            )
+            object_tags_grid.addWidget(
+                _make_field("Label gap fraction", self._object_tags_label_gap_frac),
+                6,
+                1,
+            )
+            object_tags_grid.addWidget(self._object_tags_pil_text, 7, 0)
+            object_tags_grid.addWidget(
+                _make_field("Output folder", object_tags_out_widget),
+                8,
+                0,
+                1,
+                2,
+            )
+            object_tags_grid.setColumnStretch(0, 1)
+            object_tags_grid.setColumnStretch(1, 1)
+
+            for field in (
+                self._object_tags_tag_size,
+                self._object_tags_id_start,
+                self._object_tags_id_count,
+                self._object_tags_dpi,
+                self._object_tags_margin_frac,
+                self._object_tags_label_gap_frac,
+            ):
+                field.valueChanged.connect(self._update_object_tag_flow)
+            for field in (
+                self._object_tags_family,
+                self._object_tags_orientation,
+            ):
+                field.currentTextChanged.connect(self._update_object_tag_flow)
+            for field in (
+                self._object_tags_ids,
+                self._object_tags_paper_mm,
+                self._object_tags_prefix,
+                self._object_tags_out_dir,
+            ):
+                field.textChanged.connect(self._update_object_tag_flow)
+            self._object_tags_pil_text.stateChanged.connect(
+                self._update_object_tag_flow
+            )
+
+            self._object_tags_guidance = QtWidgets.QLabel(
+                OBJECT_TAG_PRINT_GUIDANCE
+            )
+            self._object_tags_guidance.setObjectName("GuidanceText")
+            self._object_tags_guidance.setWordWrap(True)
+
+            self._object_tags_readiness = QtWidgets.QLabel()
+            self._object_tags_readiness.setObjectName("OutputText")
+            self._object_tags_readiness.setWordWrap(True)
+            self._object_tags_readiness.setTextInteractionFlags(
+                QtCore.Qt.TextInteractionFlag.TextSelectableByMouse
+            )
+            self._object_tags_expected_output = QtWidgets.QLabel()
+            self._object_tags_expected_output.setObjectName("OutputText")
+            self._object_tags_expected_output.setWordWrap(True)
+            self._object_tags_expected_output.setTextInteractionFlags(
+                QtCore.Qt.TextInteractionFlag.TextSelectableByMouse
+            )
+            self._object_tags_outputs = QtWidgets.QLabel("No generated files yet.")
+            self._object_tags_outputs.setObjectName("OutputText")
+            self._object_tags_outputs.setWordWrap(True)
+            self._object_tags_outputs.setMinimumHeight(96)
+            self._object_tags_outputs.setAlignment(
+                QtCore.Qt.AlignmentFlag.AlignLeft
+                | QtCore.Qt.AlignmentFlag.AlignTop
+            )
+            self._object_tags_outputs.setTextInteractionFlags(
+                QtCore.Qt.TextInteractionFlag.TextSelectableByMouse
+            )
+
+            self._object_tags_generate_button = QtWidgets.QPushButton(
+                "Generate Object Tags"
+            )
+            self._object_tags_generate_button.setObjectName("PrimaryActionButton")
+            self._object_tags_generate_button.clicked.connect(
+                self._generate_object_tags
+            )
+            object_tags_refresh_button = QtWidgets.QPushButton("Refresh Status")
+            object_tags_refresh_button.setObjectName("SecondaryActionButton")
+            object_tags_refresh_button.clicked.connect(self._refresh)
+            self._object_tags_open_file_button = QtWidgets.QPushButton(
+                "Open First Sheet"
+            )
+            self._object_tags_open_file_button.setObjectName("SecondaryActionButton")
+            self._object_tags_open_file_button.setEnabled(False)
+            self._object_tags_open_file_button.clicked.connect(
+                self._open_object_tags_sheet_file
+            )
+            self._object_tags_open_folder_button = QtWidgets.QPushButton(
+                "Open Output Folder"
+            )
+            self._object_tags_open_folder_button.setObjectName("SecondaryActionButton")
+            self._object_tags_open_folder_button.setEnabled(False)
+            self._object_tags_open_folder_button.clicked.connect(
+                self._open_object_tags_output_folder
+            )
+
+            object_tags_action_row = QtWidgets.QHBoxLayout()
+            object_tags_action_row.addWidget(self._object_tags_generate_button)
+            object_tags_action_row.addWidget(object_tags_refresh_button)
+            object_tags_action_row.addStretch(1)
+
+            object_tags_file_action_row = QtWidgets.QHBoxLayout()
+            object_tags_file_action_row.addWidget(self._object_tags_open_file_button)
+            object_tags_file_action_row.addWidget(
+                self._object_tags_open_folder_button
+            )
+            object_tags_file_action_row.addStretch(1)
+
+            object_tags_status_grid = QtWidgets.QGridLayout()
+            object_tags_status_grid.setContentsMargins(0, 0, 0, 0)
+            object_tags_status_grid.setHorizontalSpacing(12)
+            object_tags_status_grid.setVerticalSpacing(8)
+            object_tags_status_grid.addWidget(
+                _make_field("Readiness", self._object_tags_readiness),
+                0,
+                0,
+            )
+            object_tags_status_grid.addWidget(
+                _make_field("Expected output", self._object_tags_expected_output),
+                0,
+                1,
+            )
+            object_tags_status_grid.addWidget(
+                _make_field("Generated files", self._object_tags_outputs),
+                1,
+                0,
+                1,
+                2,
+            )
+            object_tags_status_grid.setColumnStretch(0, 1)
+            object_tags_status_grid.setColumnStretch(1, 1)
+
+            self._object_tags_preview = _ImagePreviewCanvas(
+                "No generated tag sheet yet.",
+                object_name="ObjectTagPreviewCanvas",
+            )
+            object_tags_preview_title = QtWidgets.QLabel("Preview")
+            object_tags_preview_title.setObjectName("FieldLabel")
+            object_tags_preview_note = QtWidgets.QLabel(
+                "First generated PNG sheet."
+            )
+            object_tags_preview_note.setObjectName("MutedText")
+            object_tags_preview_note.setWordWrap(True)
+            object_tags_preview_column = QtWidgets.QFrame()
+            object_tags_preview_column.setObjectName("ObjectTagPreviewColumn")
+            object_tags_preview_layout = QtWidgets.QVBoxLayout(
+                object_tags_preview_column
+            )
+            object_tags_preview_layout.setContentsMargins(10, 10, 10, 10)
+            object_tags_preview_layout.setSpacing(7)
+            object_tags_preview_layout.addWidget(object_tags_preview_title)
+            object_tags_preview_layout.addWidget(self._object_tags_preview)
+            object_tags_preview_layout.addWidget(object_tags_preview_note)
+            object_tags_preview_layout.addStretch(1)
+            object_tags_preview_column.setMinimumWidth(320)
+
+            object_tags_controls = QtWidgets.QWidget()
+            object_tags_controls_layout = QtWidgets.QVBoxLayout(
+                object_tags_controls
+            )
+            object_tags_controls_layout.setContentsMargins(0, 0, 0, 0)
+            object_tags_controls_layout.setSpacing(9)
+            object_tags_controls_layout.addLayout(object_tags_grid)
+            object_tags_controls_layout.addWidget(self._object_tags_guidance)
+            object_tags_controls_layout.addLayout(object_tags_status_grid)
+            object_tags_controls_layout.addLayout(object_tags_file_action_row)
+            object_tags_controls_layout.addLayout(object_tags_action_row)
+            object_tags_controls_layout.addStretch(1)
+
+            object_tags_body = QtWidgets.QHBoxLayout()
+            object_tags_body.setContentsMargins(0, 0, 0, 0)
+            object_tags_body.setSpacing(12)
+            object_tags_body.addWidget(
+                object_tags_controls,
+                3,
+                QtCore.Qt.AlignmentFlag.AlignTop,
+            )
+            object_tags_body.addWidget(
+                object_tags_preview_column,
+                2,
+                QtCore.Qt.AlignmentFlag.AlignTop,
+            )
+
+            object_tags_layout.addWidget(object_tags_title)
+            object_tags_layout.addWidget(object_tags_note)
+            object_tags_layout.addLayout(object_tags_body)
+
             detail_content = QtWidgets.QWidget()
             detail_content_layout = QtWidgets.QVBoxLayout(detail_content)
             detail_content_layout.setContentsMargins(0, 0, 0, 0)
@@ -898,6 +1293,7 @@ def build_main_window(qt: Any, project_root: Path) -> Any:
             detail_content_layout.addLayout(cards_grid)
             detail_content_layout.addWidget(self._charuco_card)
             detail_content_layout.addWidget(self._calibration_card)
+            detail_content_layout.addWidget(self._object_tags_card)
             detail_content_layout.addWidget(command_card)
             detail_content_layout.addStretch(1)
 
@@ -1048,7 +1444,7 @@ def build_main_window(qt: Any, project_root: Path) -> Any:
             self.setStyleSheet(_style_sheet())
             self.statusBar().showMessage(
                 "Dashboard can generate ChArUco board files and prepare "
-                "camera-calibration commands."
+                "camera-calibration and object-tag workflows."
             )
 
             self._refresh()
@@ -1092,6 +1488,17 @@ def build_main_window(qt: Any, project_root: Path) -> Any:
             if selected:
                 self._charuco_out_dir.setText(selected)
 
+        def _browse_object_tags_output_dir(self) -> None:
+            current = self._object_tags_out_dir.text().strip()
+            start_dir = current or str(self._current_project_root())
+            selected = QtWidgets.QFileDialog.getExistingDirectory(
+                self,
+                "Select object AprilTag output folder",
+                start_dir,
+            )
+            if selected:
+                self._object_tags_out_dir.setText(selected)
+
         def _browse_calibration_video(self) -> None:
             current = self._calibration_video_path.text().strip()
             start_path = current or str(self._current_project_root())
@@ -1107,6 +1514,14 @@ def build_main_window(qt: Any, project_root: Path) -> Any:
         def _calibration_source_changed(self) -> None:
             self._render_calibration_source_fields()
             self._update_calibration_flow()
+
+        def _object_tag_mode_changed(self) -> None:
+            self._render_object_tag_mode_fields()
+            self._update_object_tag_flow()
+
+        def _object_tag_paper_changed(self) -> None:
+            self._render_object_tag_paper_fields()
+            self._update_object_tag_flow()
 
         def _generate_charuco_board(self) -> None:
             self._charuco_generate_button.setEnabled(False)
@@ -1180,6 +1595,92 @@ def build_main_window(qt: Any, project_root: Path) -> Any:
                 "Opened ChArUco output folder."
                 if opened
                 else "Could not open the ChArUco output folder."
+            )
+            self.statusBar().showMessage(message, 4000)
+
+        def _generate_object_tags(self) -> None:
+            self._object_tags_generate_button.setEnabled(False)
+            try:
+                result = generate_object_tags(self._object_tag_config())
+            except ObjectTagGenerationError as exc:
+                message = f"Object AprilTag generation failed: {exc}"
+                self._object_tags_outputs.setText(message)
+                self._last_object_tag_output_dir = None
+                self._last_object_tag_sheet_file = None
+                self._object_tags_open_folder_button.setEnabled(False)
+                self._object_tags_open_file_button.setEnabled(False)
+                self._object_tags_preview.clear_preview("Preview unavailable.")
+                self.statusBar().showMessage(message, 6000)
+                self._update_object_tag_flow()
+            except Exception as exc:  # pragma: no cover - defensive UI boundary
+                message = f"Object AprilTag generation failed: {exc}"
+                self._object_tags_outputs.setText(message)
+                self._last_object_tag_output_dir = None
+                self._last_object_tag_sheet_file = None
+                self._object_tags_open_folder_button.setEnabled(False)
+                self._object_tags_open_file_button.setEnabled(False)
+                self._object_tags_preview.clear_preview("Preview unavailable.")
+                self.statusBar().showMessage(message, 6000)
+                self._update_object_tag_flow()
+            else:
+                first_sheet = result.pdf_paths[0] if result.pdf_paths else None
+                if first_sheet is None and result.png_paths:
+                    first_sheet = result.png_paths[0]
+                self._last_object_tag_output_dir = result.out_dir
+                self._last_object_tag_sheet_file = first_sheet
+                self._object_tags_outputs.setText(_format_object_tag_outputs(result))
+                self._object_tags_open_folder_button.setEnabled(
+                    result.out_dir.is_dir()
+                )
+                self._object_tags_open_file_button.setEnabled(
+                    bool(first_sheet and first_sheet.is_file())
+                )
+                if result.png_paths:
+                    self._object_tags_preview.show_preview(result.png_paths[0])
+                else:
+                    self._object_tags_preview.clear_preview("Preview unavailable.")
+                self.statusBar().showMessage(
+                    "Generated object AprilTag sheet outputs.",
+                    5000,
+                )
+                self._refresh()
+            finally:
+                self._update_object_tag_flow()
+
+        def _open_object_tags_sheet_file(self) -> None:
+            target = self._last_object_tag_sheet_file
+            if target is None or not target.is_file():
+                message = "Generated object AprilTag sheet is not available to open."
+                self.statusBar().showMessage(message, 4000)
+                return
+
+            opened = QtGui.QDesktopServices.openUrl(
+                QtCore.QUrl.fromLocalFile(str(target.resolve()))
+            )
+            message = (
+                "Opened generated object AprilTag sheet."
+                if opened
+                else "Could not open the generated object AprilTag sheet."
+            )
+            self.statusBar().showMessage(message, 4000)
+
+        def _open_object_tags_output_folder(self) -> None:
+            target = (
+                self._last_object_tag_output_dir
+                or self._object_tag_output_target()
+            )
+            if not target.is_dir():
+                message = "Object AprilTag output folder is not available to open."
+                self.statusBar().showMessage(message, 4000)
+                return
+
+            opened = QtGui.QDesktopServices.openUrl(
+                QtCore.QUrl.fromLocalFile(str(target.resolve()))
+            )
+            message = (
+                "Opened object AprilTag output folder."
+                if opened
+                else "Could not open the object AprilTag output folder."
             )
             self.statusBar().showMessage(message, 4000)
 
@@ -1337,9 +1838,12 @@ def build_main_window(qt: Any, project_root: Path) -> Any:
             )
             self._charuco_card.setVisible(model.stage_id == 1)
             self._calibration_card.setVisible(model.stage_id == 2)
+            self._object_tags_card.setVisible(model.stage_id == 3)
             if model.stage_id == 2:
                 self._sync_calibration_from_project_metadata()
                 self._update_calibration_flow()
+            if model.stage_id == 3:
+                self._update_object_tag_flow()
             self._render_side_panel_calibration_result()
             self._render_stage_rail_selection()
 
@@ -1418,6 +1922,7 @@ def build_main_window(qt: Any, project_root: Path) -> Any:
             self._copy_feedback.setText(_command_ready_message(""))
             self._charuco_card.setVisible(False)
             self._calibration_card.setVisible(False)
+            self._object_tags_card.setVisible(False)
             self._render_health()
 
         def _render_stage_rail_selection(self) -> None:
@@ -1561,6 +2066,37 @@ def build_main_window(qt: Any, project_root: Path) -> Any:
             )
             self._copy_feedback.setText(
                 _calibration_command_ready_message(
+                    readiness,
+                    stage_complete=model.status == "complete",
+                )
+            )
+
+        def _update_object_tag_flow(self) -> None:
+            if not hasattr(self, "_object_tags_readiness"):
+                return
+            self._render_object_tag_mode_fields()
+            self._render_object_tag_paper_fields()
+            readiness = inspect_object_tag_generation(self._object_tag_config())
+            self._object_tags_readiness.setText(
+                _format_object_tag_readiness(readiness)
+            )
+            self._object_tags_expected_output.setText(
+                _format_object_tag_expected_output(readiness)
+            )
+            self._object_tags_generate_button.setEnabled(readiness.ready)
+
+            model = self._model_by_stage_id(self._selected_stage_id)
+            if model is None or model.stage_id != 3:
+                return
+
+            self._command_preview.setText(readiness.command_preview)
+            self._command_preview.setCursorPosition(0)
+            self._copy_button.setEnabled(bool(readiness.command_preview))
+            self._command_note.setText(
+                _object_tag_command_card_note(readiness, model)
+            )
+            self._copy_feedback.setText(
+                _object_tag_command_ready_message(
                     readiness,
                     stage_complete=model.status == "complete",
                 )
@@ -1765,6 +2301,20 @@ def build_main_window(qt: Any, project_root: Path) -> Any:
             self._calibration_video_path.setEnabled(is_video)
             self._calibration_video_browse_button.setEnabled(is_video)
 
+        def _render_object_tag_mode_fields(self) -> None:
+            mode = self._object_tag_id_mode_value()
+            using_list = mode == OBJECT_TAG_ID_MODE_LIST
+            self._object_tags_list_field.setVisible(using_list)
+            self._object_tags_start_field.setVisible(not using_list)
+            self._object_tags_count_field.setVisible(not using_list)
+
+        def _render_object_tag_paper_fields(self) -> None:
+            custom = (
+                self._object_tags_paper.currentText().strip().upper()
+                == OBJECT_TAG_PAPER_CUSTOM
+            )
+            self._object_tags_paper_mm_field.setVisible(custom)
+
         def _calibration_config(self) -> CameraCalibrationConfig:
             return CameraCalibrationConfig(
                 project_root=self._current_project_root(),
@@ -1794,6 +2344,37 @@ def build_main_window(qt: Any, project_root: Path) -> Any:
                 return normalize_source(raw)
             except Exception:
                 return SOURCE_OPENCV
+
+        def _object_tag_config(self) -> ObjectTagGenerationConfig:
+            out_dir_text = self._object_tags_out_dir.text().strip()
+            out_dir = Path(out_dir_text).expanduser() if out_dir_text else None
+            paper_mm_text = self._object_tags_paper_mm.text().strip()
+            paper_mm = paper_mm_text or None
+            return ObjectTagGenerationConfig(
+                project_root=self._current_project_root(),
+                family=self._object_tags_family.currentText(),
+                tag_size_mm=float(self._object_tags_tag_size.value()),
+                id_mode=self._object_tag_id_mode_value(),
+                ids=self._object_tags_ids.text(),
+                id_start=int(self._object_tags_id_start.value()),
+                id_count=int(self._object_tags_id_count.value()),
+                paper=self._object_tags_paper.currentText(),
+                paper_mm=paper_mm,
+                orientation=self._object_tags_orientation.currentText(),
+                dpi=int(self._object_tags_dpi.value()),
+                pil_text=bool(self._object_tags_pil_text.isChecked()),
+                margin_frac=float(self._object_tags_margin_frac.value()),
+                label_gap_frac=float(self._object_tags_label_gap_frac.value()),
+                out_dir=out_dir,
+                prefix=self._object_tags_prefix.text(),
+            )
+
+        def _object_tag_id_mode_value(self) -> str:
+            data = self._object_tags_id_mode.currentData()
+            raw = str(data if data is not None else self._object_tags_id_mode.currentText())
+            if raw in OBJECT_TAG_ID_MODE_CHOICES:
+                return raw
+            return OBJECT_TAG_ID_MODE_RANGE if "count" in raw.lower() else OBJECT_TAG_ID_MODE_LIST
 
         def _model_by_stage_id(self, stage_id: int) -> Optional[StageViewModel]:
             for model in self._models:
@@ -1830,6 +2411,12 @@ def build_main_window(qt: Any, project_root: Path) -> Any:
             if out_dir_text:
                 return Path(out_dir_text).expanduser()
             return default_output_dir(self._current_project_root())
+
+        def _object_tag_output_target(self) -> Path:
+            out_dir_text = self._object_tags_out_dir.text().strip()
+            if out_dir_text:
+                return Path(out_dir_text).expanduser()
+            return default_object_tag_output_dir(self._current_project_root())
 
     return PoseTagMainWindow(project_root)
 
@@ -1944,6 +2531,54 @@ def _format_charuco_outputs(result: Any) -> str:
     else:
         lines.append(f"PDF:    {Path(result.pdf).name}")
     return "\n".join(lines)
+
+
+def _format_object_tag_outputs(result: Any) -> str:
+    png_paths = tuple(getattr(result, "png_paths", ()))
+    pdf_paths = tuple(getattr(result, "pdf_paths", ()))
+    parsed_ids = tuple(getattr(result, "parsed_ids", ()))
+    lines = [
+        f"Folder: {_display_path(getattr(result, 'out_dir', Path('.')))}",
+        f"IDs:    {_format_id_summary(parsed_ids)}",
+        f"PNG:    {len(png_paths)} sheet{'s' if len(png_paths) != 1 else ''}",
+    ]
+    lines.extend(f"  - {Path(path).name}" for path in png_paths)
+    if pdf_paths:
+        lines.append(
+            f"PDF:    {len(pdf_paths)} sheet{'s' if len(pdf_paths) != 1 else ''}"
+        )
+        lines.extend(f"  - {Path(path).name}" for path in pdf_paths)
+    else:
+        lines.append("PDF:    unavailable in this environment")
+    return "\n".join(lines)
+
+
+def _format_object_tag_readiness(
+    readiness: ObjectTagGenerationReadiness,
+) -> str:
+    lines = ["Ready to generate." if readiness.ready else "Not ready yet."]
+    if readiness.parsed_ids:
+        lines.extend(["", f"IDs: {_format_id_summary(readiness.parsed_ids)}"])
+    if readiness.errors:
+        lines.extend(["", "Errors", *_format_items(readiness.errors)])
+    if readiness.warnings:
+        lines.extend(["", "Warnings", *_format_items(readiness.warnings)])
+    return "\n".join(lines)
+
+
+def _format_object_tag_expected_output(
+    readiness: ObjectTagGenerationReadiness,
+) -> str:
+    state = "present" if readiness.expected_output_dir.exists() else "missing"
+    return f"{_display_path(readiness.expected_output_dir)}\nStatus: {state}"
+
+
+def _format_id_summary(ids: tuple[int, ...]) -> str:
+    if not ids:
+        return "none"
+    if len(ids) <= 12:
+        return ", ".join(str(tag_id) for tag_id in ids)
+    return f"{ids[0]}-{ids[-1]} ({len(ids)} IDs)"
 
 
 def _format_calibration_metadata(readiness: CameraCalibrationReadiness) -> str:
@@ -2272,17 +2907,50 @@ def _calibration_command_ready_message(
     return "Ready to run or copy a calibration command."
 
 
+def _object_tag_command_card_note(
+    readiness: ObjectTagGenerationReadiness,
+    model: StageViewModel,
+) -> str:
+    if not readiness.command_preview:
+        return (
+            "Resolve the object AprilTag readiness messages above before "
+            "generating sheets or copying a posetag-gen-tags command."
+        )
+    if model.status == "complete":
+        return (
+            "Object AprilTag sheets already exist in the checked paths. "
+            "Generate again only if you need a replacement print set."
+        )
+    return (
+        "Generate Object Tags runs the existing posetag-gen-tags workflow; "
+        "Copy Command keeps the terminal fallback with the same arguments."
+    )
+
+
+def _object_tag_command_ready_message(
+    readiness: ObjectTagGenerationReadiness,
+    *,
+    stage_complete: bool = False,
+) -> str:
+    if not readiness.command_preview:
+        return "No runnable object AprilTag command is available yet."
+    if stage_complete:
+        return "Object tag sheets exist. Copy only if you need to regenerate them."
+    return "Ready to generate or copy an object AprilTag command."
+
+
 def _project_root_hint(root: Path) -> str:
     if root.is_dir():
         return (
-            "Project folder found. Status checks are read-only except Stage 1 "
-            "board generation and Stage 2 command preparation."
+            "Project folder found. Status checks are read-only except guided "
+            "Stage 1 board generation, Stage 2 calibration launch, and Stage "
+            "3 object tag generation."
         )
     if root.exists():
         return "Selected path exists but is not a folder."
     return (
-        "Project folder not found. Status checks are read-only; Stage 1 board "
-        "generation can create the selected project layout."
+        "Project folder not found. Status checks are read-only; guided Stage "
+        "1 and Stage 3 generation can create the selected project layout."
     )
 
 
@@ -2414,7 +3082,8 @@ QFrame#ActionCard {
     border-left: 3px solid #087966;
     border-radius: 8px;
 }
-QFrame#CharucoPreviewColumn {
+QFrame#CharucoPreviewColumn,
+QFrame#ObjectTagPreviewColumn {
     background: #f4f8fb;
     border: 1px solid #dce7ef;
     border-radius: 8px;
@@ -2491,6 +3160,13 @@ QLabel#OutputText {
     font-size: 11px;
 }
 QLabel#CharucoPreviewCanvas {
+    color: #5c6b7b;
+    background: #edf4f8;
+    border: 1px solid #d4e0e9;
+    border-radius: 7px;
+    padding: 10px;
+}
+QLabel#ObjectTagPreviewCanvas {
     color: #5c6b7b;
     background: #edf4f8;
     border: 1px solid #d4e0e9;

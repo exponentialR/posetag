@@ -72,6 +72,37 @@ Explicit output override:
 posetag-gen-tags --project_root my_project --tag-size-mm 40 --ids 1-3,7,9-10 --out_dir exported_patterns
 ```
 
+## Guided GUI Stage 3 Flow
+
+The calibration-first `posetag-gui` workflow presents this command as Stage 3:
+Generate Object AprilTags. The guided panel is available after Stage 2 camera
+calibration is complete and delegates generation to the same
+`posetag-gen-tags` package workflow.
+
+Supported guided controls mirror the existing generator:
+
+- AprilTag family: currently `tag36h11`.
+- Physical tag size in millimetres.
+- ID list/ranges such as `1-4` or `1-3,7,9-10`.
+- Start ID plus ID count, converted to the existing `--id_start` /
+  `--id_end` CLI arguments.
+- Paper preset or custom `WxH` millimetre size.
+- Orientation, DPI, prefix, margin fraction, label gap fraction, Pillow text
+  labels, and output folder.
+
+With the default output folder, generated PNG sheets are written under:
+
+```text
+<project_root>/boards/patterns/
+```
+
+The dashboard previews the first generated PNG sheet, shows generated output
+paths, keeps a copyable command preview, and refreshes workflow status after
+generation. If you choose a custom output folder outside
+`<project_root>/boards/patterns/`, the files are still written there, but the
+current project status check looks for PNG sheets in the default project
+folder.
+
 ## Outputs
 
 - PNG output.
