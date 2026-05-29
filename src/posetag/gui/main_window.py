@@ -29,6 +29,19 @@ from posetag.workflows.charuco_setup import (
     dictionary_choices,
     generate_charuco_board_setup,
 )
+from posetag.workflows.calibration_flow import (
+    CALIBRATION_SOURCE_CHOICES,
+    CALIBRATION_SOURCE_LABELS,
+    SOURCE_OPENCV,
+    SOURCE_REALSENSE,
+    SOURCE_VIDEO,
+    CameraCalibrationConfig,
+    CameraCalibrationReadiness,
+    camera_calibration_config_from_project,
+    inspect_camera_calibration_readiness,
+    inspect_charuco_metadata,
+    normalize_source,
+)
 
 
 def build_main_window(qt: Any, project_root: Path) -> Any:
@@ -559,6 +572,230 @@ def build_main_window(qt: Any, project_root: Path) -> Any:
             charuco_layout.addWidget(charuco_note)
             charuco_layout.addLayout(charuco_body)
 
+            self._loaded_calibration_metadata_path: Optional[Path] = None
+            self._loaded_calibration_metadata_mtime: Optional[int] = None
+            self._calibration_card = QtWidgets.QFrame()
+            self._calibration_card.setObjectName("ActionCard")
+            calibration_layout = QtWidgets.QVBoxLayout(self._calibration_card)
+            calibration_layout.setContentsMargins(14, 12, 14, 12)
+            calibration_layout.setSpacing(9)
+
+            calibration_title = QtWidgets.QLabel("Camera calibration guide")
+            calibration_title.setObjectName("CardTitle")
+            calibration_note = QtWidgets.QLabel(
+                "Use the generated ChArUco metadata to prepare a "
+                "posetag-calib-charuco command. Capture and solve still run in "
+                "the existing calibration window."
+            )
+            calibration_note.setObjectName("MutedText")
+            calibration_note.setWordWrap(True)
+
+            self._calibration_source = QtWidgets.QComboBox()
+            for source in CALIBRATION_SOURCE_CHOICES:
+                self._calibration_source.addItem(
+                    CALIBRATION_SOURCE_LABELS[source],
+                    source,
+                )
+            self._calibration_source.setMinimumWidth(180)
+            self._calibration_source.currentIndexChanged.connect(
+                self._calibration_source_changed
+            )
+
+            self._calibration_camera_index = _make_int_spin(0, 99, 0)
+            self._calibration_video_path = QtWidgets.QLineEdit()
+            self._calibration_video_path.setPlaceholderText(
+                "Select calibration video file"
+            )
+            self._calibration_video_path.textChanged.connect(
+                self._update_calibration_flow
+            )
+            calibration_video_browse_button = QtWidgets.QPushButton("Browse")
+            calibration_video_browse_button.clicked.connect(
+                self._browse_calibration_video
+            )
+            self._calibration_video_browse_button = calibration_video_browse_button
+            calibration_video_row = QtWidgets.QHBoxLayout()
+            calibration_video_row.setContentsMargins(0, 0, 0, 0)
+            calibration_video_row.addWidget(self._calibration_video_path, 1)
+            calibration_video_row.addWidget(calibration_video_browse_button)
+            calibration_video_widget = QtWidgets.QWidget()
+            calibration_video_widget.setLayout(calibration_video_row)
+
+            self._calibration_squares_x = _make_int_spin(2, 99, DEFAULT_SQUARES_X)
+            self._calibration_squares_y = _make_int_spin(2, 99, DEFAULT_SQUARES_Y)
+            self._calibration_square_length = _make_float_spin(
+                0.1,
+                1000.0,
+                DEFAULT_SQUARE_LENGTH_MM,
+                " mm",
+            )
+            self._calibration_marker_length = _make_float_spin(
+                0.1,
+                1000.0,
+                DEFAULT_MARKER_LENGTH_MM,
+                " mm",
+            )
+            self._calibration_dictionary = QtWidgets.QComboBox()
+            self._calibration_dictionary.addItems(list(_safe_dictionary_choices()))
+            self._calibration_dictionary.setCurrentText(DEFAULT_DICTIONARY)
+            self._calibration_dictionary.setMinimumWidth(180)
+
+            for field in (
+                self._calibration_camera_index,
+                self._calibration_squares_x,
+                self._calibration_squares_y,
+                self._calibration_square_length,
+                self._calibration_marker_length,
+            ):
+                field.valueChanged.connect(self._update_calibration_flow)
+            self._calibration_dictionary.currentTextChanged.connect(
+                self._update_calibration_flow
+            )
+
+            self._calibration_camera_field = _make_field(
+                "Camera index",
+                self._calibration_camera_index,
+            )
+            self._calibration_video_field = _make_field(
+                "Video path",
+                calibration_video_widget,
+            )
+
+            calibration_grid = QtWidgets.QGridLayout()
+            calibration_grid.setContentsMargins(0, 0, 0, 0)
+            calibration_grid.setHorizontalSpacing(14)
+            calibration_grid.setVerticalSpacing(10)
+            calibration_grid.addWidget(
+                _make_field("Source", self._calibration_source),
+                0,
+                0,
+            )
+            calibration_grid.addWidget(self._calibration_camera_field, 0, 1)
+            calibration_grid.addWidget(self._calibration_video_field, 1, 0, 1, 2)
+            calibration_grid.addWidget(
+                _make_field("Squares X", self._calibration_squares_x),
+                2,
+                0,
+            )
+            calibration_grid.addWidget(
+                _make_field("Squares Y", self._calibration_squares_y),
+                2,
+                1,
+            )
+            calibration_grid.addWidget(
+                _make_field("Square length", self._calibration_square_length),
+                3,
+                0,
+            )
+            calibration_grid.addWidget(
+                _make_field("Marker length", self._calibration_marker_length),
+                3,
+                1,
+            )
+            calibration_grid.addWidget(
+                _make_field("Dictionary", self._calibration_dictionary),
+                4,
+                0,
+                1,
+                2,
+            )
+            calibration_grid.setColumnStretch(0, 1)
+            calibration_grid.setColumnStretch(1, 1)
+
+            self._calibration_metadata = QtWidgets.QLabel(
+                "No ChArUco metadata inspected yet."
+            )
+            self._calibration_metadata.setObjectName("OutputText")
+            self._calibration_metadata.setWordWrap(True)
+            self._calibration_metadata.setTextInteractionFlags(
+                QtCore.Qt.TextInteractionFlag.TextSelectableByMouse
+            )
+            self._calibration_expected_output = QtWidgets.QLabel()
+            self._calibration_expected_output.setObjectName("OutputText")
+            self._calibration_expected_output.setWordWrap(True)
+            self._calibration_expected_output.setTextInteractionFlags(
+                QtCore.Qt.TextInteractionFlag.TextSelectableByMouse
+            )
+            self._calibration_readiness = QtWidgets.QLabel()
+            self._calibration_readiness.setObjectName("OutputText")
+            self._calibration_readiness.setWordWrap(True)
+            self._calibration_readiness.setTextInteractionFlags(
+                QtCore.Qt.TextInteractionFlag.TextSelectableByMouse
+            )
+
+            self._calibration_command_preview = QtWidgets.QLineEdit()
+            self._calibration_command_preview.setObjectName("CommandPreview")
+            self._calibration_command_preview.setReadOnly(True)
+            self._calibration_command_preview.setPlaceholderText(
+                "Resolve readiness messages before copying a calibration command."
+            )
+            self._calibration_copy_button = QtWidgets.QPushButton("Copy Command")
+            self._calibration_copy_button.clicked.connect(
+                self._copy_calibration_command
+            )
+            self._calibration_copy_feedback = QtWidgets.QLabel()
+            self._calibration_copy_feedback.setObjectName("MutedText")
+            self._calibration_copy_feedback.setWordWrap(True)
+            calibration_command_row = QtWidgets.QHBoxLayout()
+            calibration_command_row.setContentsMargins(0, 0, 0, 0)
+            calibration_command_row.addWidget(self._calibration_command_preview, 1)
+            calibration_command_row.addWidget(self._calibration_copy_button)
+            calibration_command_widget = QtWidgets.QWidget()
+            calibration_command_widget.setLayout(calibration_command_row)
+
+            calibration_controls = QtWidgets.QLabel(
+                "Controls: SPACE adds a sample; ENTER solves calibration; "
+                "q quits without writing calibration output."
+            )
+            calibration_controls.setObjectName("GuidanceText")
+            calibration_controls.setWordWrap(True)
+
+            calibration_refresh_button = QtWidgets.QPushButton("Refresh Status")
+            calibration_refresh_button.setObjectName("SecondaryActionButton")
+            calibration_refresh_button.clicked.connect(self._refresh)
+            calibration_action_row = QtWidgets.QHBoxLayout()
+            calibration_action_row.addWidget(calibration_refresh_button)
+            calibration_action_row.addStretch(1)
+
+            calibration_status_grid = QtWidgets.QGridLayout()
+            calibration_status_grid.setContentsMargins(0, 0, 0, 0)
+            calibration_status_grid.setHorizontalSpacing(12)
+            calibration_status_grid.setVerticalSpacing(8)
+            calibration_status_grid.addWidget(
+                _make_field("Metadata", self._calibration_metadata),
+                0,
+                0,
+            )
+            calibration_status_grid.addWidget(
+                _make_field("Expected output", self._calibration_expected_output),
+                0,
+                1,
+            )
+            calibration_status_grid.addWidget(
+                _make_field("Readiness", self._calibration_readiness),
+                1,
+                0,
+                1,
+                2,
+            )
+            calibration_status_grid.addWidget(
+                _make_field("Command preview", calibration_command_widget),
+                2,
+                0,
+                1,
+                2,
+            )
+            calibration_status_grid.setColumnStretch(0, 1)
+            calibration_status_grid.setColumnStretch(1, 1)
+
+            calibration_layout.addWidget(calibration_title)
+            calibration_layout.addWidget(calibration_note)
+            calibration_layout.addLayout(calibration_grid)
+            calibration_layout.addWidget(calibration_controls)
+            calibration_layout.addLayout(calibration_status_grid)
+            calibration_layout.addWidget(self._calibration_copy_feedback)
+            calibration_layout.addLayout(calibration_action_row)
+
             detail_content = QtWidgets.QWidget()
             detail_content_layout = QtWidgets.QVBoxLayout(detail_content)
             detail_content_layout.setContentsMargins(0, 0, 0, 0)
@@ -567,6 +804,7 @@ def build_main_window(qt: Any, project_root: Path) -> Any:
             detail_content_layout.addWidget(self._message_label)
             detail_content_layout.addLayout(cards_grid)
             detail_content_layout.addWidget(self._charuco_card)
+            detail_content_layout.addWidget(self._calibration_card)
             detail_content_layout.addWidget(command_card)
             detail_content_layout.addStretch(1)
 
@@ -656,8 +894,8 @@ def build_main_window(qt: Any, project_root: Path) -> Any:
             self.setCentralWidget(central)
             self.setStyleSheet(_style_sheet())
             self.statusBar().showMessage(
-                "Dashboard can generate ChArUco board files; "
-                "camera workflows are not executed."
+                "Dashboard can generate ChArUco board files and prepare "
+                "camera-calibration commands."
             )
 
             self._refresh()
@@ -700,6 +938,22 @@ def build_main_window(qt: Any, project_root: Path) -> Any:
             )
             if selected:
                 self._charuco_out_dir.setText(selected)
+
+        def _browse_calibration_video(self) -> None:
+            current = self._calibration_video_path.text().strip()
+            start_path = current or str(self._current_project_root())
+            selected, _ = QtWidgets.QFileDialog.getOpenFileName(
+                self,
+                "Select calibration video",
+                start_path,
+                "Video files (*.mp4 *.mov *.avi *.mkv);;All files (*)",
+            )
+            if selected:
+                self._calibration_video_path.setText(selected)
+
+        def _calibration_source_changed(self) -> None:
+            self._render_calibration_source_fields()
+            self._update_calibration_flow()
 
         def _generate_charuco_board(self) -> None:
             self._charuco_generate_button.setEnabled(False)
@@ -867,6 +1121,10 @@ def build_main_window(qt: Any, project_root: Path) -> Any:
                 )
             )
             self._charuco_card.setVisible(model.stage_id == 1)
+            self._calibration_card.setVisible(model.stage_id == 2)
+            if model.stage_id == 2:
+                self._sync_calibration_from_project_metadata()
+                self._update_calibration_flow()
             self._render_stage_rail_selection()
 
         def _render_health(self) -> None:
@@ -919,6 +1177,7 @@ def build_main_window(qt: Any, project_root: Path) -> Any:
             self._copy_button.setEnabled(False)
             self._copy_feedback.setText(_command_ready_message(""))
             self._charuco_card.setVisible(False)
+            self._calibration_card.setVisible(False)
             self._render_health()
 
         def _render_stage_rail_selection(self) -> None:
@@ -950,6 +1209,152 @@ def build_main_window(qt: Any, project_root: Path) -> Any:
             self._project_title.setText(f"Project: {title}")
             self._root_status_label.setText(_project_root_hint(root))
             self._open_folder_button.setEnabled(root.is_dir())
+
+        def _sync_calibration_from_project_metadata(self) -> None:
+            metadata_state = inspect_charuco_metadata(self._current_project_root())
+            selected = metadata_state.selected_path
+            mtime = _path_mtime_ns(selected)
+            if (
+                selected == self._loaded_calibration_metadata_path
+                and mtime == self._loaded_calibration_metadata_mtime
+            ):
+                return
+
+            if metadata_state.metadata is None:
+                self._loaded_calibration_metadata_path = selected
+                self._loaded_calibration_metadata_mtime = mtime
+                return
+
+            config = camera_calibration_config_from_project(
+                self._current_project_root(),
+                source=self._calibration_source_value(),
+                camera_index=int(self._calibration_camera_index.value()),
+                video_path=self._calibration_video_path.text().strip() or None,
+            )
+            self._apply_calibration_config(config)
+            self._loaded_calibration_metadata_path = selected
+            self._loaded_calibration_metadata_mtime = mtime
+
+        def _apply_calibration_config(
+            self,
+            config: CameraCalibrationConfig,
+        ) -> None:
+            fields = (
+                self._calibration_squares_x,
+                self._calibration_squares_y,
+                self._calibration_square_length,
+                self._calibration_marker_length,
+                self._calibration_dictionary,
+            )
+            for field in fields:
+                field.blockSignals(True)
+            try:
+                self._calibration_squares_x.setValue(int(config.squares_x))
+                self._calibration_squares_y.setValue(int(config.squares_y))
+                self._calibration_square_length.setValue(
+                    float(config.square_length_mm)
+                )
+                self._calibration_marker_length.setValue(
+                    float(config.marker_length_mm)
+                )
+                dictionary_name = str(config.dictionary_name)
+                if self._calibration_dictionary.findText(dictionary_name) < 0:
+                    self._calibration_dictionary.addItem(dictionary_name)
+                self._calibration_dictionary.setCurrentText(dictionary_name)
+            finally:
+                for field in fields:
+                    field.blockSignals(False)
+
+        def _update_calibration_flow(self) -> None:
+            if not hasattr(self, "_calibration_readiness"):
+                return
+            self._render_calibration_source_fields()
+            readiness = inspect_camera_calibration_readiness(
+                self._calibration_config()
+            )
+            self._calibration_metadata.setText(
+                _format_calibration_metadata(readiness)
+            )
+            self._calibration_expected_output.setText(
+                _format_calibration_expected_output(readiness)
+            )
+            self._calibration_readiness.setText(
+                _format_calibration_readiness(readiness)
+            )
+
+            model = self._model_by_stage_id(self._selected_stage_id)
+            stage_complete = bool(model and model.stage_id == 2 and model.status == "complete")
+            self._calibration_command_preview.setText(readiness.command_preview)
+            self._calibration_command_preview.setCursorPosition(0)
+            self._calibration_copy_button.setEnabled(bool(readiness.command_preview))
+            self._calibration_copy_feedback.setText(
+                _calibration_command_ready_message(
+                    readiness,
+                    stage_complete=stage_complete,
+                )
+            )
+
+            if model is None or model.stage_id != 2:
+                return
+
+            self._command_preview.setText(readiness.command_preview)
+            self._command_preview.setCursorPosition(0)
+            self._copy_button.setEnabled(bool(readiness.command_preview))
+            self._command_note.setText(
+                _calibration_command_card_note(readiness, model)
+            )
+            self._copy_feedback.setText(
+                _calibration_command_ready_message(
+                    readiness,
+                    stage_complete=model.status == "complete",
+                )
+            )
+
+        def _copy_calibration_command(self) -> None:
+            command = self._calibration_command_preview.text()
+            if command:
+                QtWidgets.QApplication.clipboard().setText(command)
+            model = self._model_by_stage_id(self._selected_stage_id)
+            message = _copy_confirmation_message(
+                command,
+                stage_complete=bool(
+                    model and model.stage_id == 2 and model.status == "complete"
+                ),
+            )
+            self._calibration_copy_feedback.setText(message)
+            self.statusBar().showMessage(message, 3000)
+
+        def _render_calibration_source_fields(self) -> None:
+            source = self._calibration_source_value()
+            is_webcam = source == SOURCE_OPENCV
+            is_video = source == SOURCE_VIDEO
+            self._calibration_camera_field.setVisible(is_webcam)
+            self._calibration_video_field.setVisible(is_video)
+            self._calibration_video_path.setEnabled(is_video)
+            self._calibration_video_browse_button.setEnabled(is_video)
+
+        def _calibration_config(self) -> CameraCalibrationConfig:
+            return CameraCalibrationConfig(
+                project_root=self._current_project_root(),
+                source=self._calibration_source_value(),
+                camera_index=int(self._calibration_camera_index.value()),
+                video_path=self._calibration_video_path.text().strip() or None,
+                squares_x=int(self._calibration_squares_x.value()),
+                squares_y=int(self._calibration_squares_y.value()),
+                square_length_mm=float(self._calibration_square_length.value()),
+                marker_length_mm=float(self._calibration_marker_length.value()),
+                dictionary_name=self._calibration_dictionary.currentText(),
+            )
+
+        def _calibration_source_value(self) -> str:
+            data = self._calibration_source.currentData()
+            raw = str(
+                data if data is not None else self._calibration_source.currentText()
+            )
+            try:
+                return normalize_source(raw)
+            except Exception:
+                return SOURCE_OPENCV
 
         def _model_by_stage_id(self, stage_id: int) -> Optional[StageViewModel]:
             for model in self._models:
@@ -1102,6 +1507,45 @@ def _format_charuco_outputs(result: Any) -> str:
     return "\n".join(lines)
 
 
+def _format_calibration_metadata(readiness: CameraCalibrationReadiness) -> str:
+    metadata = readiness.metadata
+    if metadata is None:
+        if readiness.metadata_path is None:
+            return "Missing: <project_root>/calib/boards/charuco_*.yaml"
+        return (
+            f"Found: {_display_path(readiness.metadata_path)}\n"
+            "Could not autofill board parameters from this metadata."
+        )
+
+    return "\n".join(
+        [
+            f"Using: {_display_path(metadata.path)}",
+            f"Board: {metadata.squares_x} x {metadata.squares_y}",
+            f"Square: {metadata.square_length_mm:g} mm",
+            f"Marker: {metadata.marker_length_mm:g} mm",
+            f"Dictionary: {metadata.dictionary_name}",
+        ]
+    )
+
+
+def _format_calibration_expected_output(
+    readiness: CameraCalibrationReadiness,
+) -> str:
+    state = "present" if readiness.output_exists else "missing"
+    return f"{_display_path(readiness.expected_output)}\nStatus: {state}"
+
+
+def _format_calibration_readiness(
+    readiness: CameraCalibrationReadiness,
+) -> str:
+    lines = ["Ready to run." if readiness.ready else "Not ready yet."]
+    if readiness.errors:
+        lines.extend(["", "Errors", *_format_items(readiness.errors)])
+    if readiness.warnings:
+        lines.extend(["", "Warnings", *_format_items(readiness.warnings)])
+    return "\n".join(lines)
+
+
 def _display_path(path: Path) -> str:
     home = Path.home()
     try:
@@ -1195,11 +1639,43 @@ def _copy_confirmation_message(command: str, *, stage_complete: bool = False) ->
     return "No command preview is available for this stage."
 
 
+def _calibration_command_card_note(
+    readiness: CameraCalibrationReadiness,
+    model: StageViewModel,
+) -> str:
+    if not readiness.command_preview:
+        return (
+            "Resolve the calibration readiness messages above before copying a "
+            "posetag-calib-charuco command."
+        )
+    if model.status == "complete":
+        return (
+            "Calibration output already exists. Copy this command only if you "
+            "need to rerun the existing posetag-calib-charuco workflow."
+        )
+    return (
+        "Copy the preview into a terminal. The command opens the existing "
+        "calibration window; SPACE adds samples, ENTER solves, and q quits."
+    )
+
+
+def _calibration_command_ready_message(
+    readiness: CameraCalibrationReadiness,
+    *,
+    stage_complete: bool = False,
+) -> str:
+    if not readiness.command_preview:
+        return "No runnable calibration command is available yet."
+    if stage_complete:
+        return "Calibration output exists. Copy only if you need to rerun it."
+    return "Ready to copy a calibration command."
+
+
 def _project_root_hint(root: Path) -> str:
     if root.is_dir():
         return (
             "Project folder found. Status checks are read-only except Stage 1 "
-            "board generation."
+            "board generation and Stage 2 command preparation."
         )
     if root.exists():
         return "Selected path exists but is not a folder."
@@ -1207,6 +1683,15 @@ def _project_root_hint(root: Path) -> str:
         "Project folder not found. Status checks are read-only; Stage 1 board "
         "generation can create the selected project layout."
     )
+
+
+def _path_mtime_ns(path: Optional[Path]) -> Optional[int]:
+    if path is None:
+        return None
+    try:
+        return path.stat().st_mtime_ns
+    except OSError:
+        return None
 
 
 def _pill_style(foreground: str, background: str, border: str) -> str:

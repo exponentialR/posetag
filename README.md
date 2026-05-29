@@ -111,9 +111,13 @@ command previews. The GUI order is project setup, ChArUco board generation,
 camera calibration, object AprilTag generation, board definitions, face-shot
 capture, annotation, dataset collection, and review/export. In Stage 1 it can
 generate the ChArUco board PNG, PDF, and metadata YAML using the same package
-helper as `posetag-gen-charuco`. It can open selected folders in the system
-file manager, but it does not launch camera capture, calibration solving,
-board-building, annotation, or dataset workflows.
+helper as `posetag-gen-charuco`. In Stage 2 it reads the generated ChArUco
+metadata, autofills the calibration board parameters, lets you choose webcam,
+RealSense, or video source settings, and prepares a copyable
+`posetag-calib-charuco` command with the expected
+`<project_root>/calib/calib_color.yaml` output path. It can open selected
+folders in the system file manager, but it does not reimplement camera
+capture, calibration solving, board-building, annotation, or dataset workflows.
 
 ## Scientific Contract
 
@@ -216,6 +220,11 @@ printed square edge with a ruler before calibration.
 
 The optional `posetag-gui` dashboard provides the same ChArUco board setup from
 the Stage 1 ChArUco panel and refreshes project status after writing the files.
+The Stage 2 calibration panel then reads the generated metadata, autofills the
+matching board arguments, lets you choose webcam/OpenCV, RealSense, or video
+source settings, shows the `SPACE` / `ENTER` / `q` controls, and prepares a
+copyable `posetag-calib-charuco` command. Refresh the dashboard after
+`calib/calib_color.yaml` appears to update workflow status.
 
 Then calibrate with the same board parameters. Press `SPACE` to capture a
 sample and `ENTER` to solve. The calibration command outputs

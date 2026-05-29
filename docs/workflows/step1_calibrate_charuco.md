@@ -82,10 +82,15 @@ Use `--out_dir <path>` to write the PNG/PDF/YAML somewhere other than
 `--paper-mm WxH`, for example `--paper-mm 210x297`.
 
 The optional `posetag-gui` dashboard exposes this setup as the guided Stage 1
-ChArUco board panel, before the Stage 2 camera-calibration command preview. It
-calls the same package generator as `posetag-gen-charuco`, displays the
-generated PNG/YAML/PDF paths, and refreshes workflow status. It does not start
-camera capture or run `posetag-calib-charuco`.
+ChArUco board panel, then uses the generated metadata in Stage 2 to guide
+camera calibration. The Stage 2 panel autofills `--squares-x`, `--squares-y`,
+`--square-length-mm`, `--marker-length-mm`, and `--dict`, lets you choose
+webcam/OpenCV, RealSense, or video source settings, shows the expected
+`<project_root>/calib/calib_color.yaml` output, and prepares a copyable
+`posetag-calib-charuco` command. It also reports missing metadata, missing
+video path, unavailable RealSense dependency, and missing calibration output
+states. It does not start camera capture, detect ChArUco corners, solve
+calibration, or write calibration YAML itself.
 
 ## Command Examples
 
