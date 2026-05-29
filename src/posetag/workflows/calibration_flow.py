@@ -18,6 +18,7 @@ import yaml
 
 from posetag.pipelines.charuco_calibration import (
     CharucoCalibrationError,
+    get_dictionary,
     validate_capture_args,
 )
 from posetag.workflows.charuco_setup import (
@@ -293,6 +294,7 @@ def inspect_camera_calibration_readiness(
         )
     except CharucoCalibrationError as exc:
         errors.append(str(exc))
+    errors.extend(_camera_calibration_board_errors(config))
 
     command_preview = ""
     if not errors:
@@ -323,6 +325,7 @@ def build_camera_calibration_command(config: CameraCalibrationConfig) -> str:
         raise CameraCalibrationFlowError(
             "--video path is required when --source=video"
         )
+    _validate_camera_calibration_board(config)
 
     parts: list[str] = [
         "posetag-calib-charuco",
@@ -408,6 +411,85 @@ def _video_arg(video_path: Optional[Union[Path, str]]) -> Optional[str]:
     if not text:
         return None
     return str(Path(text).expanduser())
+
+
+def _validate_camera_calibration_board(config: CameraCalibrationConfig) -> None:
+    errors = _camera_calibration_board_errors(config)
+    if errors:
+        raise CameraCalibrationFlowError(" ".join(errors))
+
+
+def _camera_calibration_board_errors(
+    config: CameraCalibrationConfig,
+) -> list[str]:
+    errors: list[str] = []
+    squares_x = _coerce_int(config.squares_x, "--squares-x", errors)
+    squares_y = _coerce_int(config.squares_y, "--squares-y", errors)
+    square_length_mm = _coerce_float(
+        config.square_length_mm,
+        "--square-length-mm",
+        errors,
+    )
+    marker_length_mm = _coerce_float(
+        config.marker_length_mm,
+        "--marker-length-mm",
+        errors,
+    )
+    dictionary_name = str(config.dictionary_name).strip()
+
+    if squares_x is not None and squares_x < 2:
+        errors.append("--squares-x must be at least 2.")
+    if squares_y is not None and squares_y < 2:
+        errors.append("--squares-y must be at least 2.")
+    if square_length_mm is not None and square_length_mm <= 0:
+        errors.append("--square-length-mm must be a positive millimetre value.")
+    if marker_length_mm is not None and marker_length_mm <= 0:
+        errors.append("--marker-length-mm must be a positive millimetre value.")
+    if (
+        square_length_mm is not None
+        and marker_length_mm is not None
+        and marker_length_mm >= square_length_mm
+    ):
+        errors.append("--marker-length-mm must be smaller than --square-length-mm.")
+    if not dictionary_name:
+        errors.append("--dict must be a non-empty ArUco dictionary name.")
+    else:
+        try:
+            get_dictionary(dictionary_name)
+        except CharucoCalibrationError as exc:
+            errors.append(str(exc))
+
+    return errors
+
+
+def _coerce_int(value: Any, label: str, errors: list[str]) -> Optional[int]:
+    if isinstance(value, bool):
+        errors.append(f"{label} must be an integer.")
+        return None
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        errors.append(f"{label} must be an integer.")
+        return None
+    if isinstance(value, float) and not value.is_integer():
+        errors.append(f"{label} must be an integer.")
+        return None
+    return parsed
+
+
+def _coerce_float(value: Any, label: str, errors: list[str]) -> Optional[float]:
+    if isinstance(value, bool):
+        errors.append(f"{label} must be numeric.")
+        return None
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        errors.append(f"{label} must be numeric.")
+        return None
+    if not math.isfinite(parsed):
+        errors.append(f"{label} must be finite.")
+        return None
+    return parsed
 
 
 def _require_int(

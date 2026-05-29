@@ -103,6 +103,25 @@ class WorkflowCalibrationFlowTests(unittest.TestCase):
         self.assertNotIn("--cam", command)
         self.assertNotIn("--video", command)
 
+    def test_command_construction_rejects_invalid_board_lengths(self) -> None:
+        with self.assertRaisesRegex(ValueError, "marker-length-mm"):
+            build_camera_calibration_command(
+                CameraCalibrationConfig(
+                    project_root="project",
+                    square_length_mm=10.0,
+                    marker_length_mm=20.0,
+                )
+            )
+
+    def test_command_construction_rejects_unsupported_dictionary(self) -> None:
+        with self.assertRaisesRegex(ValueError, "Unsupported ArUco dictionary"):
+            build_camera_calibration_command(
+                CameraCalibrationConfig(
+                    project_root="project",
+                    dictionary_name="NOT_A_DICT",
+                )
+            )
+
     def test_readiness_reports_missing_metadata_before_command(self) -> None:
         with TemporaryDirectory() as tmpdir:
             project_root = Path(tmpdir) / "project"
@@ -134,6 +153,45 @@ class WorkflowCalibrationFlowTests(unittest.TestCase):
         self.assertIn("--squares-x 3 --squares-y 5", result.command_preview)
         self.assertFalse(result.output_exists)
         self.assertIn(result.expected_output, result.checked_paths)
+
+    def test_readiness_rejects_edited_invalid_board_lengths(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            project_root = Path(tmpdir) / "project"
+            _write_metadata(project_root)
+
+            result = inspect_camera_calibration_readiness(
+                CameraCalibrationConfig(
+                    project_root=project_root,
+                    square_length_mm=10.0,
+                    marker_length_mm=20.0,
+                ),
+                realsense_available=True,
+            )
+
+        self.assertFalse(result.ready)
+        self.assertEqual(result.command_preview, "")
+        self.assertTrue(
+            any("marker-length-mm" in error for error in result.errors)
+        )
+
+    def test_readiness_rejects_edited_unsupported_dictionary(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            project_root = Path(tmpdir) / "project"
+            _write_metadata(project_root)
+
+            result = inspect_camera_calibration_readiness(
+                CameraCalibrationConfig(
+                    project_root=project_root,
+                    dictionary_name="NOT_A_DICT",
+                ),
+                realsense_available=True,
+            )
+
+        self.assertFalse(result.ready)
+        self.assertEqual(result.command_preview, "")
+        self.assertTrue(
+            any("Unsupported ArUco dictionary" in error for error in result.errors)
+        )
 
     def test_readiness_rejects_video_without_path(self) -> None:
         with TemporaryDirectory() as tmpdir:
