@@ -17,7 +17,6 @@ utils.project_config.resolve_project_root (env/config/home logic).
 """
 
 import argparse, sys, numpy as np, cv2, datetime
-from math import atan2, degrees
 from pathlib import Path
 from typing import Tuple
 
@@ -29,44 +28,22 @@ except Exception:
 
 from posetag.pipelines.make_board import (
     MakeBoardError,
-    build_board_yaml,
+    annotate_detections,
+    board_entries_from_detections,
+    create_apriltag_detector,
+    detect_frame_tags,
+    load_detector_class,
     load_calibration_yaml,
-    load_registry,
     prepare_project_paths,
     preview_project_root,
     resolve_calibration_path,
-    save_registry,
-    update_registry_entries,
+    save_board_definition,
     validate_source_args,
-    write_board_yaml,
 )
 
 
-def se3(R, t):
-    T = np.eye(4, dtype=float)
-    T[:3, :3] = R
-    T[:3, 3] = t.reshape(3)
-    return T
-
-
-def inv_se3(T):
-    R = T[:3, :3]
-    t = T[:3, 3]
-    Ti = np.eye(4)
-    Ti[:3, :3] = R.T
-    Ti[:3, 3] = -R.T @ t
-    return Ti
-
-
 def _load_detector_class():
-    try:
-        from pupil_apriltags import Detector
-    except Exception as exc:
-        raise MakeBoardError(
-            "pupil-apriltags is not available; install PoseTag with the 'apriltags' "
-            "extra or run `python -m pip install pupil-apriltags`."
-        ) from exc
-    return Detector
+    return load_detector_class()
 
 
 # --------- CLI ---------
@@ -206,15 +183,11 @@ def main(argv=None):
     except MakeBoardError as exc:
         raise SystemExit(str(exc)) from exc
 
-    fx, fy, cx, cy = calib.camera_params
-
     tag_size_m = args.tag_size_mm / 1000.0
     try:
-        det = Detector(families=args.family, nthreads=4, quad_decimate=1.0, refine_edges=True)
-    except Exception as exc:
-        raise SystemExit(
-            f"Could not initialize AprilTag detector for family '{args.family}': {exc}"
-        ) from exc
+        det = create_apriltag_detector(args.family, detector_class=Detector)
+    except MakeBoardError as exc:
+        raise SystemExit(str(exc)) from exc
 
     read_frame, stop = _open_source(args)
     try:
@@ -249,15 +222,9 @@ def main(argv=None):
                     print("[i] video ended before a board frame was captured; exiting without writing board YAML.")
                     return 0
                 continue
-            g = cv2.cvtColor(c, cv2.COLOR_BGR2GRAY)
-
             # Draw IDs for situational awareness
-            dd = det.detect(g, estimate_tag_pose=False)
-            vis = c.copy()
-            for d in dd:
-                pts = d.corners.astype(int)
-                cv2.polylines(vis, [pts], True, (0, 255, 0), 2)
-                cv2.putText(vis, str(int(d.tag_id)), tuple(pts[0]), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
+            dd = detect_frame_tags(c, det, estimate_pose=False)
+            vis = annotate_detections(c, dd)
 
             cv2.imshow("Select a view (ENTER to use)", vis)
             k = cv2.waitKey(1) & 0xFF
@@ -266,9 +233,12 @@ def main(argv=None):
                 return 0
             if k in (10, 13):  # ENTER
                 frame = c.copy()
-                g2 = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-                dets = det.detect(
-                    g2, estimate_tag_pose=True, camera_params=(fx, fy, cx, cy), tag_size=tag_size_m
+                dets = detect_frame_tags(
+                    frame,
+                    det,
+                    calibration=calib,
+                    tag_size_m=tag_size_m,
+                    estimate_pose=True,
                 )
                 if len(dets) == 0:
                     print("[!] No tags detected in captured frame; try again.")
@@ -280,11 +250,7 @@ def main(argv=None):
                     raw_path = f"{base}_raw.png"
                     ann_path = f"{base}_ann.png"
                     cv2.imwrite(raw_path, frame)
-                    ann = frame.copy()
-                    for d in dets:
-                        pts = d.corners.astype(int)
-                        cv2.polylines(ann, [pts], True, (0, 255, 0), 2)
-                        cv2.putText(ann, str(int(d.tag_id)), tuple(pts[0]), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
+                    ann = annotate_detections(frame, dets)
                     cv2.imwrite(ann_path, ann)
                     print(f"[i] Saved shot: {raw_path} and {ann_path}")
                 break
@@ -312,53 +278,46 @@ def main(argv=None):
         print("[!] Origin must be one of the selected IDs.")
         return
 
-    # ---- Build SE(3) per tag and express in origin frame ----
-    det_map = {int(d.tag_id): d for d in dets}
-    T_cam = {}
-    for tid in sel_ids:
-        d = det_map.get(tid, None)
-        if d is None or d.pose_R is None or d.pose_t is None:
-            print(f"[!] Missing pose for id {tid}.")
-            return
-        T_cam[tid] = se3(d.pose_R.astype(float), d.pose_t.reshape(3).astype(float))
+    try:
+        layout = board_entries_from_detections(
+            dets,
+            sel_ids,
+            origin_id,
+            z_threshold_m=args.z_thresh,
+        )
+    except MakeBoardError as exc:
+        print(f"[!] {exc}")
+        return
 
-    T_org_cam = inv_se3(T_cam[origin_id])
-    entries = []
-    nonplanar = False
-    for tid in sel_ids:
-        T_org_tag = T_org_cam @ T_cam[tid]
-        t = T_org_tag[:3, 3]
-        R = T_org_tag[:3, :3]
-        yaw = degrees(atan2(R[1, 0], R[0, 0]))  # in-plane yaw around +z
-        if abs(t[2]) > args.z_thresh:
-            print(f"[!] Tag {tid} z offset {t[2]:.3f} m exceeds {args.z_thresh} m.")
-            nonplanar = True
-        entries.append(dict(id=int(tid), cx=float(t[0]), cy=float(t[1]), yaw_deg=float(yaw)))
-
-    if nonplanar and not args.allow_nonplanar:
+    for nonplanar_tag in layout.nonplanar_tags:
+        print(
+            f"[!] Tag {nonplanar_tag.tag_id} z offset "
+            f"{nonplanar_tag.z_offset_m:.3f} m exceeds "
+            f"{nonplanar_tag.threshold_m} m."
+        )
+    if layout.nonplanar_tags and not args.allow_nonplanar:
         print("[!] Re-capture with a flatter view / re-mount the tags, or use --allow_nonplanar to proceed.")
         return
 
-    entries.sort(key=lambda e: e["id"])
+    entries = tuple(layout.entries)
 
     # ---- Write board YAML ----
-    out_path = paths.board_yaml_path
-    board = build_board_yaml(
+    saved = save_board_definition(
+        paths,
         object_name=args.object_name,
         family=args.family,
         tag_size_mm=args.tag_size_mm,
         origin_id=origin_id,
         entries=entries,
     )
-    write_board_yaml(out_path, board)
+    out_path = saved.board_yaml_path
     print(f"[i] Wrote {out_path}")
     print("[i] Example entries:")
     for e in entries:
         print(f"    - {{id: {e['id']}, cx: {e['cx']:.3f}, cy: {e['cy']:.3f}, yaw_deg: {e['yaw_deg']:.1f}}}")
 
     # ---- Update registry ----
-    reg = load_registry(registry_path)
-    registry_update = update_registry_entries(reg, board["tags"], args.object_name, out_path)
+    registry_update = saved.registry_update
 
     if registry_update.conflicts:
         print("[!] Registry conflicts:")
@@ -366,7 +325,6 @@ def main(argv=None):
             print(f"    tag {conflict.tag_id}: {conflict.existing_yaml}  ->  {conflict.requested_yaml}")
         # By design we *don't* overwrite automatically here. Edit or delete the old mapping if intended.
 
-    save_registry(registry_path, reg)
     print(f"[i] Registry updated ({registry_update.updated} entries) at {registry_path}")
 
 

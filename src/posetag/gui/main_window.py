@@ -56,6 +56,54 @@ from posetag.workflows.calibration_flow import (
     read_camera_calibration_yaml_text,
     summarize_camera_calibration_process_result,
 )
+from posetag.workflows.board_building import (
+    BOARD_BUILDING_GUIDANCE,
+    BOARD_NATIVE_CAPTURE_GUIDANCE,
+    BOARD_PROCESS_NOT_STARTED,
+    BOARD_SOURCE_CHOICES,
+    BOARD_SOURCE_LABELS,
+    DEFAULT_CAMERA_INDEX as DEFAULT_BOARD_CAMERA_INDEX,
+    DEFAULT_FAMILY as DEFAULT_BOARD_FAMILY,
+    DEFAULT_FPS as DEFAULT_BOARD_FPS,
+    DEFAULT_HEIGHT as DEFAULT_BOARD_HEIGHT,
+    DEFAULT_OBJECT_LABEL as DEFAULT_BOARD_OBJECT_LABEL,
+    DEFAULT_OBJECT_NAME as DEFAULT_BOARD_OBJECT_NAME,
+    DEFAULT_SIDE_LABEL as DEFAULT_BOARD_SIDE_LABEL,
+    DEFAULT_SIDE_LABELS as DEFAULT_BOARD_SIDE_LABELS,
+    DEFAULT_TAG_SIZE_MM as DEFAULT_BOARD_TAG_SIZE_MM,
+    DEFAULT_WIDTH as DEFAULT_BOARD_WIDTH,
+    DEFAULT_Z_THRESHOLD_M as DEFAULT_BOARD_Z_THRESHOLD_M,
+    SOURCE_OPENCV as BOARD_SOURCE_OPENCV,
+    SOURCE_REALSENSE as BOARD_SOURCE_REALSENSE,
+    SOURCE_VIDEO as BOARD_SOURCE_VIDEO,
+    BoardBuildingConfig,
+    BoardBuildingProcessState,
+    BoardBuildingReadiness,
+    BoardBatchItem,
+    BoardBatchRow,
+    BoardBatchDraft,
+    NativeBoardCaptureObservation,
+    NativeBoardCaptureResult,
+    NativeBoardCaptureSession,
+    board_building_process_failed,
+    board_building_process_not_started,
+    board_building_process_running,
+    build_board_batch_items,
+    build_board_building_launch,
+    compose_board_object_name,
+    default_boards_dir,
+    default_board_batch_draft_path,
+    default_calibration_path,
+    delete_board_batch_draft,
+    inspect_board_building,
+    infer_latest_object_tag_size_mm,
+    load_board_batch_draft,
+    next_default_side_label,
+    normalize_source as normalize_board_source,
+    parse_board_batch_rows,
+    save_board_batch_draft,
+    summarize_board_building_process_result,
+)
 from posetag.workflows.object_tags import (
     DEFAULT_DPI as DEFAULT_OBJECT_TAG_DPI,
     DEFAULT_FAMILY as DEFAULT_OBJECT_TAG_FAMILY,
@@ -163,6 +211,24 @@ def build_main_window(qt: Any, project_root: Path) -> Any:
         layout.addWidget(field)
         return wrapper
 
+    def _make_collapsible_group(
+        title: str,
+        content: Any,
+        *,
+        checked: bool = False,
+    ) -> Any:
+        group = QtWidgets.QGroupBox(title)
+        group.setObjectName("CollapsibleGroup")
+        group.setCheckable(True)
+        group.setChecked(checked)
+        layout = QtWidgets.QVBoxLayout(group)
+        layout.setContentsMargins(10, 8, 10, 10)
+        layout.setSpacing(8)
+        layout.addWidget(content)
+        content.setVisible(checked)
+        group.toggled.connect(content.setVisible)
+        return group
+
     def _safe_dictionary_choices() -> tuple[str, ...]:
         try:
             names = dictionary_choices()
@@ -246,6 +312,15 @@ def build_main_window(qt: Any, project_root: Path) -> Any:
             self._refresh_pixmap()
             return True
 
+        def show_pixmap(self, pixmap: Any) -> bool:
+            if pixmap is None or pixmap.isNull():
+                self.clear_preview("Preview unavailable.")
+                return False
+            self._source_pixmap = pixmap
+            self.setText("")
+            self._refresh_pixmap()
+            return True
+
         def resizeEvent(self, event: Any) -> None:
             super().resizeEvent(event)
             self._refresh_pixmap()
@@ -263,6 +338,747 @@ def build_main_window(qt: Any, project_root: Path) -> Any:
             )
             self.setPixmap(scaled)
 
+    def _pixmap_from_bgr_frame(frame: Any) -> Any:
+        if frame is None:
+            return QtGui.QPixmap()
+        if len(frame.shape) != 3 or frame.shape[2] < 3:
+            return QtGui.QPixmap()
+        rgb = frame[:, :, :3][:, :, ::-1].copy()
+        height, width, channels = rgb.shape
+        try:
+            image_format = QtGui.QImage.Format.Format_RGB888
+        except AttributeError:  # pragma: no cover - Qt compatibility
+            image_format = QtGui.QImage.Format_RGB888
+        image = QtGui.QImage(
+            rgb.data,
+            width,
+            height,
+            channels * width,
+            image_format,
+        ).copy()
+        return QtGui.QPixmap.fromImage(image)
+
+    class _NativeBoardCaptureDialog(QtWidgets.QDialog):
+        def __init__(self, parent: Any, config: BoardBuildingConfig) -> None:
+            super().__init__(parent)
+            self.setWindowTitle("Guided Board Capture")
+            self.setModal(True)
+            self.resize(980, 720)
+            self._config = config
+            self._session: Optional[NativeBoardCaptureSession] = None
+            self._last_observation: Optional[NativeBoardCaptureObservation] = None
+            self.result_payload: Optional[NativeBoardCaptureResult] = None
+
+            self._timer = QtCore.QTimer(self)
+            self._timer.setInterval(80)
+            self._timer.timeout.connect(self._poll_frame)
+
+            self._preview = _ImagePreviewCanvas(
+                "Starting camera...",
+                object_name="NativeBoardCapturePreview",
+            )
+            self._preview.setMinimumSize(540, 380)
+            self._preview.setMaximumHeight(520)
+
+            title = QtWidgets.QLabel("Guided object board capture")
+            title.setObjectName("CardTitle")
+            note = QtWidgets.QLabel(BOARD_NATIVE_CAPTURE_GUIDANCE)
+            note.setObjectName("MutedText")
+            note.setWordWrap(True)
+
+            self._guidance = QtWidgets.QLabel("Starting detector...")
+            self._guidance.setObjectName("GuidanceText")
+            self._guidance.setWordWrap(True)
+
+            self._ids = QtWidgets.QListWidget()
+            self._ids.setMinimumHeight(130)
+            self._origin = QtWidgets.QComboBox()
+            self._auto_capture = QtWidgets.QCheckBox("Auto-capture stable view")
+            self._auto_capture.setChecked(True)
+
+            self._status = QtWidgets.QLabel("No capture yet.")
+            self._status.setObjectName("OutputText")
+            self._status.setWordWrap(True)
+            self._status.setTextInteractionFlags(
+                QtCore.Qt.TextInteractionFlag.TextSelectableByMouse
+            )
+
+            self._capture_button = QtWidgets.QPushButton("Capture Now")
+            self._capture_button.setObjectName("SecondaryActionButton")
+            self._capture_button.clicked.connect(self._capture_now)
+            self._save_button = QtWidgets.QPushButton("Save Board Definition")
+            self._save_button.setObjectName("PrimaryActionButton")
+            self._save_button.setEnabled(False)
+            self._save_button.clicked.connect(self._save_capture)
+            self._restart_button = QtWidgets.QPushButton("Resume Live View")
+            self._restart_button.setObjectName("SecondaryActionButton")
+            self._restart_button.setEnabled(False)
+            self._restart_button.clicked.connect(self._resume_live_view)
+            close_button = QtWidgets.QPushButton("Close")
+            close_button.setObjectName("SecondaryActionButton")
+            close_button.clicked.connect(self.reject)
+
+            controls = QtWidgets.QVBoxLayout()
+            controls.setSpacing(8)
+            controls.addWidget(_make_field("Guidance", self._guidance))
+            controls.addWidget(_make_field("Detected tag IDs", self._ids))
+            controls.addWidget(_make_field("Origin tag", self._origin))
+            controls.addWidget(self._auto_capture)
+            controls.addWidget(_make_field("Capture status", self._status))
+            controls.addStretch(1)
+
+            buttons = QtWidgets.QHBoxLayout()
+            buttons.addWidget(self._capture_button)
+            buttons.addWidget(self._restart_button)
+            buttons.addStretch(1)
+            buttons.addWidget(close_button)
+            buttons.addWidget(self._save_button)
+
+            body = QtWidgets.QHBoxLayout()
+            body.setSpacing(14)
+            body.addWidget(self._preview, 3)
+            controls_widget = QtWidgets.QWidget()
+            controls_widget.setLayout(controls)
+            controls_widget.setMinimumWidth(300)
+            body.addWidget(controls_widget, 2)
+
+            layout = QtWidgets.QVBoxLayout(self)
+            layout.setContentsMargins(16, 14, 16, 14)
+            layout.setSpacing(10)
+            layout.addWidget(title)
+            layout.addWidget(note)
+            layout.addLayout(body, 1)
+            layout.addLayout(buttons)
+
+            self._start_session()
+
+        def _start_session(self) -> None:
+            try:
+                self._session = NativeBoardCaptureSession(self._config)
+            except Exception as exc:
+                self._guidance.setText(f"Could not start guided capture: {exc}")
+                self._status.setText("Guided capture did not start.")
+                self._capture_button.setEnabled(False)
+                return
+            self._timer.start()
+            self._status.setText("Live detection is running.")
+
+        def _poll_frame(self) -> None:
+            if self._session is None:
+                return
+            try:
+                observation = self._session.read_observation()
+            except Exception as exc:
+                self._timer.stop()
+                self._guidance.setText(f"Guided capture failed: {exc}")
+                self._status.setText("Capture stopped before a board was saved.")
+                return
+
+            self._last_observation = observation
+            self._guidance.setText(observation.guidance)
+            if observation.annotated_frame_bgr is not None:
+                self._preview.show_pixmap(
+                    _pixmap_from_bgr_frame(observation.annotated_frame_bgr)
+                )
+            self._update_detected_ids(observation.pose_ready_ids)
+            if observation.source_exhausted:
+                self._timer.stop()
+                self._status.setText("Video ended before auto-capture.")
+                return
+            if (
+                observation.ready_to_capture
+                and self._auto_capture.isChecked()
+                and self._session.captured_observation is None
+            ):
+                self._capture_observation(observation, automatic=True)
+
+        def _update_detected_ids(
+            self,
+            ids: tuple[int, ...],
+            *,
+            force_all_checked: bool = False,
+        ) -> None:
+            checked = _checked_tag_ids_for_update(
+                ids,
+                self._checked_ids(),
+                force_all=force_all_checked,
+            )
+            origin_text = self._origin.currentText()
+            self._ids.clear()
+            self._origin.clear()
+            for tag_id in ids:
+                item = QtWidgets.QListWidgetItem(str(tag_id))
+                item.setFlags(
+                    item.flags() | QtCore.Qt.ItemFlag.ItemIsUserCheckable
+                )
+                item.setCheckState(
+                    QtCore.Qt.CheckState.Checked
+                    if tag_id in checked
+                    else QtCore.Qt.CheckState.Unchecked
+                )
+                self._ids.addItem(item)
+                self._origin.addItem(str(tag_id), tag_id)
+            if origin_text:
+                index = self._origin.findText(origin_text)
+                if index >= 0:
+                    self._origin.setCurrentIndex(index)
+
+        def _checked_ids(self) -> set[int]:
+            selected: set[int] = set()
+            for row in range(self._ids.count()):
+                item = self._ids.item(row)
+                if item.checkState() == QtCore.Qt.CheckState.Checked:
+                    selected.add(int(item.text()))
+            return selected
+
+        def _capture_now(self) -> None:
+            if self._last_observation is None:
+                self._status.setText("No frame has been detected yet.")
+                return
+            self._capture_observation(self._last_observation, automatic=False)
+
+        def _capture_observation(
+            self,
+            observation: NativeBoardCaptureObservation,
+            *,
+            automatic: bool,
+        ) -> None:
+            if self._session is None:
+                return
+            try:
+                captured = self._session.capture_current(observation)
+            except Exception as exc:
+                self._status.setText(f"Could not capture board view: {exc}")
+                return
+            self._timer.stop()
+            self._update_detected_ids(
+                captured.pose_ready_ids,
+                force_all_checked=True,
+            )
+            self._save_button.setEnabled(True)
+            self._restart_button.setEnabled(True)
+            prefix = "Auto-captured" if automatic else "Captured"
+            self._status.setText(
+                f"{prefix} stable board view with IDs "
+                f"{_format_id_summary(captured.pose_ready_ids)}. Confirm IDs "
+                "and choose the origin tag, then save."
+            )
+
+        def _resume_live_view(self) -> None:
+            if self._session is None:
+                return
+            self._session.clear_capture()
+            self._save_button.setEnabled(False)
+            self._restart_button.setEnabled(False)
+            self._status.setText("Live detection resumed.")
+            self._timer.start()
+
+        def _save_capture(self) -> None:
+            if self._session is None:
+                return
+            selected = tuple(sorted(self._checked_ids()))
+            if not selected:
+                self._status.setText("Select at least one detected tag ID.")
+                return
+            origin_data = self._origin.currentData()
+            if origin_data is None:
+                self._status.setText("Choose an origin tag.")
+                return
+            origin_id = int(origin_data)
+            try:
+                self.result_payload = self._session.save_capture(
+                    selected_ids=selected,
+                    origin_id=origin_id,
+                )
+            except Exception as exc:
+                self._status.setText(f"Could not save board definition: {exc}")
+                return
+            self.accept()
+
+        def done(self, result: int) -> None:
+            self._timer.stop()
+            if self._session is not None:
+                self._session.close()
+            super().done(result)
+
+    class _NativeBoardBatchCaptureDialog(QtWidgets.QDialog):
+        def __init__(
+            self,
+            parent: Any,
+            base_config: BoardBuildingConfig,
+            items: tuple[BoardBatchItem, ...],
+        ) -> None:
+            super().__init__(parent)
+            self.setWindowTitle("Batch Guided Board Capture")
+            self.setModal(True)
+            self.resize(1100, 760)
+            self._base_config = base_config
+            self._items = items
+            self._index = 0
+            self._session: Optional[NativeBoardCaptureSession] = None
+            self._last_observation: Optional[NativeBoardCaptureObservation] = None
+            self.saved_results: dict[str, NativeBoardCaptureResult] = {}
+            self.skipped_items: dict[str, BoardBatchItem] = {}
+            self._syncing_queue_selection = False
+
+            self._timer = QtCore.QTimer(self)
+            self._timer.setInterval(80)
+            self._timer.timeout.connect(self._poll_frame)
+
+            title = QtWidgets.QLabel("Batch guided board capture")
+            title.setObjectName("CardTitle")
+            note = QtWidgets.QLabel(
+                "Keep the camera open and present each queued object side. "
+                "PoseTag auto-captures a stable tag view, then you confirm IDs "
+                "and the origin before saving and moving to the next board. "
+                "Revisiting a saved board replaces that same board definition."
+            )
+            note.setObjectName("MutedText")
+            note.setWordWrap(True)
+
+            self._current_item = QtWidgets.QLabel()
+            self._current_item.setObjectName("StageTitle")
+            self._progress = QtWidgets.QLabel()
+            self._progress.setObjectName("MutedText")
+            self._progress.setWordWrap(True)
+
+            self._preview = _ImagePreviewCanvas(
+                "Starting camera...",
+                object_name="NativeBoardBatchPreview",
+            )
+            self._preview.setMinimumSize(540, 380)
+            self._preview.setMaximumHeight(520)
+            self._guidance = QtWidgets.QLabel("Starting detector...")
+            self._guidance.setObjectName("GuidanceText")
+            self._guidance.setWordWrap(True)
+            self._ids = QtWidgets.QListWidget()
+            self._ids.setMinimumHeight(130)
+            self._origin = QtWidgets.QComboBox()
+            self._auto_capture = QtWidgets.QCheckBox("Auto-capture stable view")
+            self._auto_capture.setChecked(True)
+            self._status = QtWidgets.QLabel("No capture yet.")
+            self._status.setObjectName("OutputText")
+            self._status.setWordWrap(True)
+            self._status.setTextInteractionFlags(
+                QtCore.Qt.TextInteractionFlag.TextSelectableByMouse
+            )
+
+            self._queue = QtWidgets.QListWidget()
+            self._queue.setObjectName("BatchCaptureQueue")
+            self._queue.setMinimumWidth(250)
+            self._queue.setMaximumWidth(330)
+            self._queue.setSpacing(3)
+            self._queue.setSelectionMode(
+                QtWidgets.QAbstractItemView.SelectionMode.SingleSelection
+            )
+            for index, item in enumerate(items, start=1):
+                tag_size = _format_batch_item_tag_size(item, base_config)
+                queue_item = QtWidgets.QListWidgetItem(
+                    f"{index}. {item.object_name} ({tag_size} mm)"
+                )
+                queue_item.setToolTip(f"{item.object_name} | tag size {tag_size} mm")
+                self._queue.addItem(queue_item)
+            self._queue.currentRowChanged.connect(self._select_queue_row)
+
+            self._capture_button = QtWidgets.QPushButton("Capture Now")
+            self._capture_button.setObjectName("SecondaryActionButton")
+            self._capture_button.clicked.connect(self._capture_now)
+            self._resume_button = QtWidgets.QPushButton("Resume Live View")
+            self._resume_button.setObjectName("SecondaryActionButton")
+            self._resume_button.setEnabled(False)
+            self._resume_button.clicked.connect(self._resume_live_view)
+            self._skip_button = QtWidgets.QPushButton("Skip")
+            self._skip_button.setObjectName("SecondaryActionButton")
+            self._skip_button.clicked.connect(self._skip_current)
+            self._previous_button = QtWidgets.QPushButton("Previous")
+            self._previous_button.setObjectName("SecondaryActionButton")
+            self._previous_button.clicked.connect(self._previous_item)
+            self._save_next_button = QtWidgets.QPushButton("Save & Next")
+            self._save_next_button.setObjectName("PrimaryActionButton")
+            self._save_next_button.setEnabled(False)
+            self._save_next_button.clicked.connect(self._save_current)
+            finish_button = QtWidgets.QPushButton("Finish Batch")
+            finish_button.setObjectName("SecondaryActionButton")
+            finish_button.clicked.connect(self.accept)
+
+            controls = QtWidgets.QVBoxLayout()
+            controls.setSpacing(8)
+            controls.addWidget(_make_field("Guidance", self._guidance))
+            controls.addWidget(_make_field("Detected tag IDs", self._ids))
+            controls.addWidget(_make_field("Origin tag", self._origin))
+            controls.addWidget(self._auto_capture)
+            controls.addWidget(_make_field("Capture status", self._status))
+            controls.addStretch(1)
+
+            body = QtWidgets.QHBoxLayout()
+            body.setSpacing(14)
+            body.addWidget(_make_field("Queue", self._queue), 1)
+            body.addWidget(self._preview, 3)
+            controls_widget = QtWidgets.QWidget()
+            controls_widget.setLayout(controls)
+            controls_widget.setMinimumWidth(300)
+            body.addWidget(controls_widget, 2)
+
+            buttons = QtWidgets.QHBoxLayout()
+            buttons.addWidget(self._capture_button)
+            buttons.addWidget(self._resume_button)
+            buttons.addWidget(self._previous_button)
+            buttons.addWidget(self._skip_button)
+            buttons.addStretch(1)
+            buttons.addWidget(finish_button)
+            buttons.addWidget(self._save_next_button)
+
+            layout = QtWidgets.QVBoxLayout(self)
+            layout.setContentsMargins(16, 14, 16, 14)
+            layout.setSpacing(10)
+            layout.addWidget(title)
+            layout.addWidget(note)
+            layout.addWidget(self._current_item)
+            layout.addWidget(self._progress)
+            layout.addLayout(body, 1)
+            layout.addLayout(buttons)
+
+            self._start_session()
+            self._render_current_item()
+
+        def _start_session(self) -> None:
+            try:
+                self._session = NativeBoardCaptureSession(
+                    self._config_for_item(self._items[0])
+                )
+            except Exception as exc:
+                self._guidance.setText(f"Could not start batch capture: {exc}")
+                self._status.setText("Batch capture did not start.")
+                self._capture_button.setEnabled(False)
+                self._save_next_button.setEnabled(False)
+                return
+            self._timer.start()
+            self._status.setText("Live detection is running.")
+
+        def _current(self) -> BoardBatchItem:
+            return self._items[self._index]
+
+        def _config_for_item(self, item: BoardBatchItem) -> BoardBuildingConfig:
+            return BoardBuildingConfig(
+                project_root=self._base_config.project_root,
+                object_name=item.object_name,
+                tag_size_mm=(
+                    item.tag_size_mm
+                    if item.tag_size_mm is not None
+                    else self._base_config.tag_size_mm
+                ),
+                family=self._base_config.family,
+                calibration_path=self._base_config.calibration_path,
+                source=self._base_config.source,
+                camera_index=self._base_config.camera_index,
+                video_path=self._base_config.video_path,
+                width=self._base_config.width,
+                height=self._base_config.height,
+                fps=self._base_config.fps,
+                out_dir=self._base_config.out_dir,
+                registry_path=self._base_config.registry_path,
+                save_shot=self._base_config.save_shot,
+                shots_dir=self._base_config.shots_dir,
+                z_threshold_m=self._base_config.z_threshold_m,
+                allow_nonplanar=self._base_config.allow_nonplanar,
+                require_object_tags=self._base_config.require_object_tags,
+            )
+
+        def _render_current_item(self) -> None:
+            item = self._current()
+            self._syncing_queue_selection = True
+            self._queue.setCurrentRow(self._index)
+            self._syncing_queue_selection = False
+            tag_size = _format_batch_item_tag_size(item, self._base_config)
+            self._current_item.setText(
+                f"Current board: {item.object_name} | tag size {tag_size} mm"
+            )
+            action = (
+                "Replace & Next"
+                if item.object_name in self.saved_results
+                else "Save & Next"
+            )
+            self._save_next_button.setText(action)
+            self._progress.setText(
+                f"{self._index + 1} / {len(self._items)} queued | "
+                f"{len(self.saved_results)} saved | "
+                f"{len(self.skipped_items)} skipped"
+            )
+            self._previous_button.setEnabled(self._index > 0)
+
+        def _select_queue_row(self, row: int) -> None:
+            if self._syncing_queue_selection:
+                return
+            if row < 0 or row >= len(self._items):
+                return
+            self._index = row
+            self._reset_for_current_item(
+                "Selected queued board.",
+                inspect_saved=True,
+            )
+
+        def _poll_frame(self) -> None:
+            if self._session is None:
+                return
+            try:
+                observation = self._session.read_observation()
+            except Exception as exc:
+                self._timer.stop()
+                self._guidance.setText(f"Batch capture failed: {exc}")
+                self._status.setText("Capture stopped before the batch finished.")
+                return
+            self._last_observation = observation
+            self._guidance.setText(observation.guidance)
+            if observation.annotated_frame_bgr is not None:
+                self._preview.show_pixmap(
+                    _pixmap_from_bgr_frame(observation.annotated_frame_bgr)
+                )
+            self._update_detected_ids(observation.pose_ready_ids)
+            if observation.source_exhausted:
+                self._timer.stop()
+                self._status.setText("Video ended before the batch finished.")
+                return
+            if (
+                observation.ready_to_capture
+                and self._auto_capture.isChecked()
+                and self._session.captured_observation is None
+            ):
+                self._capture_observation(observation, automatic=True)
+
+        def _update_detected_ids(
+            self,
+            ids: tuple[int, ...],
+            *,
+            force_all_checked: bool = False,
+        ) -> None:
+            checked = _checked_tag_ids_for_update(
+                ids,
+                self._checked_ids(),
+                force_all=force_all_checked,
+            )
+            origin_text = self._origin.currentText()
+            self._ids.clear()
+            self._origin.clear()
+            for tag_id in ids:
+                item = QtWidgets.QListWidgetItem(str(tag_id))
+                item.setFlags(
+                    item.flags() | QtCore.Qt.ItemFlag.ItemIsUserCheckable
+                )
+                item.setCheckState(
+                    QtCore.Qt.CheckState.Checked
+                    if tag_id in checked
+                    else QtCore.Qt.CheckState.Unchecked
+                )
+                self._ids.addItem(item)
+                self._origin.addItem(str(tag_id), tag_id)
+            if origin_text:
+                index = self._origin.findText(origin_text)
+                if index >= 0:
+                    self._origin.setCurrentIndex(index)
+
+        def _select_origin_tag(self, origin_id: int) -> None:
+            for index in range(self._origin.count()):
+                data = self._origin.itemData(index)
+                if data is not None and int(data) == int(origin_id):
+                    self._origin.setCurrentIndex(index)
+                    return
+
+        def _checked_ids(self) -> set[int]:
+            selected: set[int] = set()
+            for row in range(self._ids.count()):
+                item = self._ids.item(row)
+                if item.checkState() == QtCore.Qt.CheckState.Checked:
+                    selected.add(int(item.text()))
+            return selected
+
+        def _capture_now(self) -> None:
+            if self._last_observation is None:
+                self._status.setText("No frame has been detected yet.")
+                return
+            self._capture_observation(self._last_observation, automatic=False)
+
+        def _capture_observation(
+            self,
+            observation: NativeBoardCaptureObservation,
+            *,
+            automatic: bool,
+        ) -> None:
+            if self._session is None:
+                return
+            try:
+                captured = self._session.capture_current(observation)
+            except Exception as exc:
+                self._status.setText(f"Could not capture board view: {exc}")
+                return
+            self._timer.stop()
+            self._update_detected_ids(
+                captured.pose_ready_ids,
+                force_all_checked=True,
+            )
+            self._save_next_button.setEnabled(True)
+            self._resume_button.setEnabled(True)
+            self._resume_button.setText("Resume Live View")
+            prefix = "Auto-captured" if automatic else "Captured"
+            self._status.setText(
+                f"{prefix} {self._current().object_name} with IDs "
+                f"{_format_id_summary(captured.pose_ready_ids)}. Confirm IDs "
+                "and origin, then save and continue."
+            )
+
+        def _resume_live_view(self) -> None:
+            if self._session is None:
+                return
+            self._session.clear_capture()
+            self._save_next_button.setEnabled(False)
+            self._resume_button.setEnabled(False)
+            self._resume_button.setText("Resume Live View")
+            self._status.setText("Live detection resumed.")
+            self._timer.start()
+
+        def _save_current(self) -> None:
+            if self._session is None:
+                return
+            selected = tuple(sorted(self._checked_ids()))
+            if not selected:
+                self._status.setText("Select at least one detected tag ID.")
+                return
+            origin_data = self._origin.currentData()
+            if origin_data is None:
+                self._status.setText("Choose an origin tag.")
+                return
+            item = self._current()
+            try:
+                result = self._session.save_capture(
+                    selected_ids=selected,
+                    origin_id=int(origin_data),
+                    config=self._config_for_item(item),
+                )
+            except Exception as exc:
+                self._status.setText(f"Could not save {item.object_name}: {exc}")
+                return
+            replaced = item.object_name in self.saved_results
+            self.saved_results[item.object_name] = result
+            self.skipped_items.pop(item.object_name, None)
+            conflict_note = (
+                f" ({len(result.registry_conflicts)} registry conflict"
+                f"{'s' if len(result.registry_conflicts) != 1 else ''})"
+                if result.registry_conflicts
+                else ""
+            )
+            action = "replaced" if replaced else "saved"
+            action_title = "Replaced" if replaced else "Saved"
+            queue_item = self._queue.item(self._index)
+            queue_item.setText(
+                f"{self._index + 1}. {action}: {item.object_name}{conflict_note}"
+            )
+            queue_item.setToolTip(
+                f"{item.object_name}\n"
+                f"Selected IDs: {_format_id_summary(result.selected_ids)}\n"
+                f"Origin tag: {result.origin_id}\n"
+                f"Board YAML: {_display_path(result.board_yaml_path)}"
+            )
+            self._advance_or_finish(
+                f"{action_title} {item.object_name}{conflict_note}."
+            )
+
+        def _skip_current(self) -> None:
+            item = self._current()
+            if item.object_name in self.saved_results:
+                self._advance_or_finish(f"Kept saved {item.object_name}.")
+                return
+            self.skipped_items[item.object_name] = item
+            self._queue.item(self._index).setText(
+                f"{self._index + 1}. skipped: {item.object_name}"
+            )
+            self._advance_or_finish(f"Skipped {item.object_name}.")
+
+        def _previous_item(self) -> None:
+            if self._index <= 0:
+                return
+            self._index -= 1
+            self._reset_for_current_item(
+                "Moved to previous board.",
+                inspect_saved=True,
+            )
+
+        def _advance_or_finish(self, message: str) -> None:
+            if self._index + 1 >= len(self._items):
+                self._timer.stop()
+                self._save_next_button.setEnabled(False)
+                self._resume_button.setEnabled(False)
+                self._status.setText(
+                    f"{message} Batch complete: {len(self.saved_results)} saved, "
+                    f"{len(self.skipped_items)} skipped."
+                )
+                self._render_current_item()
+                return
+            self._index += 1
+            self._reset_for_current_item(message)
+
+        def _reset_for_current_item(
+            self,
+            message: str,
+            *,
+            inspect_saved: bool = False,
+        ) -> None:
+            if self._session is not None:
+                try:
+                    self._session.set_capture_config(
+                        self._config_for_item(self._current())
+                    )
+                except Exception as exc:
+                    self._timer.stop()
+                    self._status.setText(
+                        f"Could not switch to {self._current().object_name}: {exc}"
+                    )
+                    return
+            self._ids.clear()
+            self._origin.clear()
+            self._save_next_button.setEnabled(False)
+            self._resume_button.setEnabled(False)
+            self._resume_button.setText("Resume Live View")
+            self._last_observation = None
+            self._render_current_item()
+            saved = self.saved_results.get(self._current().object_name)
+            if inspect_saved and saved is not None:
+                self._show_saved_result(saved, message)
+                return
+            self._status.setText(
+                f"{message} Present {self._current().object_name} to the camera."
+            )
+            if self._session is not None:
+                self._timer.start()
+
+        def _show_saved_result(
+            self,
+            saved: NativeBoardCaptureResult,
+            message: str,
+        ) -> None:
+            self._timer.stop()
+            if self._session is not None:
+                self._session.clear_capture()
+            self._update_detected_ids(
+                saved.selected_ids,
+                force_all_checked=True,
+            )
+            self._select_origin_tag(saved.origin_id)
+            self._save_next_button.setEnabled(False)
+            self._resume_button.setEnabled(True)
+            self._resume_button.setText("Retake Live View")
+            self._status.setText(
+                f"{message} Saved {self._current().object_name}.\n"
+                f"Selected IDs: {_format_id_summary(saved.selected_ids)}\n"
+                f"Origin tag: {saved.origin_id}\n"
+                f"Board YAML: {_display_path(saved.board_yaml_path)}\n"
+                "Use Retake Live View to replace this board definition."
+            )
+
+        def done(self, result: int) -> None:
+            self._timer.stop()
+            if self._session is not None:
+                self._session.close()
+            super().done(result)
+
     class PoseTagMainWindow(QtWidgets.QMainWindow):
         def __init__(self, initial_project_root: Path) -> None:
             super().__init__()
@@ -276,12 +1092,23 @@ def build_main_window(qt: Any, project_root: Path) -> Any:
             self._calibration_previous_output_mtime_ns: Optional[int] = None
             self._calibration_output_existed_at_launch = False
             self._calibration_output_seen = False
+            self._board_process: Any = None
+            self._board_process_state = board_building_process_not_started()
+            self._board_running_expected_yaml: Optional[Path] = None
+            self._board_running_expected_registry: Optional[Path] = None
+            self._board_previous_yaml_mtime_ns: Optional[int] = None
+            self._board_previous_registry_mtime_ns: Optional[int] = None
+            self._board_outputs_existed_at_launch = False
+            self._board_output_seen = False
 
             self._calibration_output_timer = QtCore.QTimer(self)
             self._calibration_output_timer.setInterval(1000)
             self._calibration_output_timer.timeout.connect(
                 self._poll_calibration_output
             )
+            self._board_output_timer = QtCore.QTimer(self)
+            self._board_output_timer.setInterval(1000)
+            self._board_output_timer.timeout.connect(self._poll_board_output)
 
             self.setWindowTitle("PoseTag Workflow Dashboard")
 
@@ -1284,6 +2111,587 @@ def build_main_window(qt: Any, project_root: Path) -> Any:
             object_tags_layout.addWidget(object_tags_note)
             object_tags_layout.addLayout(object_tags_body)
 
+            self._board_building_card = QtWidgets.QFrame()
+            self._board_building_card.setObjectName("ActionCard")
+            board_building_layout = QtWidgets.QVBoxLayout(
+                self._board_building_card
+            )
+            board_building_layout.setContentsMargins(14, 12, 14, 12)
+            board_building_layout.setSpacing(9)
+
+            board_building_title = QtWidgets.QLabel("Object board definitions")
+            board_building_title.setObjectName("CardTitle")
+            board_building_note = QtWidgets.QLabel(
+                "Prepare the existing posetag-make-board workflow after "
+                "printing and attaching object AprilTags. Name each physical "
+                "object and side/face before capture."
+            )
+            board_building_note.setObjectName("MutedText")
+            board_building_note.setWordWrap(True)
+
+            self._board_object_label = QtWidgets.QLineEdit(
+                DEFAULT_BOARD_OBJECT_LABEL
+            )
+            self._board_object_label.setPlaceholderText(
+                "Example: connection_plate_white"
+            )
+            self._board_side_label = QtWidgets.QComboBox()
+            self._board_side_label.setEditable(True)
+            self._board_side_label.addItems(DEFAULT_BOARD_SIDE_LABELS)
+            self._board_side_label.setCurrentText(DEFAULT_BOARD_SIDE_LABEL)
+            self._board_side_label.setMinimumWidth(150)
+            if self._board_side_label.lineEdit() is not None:
+                self._board_side_label.lineEdit().setPlaceholderText(
+                    "sideA, front, top"
+                )
+            self._board_next_side_button = QtWidgets.QPushButton("Next Side")
+            self._board_next_side_button.setObjectName("SecondaryActionButton")
+            self._board_next_side_button.clicked.connect(
+                self._set_next_board_side_label
+            )
+            board_side_row = QtWidgets.QHBoxLayout()
+            board_side_row.setContentsMargins(0, 0, 0, 0)
+            board_side_row.addWidget(self._board_side_label, 1)
+            board_side_row.addWidget(self._board_next_side_button)
+            board_side_widget = QtWidgets.QWidget()
+            board_side_widget.setLayout(board_side_row)
+            self._board_object_name = QtWidgets.QLineEdit(DEFAULT_BOARD_OBJECT_NAME)
+            self._board_object_name.setPlaceholderText(
+                "Example: connection_plate_white_sideA"
+            )
+            self._board_object_name.setReadOnly(True)
+            self._board_object_name.setToolTip(
+                "Board definition name passed to posetag-make-board --object_name."
+            )
+            self._board_batch_instances = QtWidgets.QLineEdit()
+            self._board_batch_instances.setPlaceholderText(
+                "Optional: 01-08 or 01,02"
+            )
+            self._board_batch_sides = QtWidgets.QLineEdit("sideA, sideB")
+            self._board_batch_sides.setPlaceholderText("sideA, sideB or sideA-sideD")
+            self._board_batch_rows_model: list[BoardBatchRow] = []
+            self._board_batch_draft_loading = False
+            self._loaded_board_batch_draft_path: Optional[Path] = None
+            self._loaded_board_batch_draft_mtime_ns: Optional[int] = None
+            self._board_batch_row_list = QtWidgets.QListWidget()
+            self._board_batch_row_list.setObjectName("BoardObjectRows")
+            self._board_batch_row_list.setMaximumHeight(96)
+            self._board_batch_row_list.setMinimumHeight(72)
+            self._board_batch_row_list.setSelectionMode(
+                QtWidgets.QAbstractItemView.SelectionMode.SingleSelection
+            )
+            self._board_batch_row_list.currentRowChanged.connect(
+                self._select_board_batch_row
+            )
+            self._board_add_batch_row_button = QtWidgets.QPushButton("Add Object")
+            self._board_add_batch_row_button.setObjectName("SecondaryActionButton")
+            self._board_add_batch_row_button.clicked.connect(
+                self._add_board_batch_row
+            )
+            self._board_remove_batch_row_button = QtWidgets.QPushButton("Remove")
+            self._board_remove_batch_row_button.setObjectName("SecondaryActionButton")
+            self._board_remove_batch_row_button.clicked.connect(
+                self._remove_selected_board_batch_row
+            )
+            self._board_clear_batch_rows_button = QtWidgets.QPushButton("Clear")
+            self._board_clear_batch_rows_button.setObjectName("SecondaryActionButton")
+            self._board_clear_batch_rows_button.clicked.connect(
+                self._clear_board_batch_rows
+            )
+            self._board_batch_rows = QtWidgets.QPlainTextEdit()
+            self._board_batch_rows.setPlaceholderText(
+                "Optional multi-object batch rows:\n"
+                "connection_plate | 01-08 | sideA, sideB | 80\n"
+                "column | 01-04 | sideA-sideB | 40\n"
+                "column | 01-04 | sideC-sideD | 80"
+            )
+            self._board_batch_rows.setMaximumHeight(82)
+            self._board_batch_preview = QtWidgets.QLabel()
+            self._board_batch_preview.setObjectName("OutputText")
+            self._board_batch_preview.setWordWrap(True)
+            self._board_batch_preview.setTextInteractionFlags(
+                QtCore.Qt.TextInteractionFlag.TextSelectableByMouse
+            )
+            self._board_batch_preview.setMinimumHeight(72)
+            self._board_batch_preview.setAlignment(
+                QtCore.Qt.AlignmentFlag.AlignLeft
+                | QtCore.Qt.AlignmentFlag.AlignTop
+            )
+            self._board_tag_size = _make_float_spin(
+                0.1,
+                1000.0,
+                DEFAULT_BOARD_TAG_SIZE_MM,
+                " mm",
+            )
+            self._board_tag_size_autofill_mm: Optional[float] = None
+            self._board_tag_size_user_edited = False
+            self._board_tag_size_autofilling = False
+            board_batch_buttons = QtWidgets.QHBoxLayout()
+            board_batch_buttons.setContentsMargins(0, 0, 0, 0)
+            board_batch_buttons.setSpacing(6)
+            board_batch_buttons.addWidget(self._board_add_batch_row_button)
+            board_batch_buttons.addWidget(self._board_remove_batch_row_button)
+            board_batch_buttons.addWidget(self._board_clear_batch_rows_button)
+
+            board_batch_widget = QtWidgets.QWidget()
+            board_batch_grid = QtWidgets.QGridLayout(board_batch_widget)
+            board_batch_grid.setContentsMargins(0, 0, 0, 0)
+            board_batch_grid.setHorizontalSpacing(10)
+            board_batch_grid.setVerticalSpacing(8)
+            board_batch_grid.addWidget(
+                _make_field("Object", self._board_object_label),
+                0,
+                0,
+            )
+            board_batch_grid.addWidget(
+                _make_field("Instances", self._board_batch_instances),
+                0,
+                1,
+            )
+            board_batch_grid.addWidget(
+                _make_field("Sides / faces", self._board_batch_sides),
+                0,
+                2,
+            )
+            board_batch_grid.addWidget(
+                _make_field("Tag size", self._board_tag_size),
+                0,
+                3,
+            )
+            board_batch_grid.addLayout(board_batch_buttons, 1, 0)
+            board_batch_grid.addWidget(
+                _make_field("Objects", self._board_batch_row_list),
+                1,
+                1,
+            )
+            board_batch_grid.addWidget(
+                _make_field("Queue", self._board_batch_preview),
+                1,
+                2,
+                1,
+                2,
+            )
+            board_batch_grid.setColumnStretch(0, 2)
+            board_batch_grid.setColumnStretch(1, 1)
+            board_batch_grid.setColumnStretch(2, 1)
+            board_batch_grid.setColumnStretch(3, 1)
+
+            board_bulk_widget = QtWidgets.QWidget()
+            board_bulk_layout = QtWidgets.QVBoxLayout(board_bulk_widget)
+            board_bulk_layout.setContentsMargins(0, 0, 0, 0)
+            board_bulk_layout.setSpacing(6)
+            board_bulk_layout.addWidget(
+                _make_field("Rows", self._board_batch_rows),
+            )
+            board_bulk_group = _make_collapsible_group(
+                "Bulk Paste",
+                board_bulk_widget,
+                checked=False,
+            )
+            self._board_family = QtWidgets.QLineEdit(DEFAULT_BOARD_FAMILY)
+            self._board_family.setPlaceholderText("tag36h11")
+            self._board_source = QtWidgets.QComboBox()
+            for source in BOARD_SOURCE_CHOICES:
+                self._board_source.addItem(BOARD_SOURCE_LABELS[source], source)
+            self._board_source.setMinimumWidth(180)
+            self._board_source.currentIndexChanged.connect(
+                self._board_source_changed
+            )
+            self._board_camera_index = _make_int_spin(
+                0,
+                99,
+                DEFAULT_BOARD_CAMERA_INDEX,
+            )
+            self._board_video_path = QtWidgets.QLineEdit()
+            self._board_video_path.setPlaceholderText("Select board-building video")
+            board_video_browse_button = QtWidgets.QPushButton("Browse")
+            board_video_browse_button.clicked.connect(self._browse_board_video)
+            self._board_video_browse_button = board_video_browse_button
+            board_video_row = QtWidgets.QHBoxLayout()
+            board_video_row.setContentsMargins(0, 0, 0, 0)
+            board_video_row.addWidget(self._board_video_path, 1)
+            board_video_row.addWidget(board_video_browse_button)
+            board_video_widget = QtWidgets.QWidget()
+            board_video_widget.setLayout(board_video_row)
+
+            self._board_width = _make_int_spin(1, 10000, DEFAULT_BOARD_WIDTH)
+            self._board_height = _make_int_spin(1, 10000, DEFAULT_BOARD_HEIGHT)
+            self._board_fps = _make_int_spin(1, 240, DEFAULT_BOARD_FPS)
+            self._board_z_threshold = _make_float_spin(
+                0.001,
+                10.0,
+                DEFAULT_BOARD_Z_THRESHOLD_M,
+                " m",
+            )
+            self._board_z_threshold.setSingleStep(0.001)
+            self._board_save_shot = QtWidgets.QCheckBox("Save audit shot")
+            self._board_save_shot.stateChanged.connect(
+                self._board_save_shot_changed
+            )
+            self._board_allow_nonplanar = QtWidgets.QCheckBox(
+                "Allow non-planar warning"
+            )
+
+            self._board_calibration_path = QtWidgets.QLineEdit()
+            self._board_calibration_path.setPlaceholderText(
+                "Default: <project_root>/calib/calib_color.yaml"
+            )
+            board_calib_browse_button = QtWidgets.QPushButton("Browse")
+            board_calib_browse_button.clicked.connect(
+                self._browse_board_calibration
+            )
+            board_calib_row = QtWidgets.QHBoxLayout()
+            board_calib_row.setContentsMargins(0, 0, 0, 0)
+            board_calib_row.addWidget(self._board_calibration_path, 1)
+            board_calib_row.addWidget(board_calib_browse_button)
+            board_calib_widget = QtWidgets.QWidget()
+            board_calib_widget.setLayout(board_calib_row)
+
+            self._board_out_dir = QtWidgets.QLineEdit()
+            self._board_out_dir.setPlaceholderText(
+                "Default: <project_root>/boards/"
+            )
+            board_out_browse_button = QtWidgets.QPushButton("Browse")
+            board_out_browse_button.clicked.connect(self._browse_board_output_dir)
+            board_out_row = QtWidgets.QHBoxLayout()
+            board_out_row.setContentsMargins(0, 0, 0, 0)
+            board_out_row.addWidget(self._board_out_dir, 1)
+            board_out_row.addWidget(board_out_browse_button)
+            board_out_widget = QtWidgets.QWidget()
+            board_out_widget.setLayout(board_out_row)
+
+            self._board_registry_path = QtWidgets.QLineEdit()
+            self._board_registry_path.setPlaceholderText(
+                "Default: <project_root>/boards/tag_registry.yaml"
+            )
+            board_registry_browse_button = QtWidgets.QPushButton("Browse")
+            board_registry_browse_button.clicked.connect(
+                self._browse_board_registry
+            )
+            board_registry_row = QtWidgets.QHBoxLayout()
+            board_registry_row.setContentsMargins(0, 0, 0, 0)
+            board_registry_row.addWidget(self._board_registry_path, 1)
+            board_registry_row.addWidget(board_registry_browse_button)
+            board_registry_widget = QtWidgets.QWidget()
+            board_registry_widget.setLayout(board_registry_row)
+
+            self._board_shots_dir = QtWidgets.QLineEdit()
+            self._board_shots_dir.setPlaceholderText(
+                "Default: <project_root>/boards/shots/"
+            )
+            board_shots_browse_button = QtWidgets.QPushButton("Browse")
+            board_shots_browse_button.clicked.connect(self._browse_board_shots_dir)
+            board_shots_row = QtWidgets.QHBoxLayout()
+            board_shots_row.setContentsMargins(0, 0, 0, 0)
+            board_shots_row.addWidget(self._board_shots_dir, 1)
+            board_shots_row.addWidget(board_shots_browse_button)
+            board_shots_widget = QtWidgets.QWidget()
+            board_shots_widget.setLayout(board_shots_row)
+
+            self._board_camera_field = _make_field(
+                "Camera index",
+                self._board_camera_index,
+            )
+            self._board_video_field = _make_field("Video path", board_video_widget)
+            self._board_shots_field = _make_field(
+                "Audit-shot folder",
+                board_shots_widget,
+            )
+
+            board_capture_widget = QtWidgets.QWidget()
+            board_capture_grid = QtWidgets.QGridLayout(board_capture_widget)
+            board_capture_grid.setContentsMargins(0, 0, 0, 0)
+            board_capture_grid.setHorizontalSpacing(10)
+            board_capture_grid.setVerticalSpacing(8)
+            board_capture_grid.addWidget(
+                _make_field("Source", self._board_source),
+                0,
+                0,
+            )
+            board_capture_grid.addWidget(
+                _make_field("Calibration YAML", board_calib_widget),
+                1,
+                0,
+                1,
+                2,
+            )
+            board_capture_grid.addWidget(self._board_camera_field, 2, 0)
+            board_capture_grid.addWidget(self._board_video_field, 2, 1)
+            board_capture_grid.setColumnStretch(0, 1)
+            board_capture_grid.setColumnStretch(1, 1)
+
+            board_single_widget = QtWidgets.QWidget()
+            board_single_grid = QtWidgets.QGridLayout(board_single_widget)
+            board_single_grid.setContentsMargins(0, 0, 0, 0)
+            board_single_grid.setHorizontalSpacing(10)
+            board_single_grid.setVerticalSpacing(8)
+            board_single_grid.addWidget(
+                _make_field("Side / face", board_side_widget),
+                0,
+                0,
+            )
+            board_single_grid.addWidget(
+                _make_field("Board definition", self._board_object_name),
+                0,
+                1,
+            )
+            board_single_grid.setColumnStretch(0, 1)
+            board_single_grid.setColumnStretch(1, 1)
+            board_single_group = _make_collapsible_group(
+                "Single Board",
+                board_single_widget,
+                checked=False,
+            )
+
+            board_advanced_widget = QtWidgets.QWidget()
+            board_advanced_grid = QtWidgets.QGridLayout(board_advanced_widget)
+            board_advanced_grid.setContentsMargins(0, 0, 0, 0)
+            board_advanced_grid.setHorizontalSpacing(10)
+            board_advanced_grid.setVerticalSpacing(8)
+            board_advanced_grid.addWidget(
+                _make_field("AprilTag family", self._board_family),
+                0,
+                0,
+                1,
+                2,
+            )
+            board_advanced_grid.addWidget(
+                _make_field("Width", self._board_width),
+                1,
+                0,
+            )
+            board_advanced_grid.addWidget(
+                _make_field("Height", self._board_height),
+                1,
+                1,
+            )
+            board_advanced_grid.addWidget(
+                _make_field("FPS", self._board_fps),
+                2,
+                0,
+            )
+            board_advanced_grid.addWidget(
+                _make_field("Planarity threshold", self._board_z_threshold),
+                2,
+                1,
+            )
+            board_advanced_grid.addWidget(
+                _make_field("Board output folder", board_out_widget),
+                3,
+                0,
+                1,
+                2,
+            )
+            board_advanced_grid.addWidget(
+                _make_field("Tag registry path", board_registry_widget),
+                4,
+                0,
+                1,
+                2,
+            )
+            board_advanced_grid.addWidget(self._board_save_shot, 5, 0)
+            board_advanced_grid.addWidget(self._board_allow_nonplanar, 5, 1)
+            board_advanced_grid.addWidget(self._board_shots_field, 6, 0, 1, 2)
+            board_advanced_grid.setColumnStretch(0, 1)
+            board_advanced_grid.setColumnStretch(1, 1)
+            board_advanced_group = _make_collapsible_group(
+                "Advanced Capture And Outputs",
+                board_advanced_widget,
+                checked=False,
+            )
+
+            for field in (
+                self._board_camera_index,
+                self._board_width,
+                self._board_height,
+                self._board_fps,
+                self._board_z_threshold,
+            ):
+                field.valueChanged.connect(self._update_board_building_flow)
+            self._board_tag_size.valueChanged.connect(
+                self._board_tag_size_changed
+            )
+            self._board_object_label.textChanged.connect(
+                self._board_identity_changed
+            )
+            self._board_side_label.currentTextChanged.connect(
+                self._board_identity_changed
+            )
+            self._board_batch_instances.textChanged.connect(
+                self._board_batch_fields_changed
+            )
+            self._board_batch_sides.textChanged.connect(
+                self._board_batch_fields_changed
+            )
+            self._board_batch_rows.textChanged.connect(
+                self._board_batch_fields_changed
+            )
+            for field in (
+                self._board_family,
+                self._board_video_path,
+                self._board_calibration_path,
+                self._board_out_dir,
+                self._board_registry_path,
+                self._board_shots_dir,
+            ):
+                field.textChanged.connect(self._update_board_building_flow)
+            self._board_allow_nonplanar.stateChanged.connect(
+                self._update_board_building_flow
+            )
+
+            self._board_guidance = QtWidgets.QLabel(BOARD_BUILDING_GUIDANCE)
+            self._board_guidance.setObjectName("GuidanceText")
+            self._board_guidance.setWordWrap(True)
+            self._board_controls = QtWidgets.QLabel(
+                "After ENTER captures a frame, the terminal asks for the "
+                "detected tag IDs to include, then asks which selected tag is "
+                "the board origin."
+            )
+            self._board_controls.setObjectName("GuidanceText")
+            self._board_controls.setWordWrap(True)
+            self._board_readiness = QtWidgets.QLabel()
+            self._board_readiness.setObjectName("OutputText")
+            self._board_readiness.setWordWrap(True)
+            self._board_readiness.setTextInteractionFlags(
+                QtCore.Qt.TextInteractionFlag.TextSelectableByMouse
+            )
+            self._board_outputs = QtWidgets.QLabel()
+            self._board_outputs.setObjectName("OutputText")
+            self._board_outputs.setWordWrap(True)
+            self._board_outputs.setTextInteractionFlags(
+                QtCore.Qt.TextInteractionFlag.TextSelectableByMouse
+            )
+            self._board_process_state_label = QtWidgets.QLabel()
+            self._board_process_state_label.setObjectName("OutputText")
+            self._board_process_state_label.setWordWrap(True)
+            self._board_process_state_label.setTextInteractionFlags(
+                QtCore.Qt.TextInteractionFlag.TextSelectableByMouse
+            )
+            self._board_log = QtWidgets.QPlainTextEdit()
+            self._board_log.setObjectName("CalibrationLog")
+            self._board_log.setReadOnly(True)
+            self._board_log.setMaximumHeight(118)
+            self._board_log.setPlaceholderText(
+                "Board-builder stdout/stderr will appear here after launch."
+            )
+            self._board_log.document().setMaximumBlockCount(250)
+            self._board_prompt_input = QtWidgets.QLineEdit()
+            self._board_prompt_input.setPlaceholderText(
+                "Prompt response, e.g. 12,37 or 12"
+            )
+            self._board_prompt_input.returnPressed.connect(
+                self._send_board_prompt_response
+            )
+            self._board_send_prompt_button = QtWidgets.QPushButton("Send Response")
+            self._board_send_prompt_button.setObjectName("SecondaryActionButton")
+            self._board_send_prompt_button.clicked.connect(
+                self._send_board_prompt_response
+            )
+            board_prompt_row = QtWidgets.QHBoxLayout()
+            board_prompt_row.setContentsMargins(0, 0, 0, 0)
+            board_prompt_row.addWidget(self._board_prompt_input, 1)
+            board_prompt_row.addWidget(self._board_send_prompt_button)
+            board_prompt_widget = QtWidgets.QWidget()
+            board_prompt_widget.setLayout(board_prompt_row)
+            board_refresh_button = QtWidgets.QPushButton("Refresh Status")
+            board_refresh_button.setObjectName("SecondaryActionButton")
+            board_refresh_button.clicked.connect(self._refresh)
+            self._board_batch_capture_button = QtWidgets.QPushButton(
+                "Start Batch"
+            )
+            self._board_batch_capture_button.setObjectName("PrimaryActionButton")
+            self._board_batch_capture_button.clicked.connect(
+                self._open_native_board_batch_capture
+            )
+            self._board_guided_capture_button = QtWidgets.QPushButton(
+                "Guided Capture"
+            )
+            self._board_guided_capture_button.setObjectName("SecondaryActionButton")
+            self._board_guided_capture_button.clicked.connect(
+                self._open_native_board_capture
+            )
+            self._board_run_button = QtWidgets.QPushButton("Run Board Builder")
+            self._board_run_button.setObjectName("SecondaryActionButton")
+            self._board_run_button.clicked.connect(self._run_board_building)
+
+            board_summary_grid = QtWidgets.QGridLayout()
+            board_summary_grid.setContentsMargins(0, 0, 0, 0)
+            board_summary_grid.setHorizontalSpacing(10)
+            board_summary_grid.setVerticalSpacing(8)
+            board_summary_grid.addWidget(
+                _make_field("Readiness", self._board_readiness),
+                0,
+                0,
+            )
+            board_summary_grid.addWidget(
+                _make_field("Expected outputs", self._board_outputs),
+                0,
+                1,
+            )
+            board_summary_grid.setColumnStretch(0, 1)
+            board_summary_grid.setColumnStretch(1, 1)
+
+            board_cli_grid = QtWidgets.QGridLayout()
+            board_cli_grid.setContentsMargins(0, 0, 0, 0)
+            board_cli_grid.setHorizontalSpacing(10)
+            board_cli_grid.setVerticalSpacing(8)
+            board_cli_grid.addWidget(
+                _make_field("Process state", self._board_process_state_label),
+                0,
+                0,
+                1,
+                2,
+            )
+            board_cli_grid.addWidget(
+                _make_field("Prompt response", board_prompt_widget),
+                1,
+                0,
+                1,
+                2,
+            )
+            board_cli_grid.addWidget(
+                _make_field("Process log", self._board_log),
+                2,
+                0,
+                1,
+                2,
+            )
+            board_cli_grid.setColumnStretch(0, 1)
+            board_cli_grid.setColumnStretch(1, 1)
+            board_cli_action_row = QtWidgets.QHBoxLayout()
+            board_cli_action_row.addWidget(self._board_run_button)
+            board_cli_action_row.addStretch(1)
+            board_cli_widget = QtWidgets.QWidget()
+            board_cli_layout = QtWidgets.QVBoxLayout(board_cli_widget)
+            board_cli_layout.setContentsMargins(0, 0, 0, 0)
+            board_cli_layout.setSpacing(8)
+            board_cli_layout.addWidget(self._board_guidance)
+            board_cli_layout.addWidget(self._board_controls)
+            board_cli_layout.addLayout(board_cli_grid)
+            board_cli_layout.addLayout(board_cli_action_row)
+            board_cli_group = _make_collapsible_group(
+                "CLI Fallback And Logs",
+                board_cli_widget,
+                checked=False,
+            )
+
+            board_action_row = QtWidgets.QHBoxLayout()
+            board_action_row.addWidget(self._board_batch_capture_button)
+            board_action_row.addWidget(self._board_guided_capture_button)
+            board_action_row.addWidget(board_refresh_button)
+            board_action_row.addStretch(1)
+
+            board_building_layout.addWidget(board_building_title)
+            board_building_layout.addWidget(board_building_note)
+            board_building_layout.addWidget(board_batch_widget)
+            board_building_layout.addWidget(board_bulk_group)
+            board_building_layout.addWidget(board_capture_widget)
+            board_building_layout.addWidget(board_single_group)
+            board_building_layout.addWidget(board_advanced_group)
+            board_building_layout.addLayout(board_summary_grid)
+            board_building_layout.addLayout(board_action_row)
+            board_building_layout.addWidget(board_cli_group)
+
             detail_content = QtWidgets.QWidget()
             detail_content_layout = QtWidgets.QVBoxLayout(detail_content)
             detail_content_layout.setContentsMargins(0, 0, 0, 0)
@@ -1294,6 +2702,7 @@ def build_main_window(qt: Any, project_root: Path) -> Any:
             detail_content_layout.addWidget(self._charuco_card)
             detail_content_layout.addWidget(self._calibration_card)
             detail_content_layout.addWidget(self._object_tags_card)
+            detail_content_layout.addWidget(self._board_building_card)
             detail_content_layout.addWidget(command_card)
             detail_content_layout.addStretch(1)
 
@@ -1444,9 +2853,10 @@ def build_main_window(qt: Any, project_root: Path) -> Any:
             self.setStyleSheet(_style_sheet())
             self.statusBar().showMessage(
                 "Dashboard can generate ChArUco board files and prepare "
-                "camera-calibration and object-tag workflows."
+                "camera-calibration, object-tag, and board-building workflows."
             )
 
+            self._render_board_batch_rows()
             self._refresh()
 
         def _browse_project_root(self) -> None:
@@ -1499,6 +2909,428 @@ def build_main_window(qt: Any, project_root: Path) -> Any:
             if selected:
                 self._object_tags_out_dir.setText(selected)
 
+        def _browse_board_calibration(self) -> None:
+            current = self._board_calibration_path.text().strip()
+            start_path = current or str(
+                default_calibration_path(self._current_project_root())
+            )
+            selected, _ = QtWidgets.QFileDialog.getOpenFileName(
+                self,
+                "Select board-building calibration YAML",
+                start_path,
+                "YAML files (*.yaml *.yml);;All files (*)",
+            )
+            if selected:
+                self._board_calibration_path.setText(selected)
+
+        def _browse_board_video(self) -> None:
+            current = self._board_video_path.text().strip()
+            start_path = current or str(self._current_project_root())
+            selected, _ = QtWidgets.QFileDialog.getOpenFileName(
+                self,
+                "Select board-building video",
+                start_path,
+                "Video files (*.mp4 *.mov *.avi *.mkv);;All files (*)",
+            )
+            if selected:
+                self._board_video_path.setText(selected)
+
+        def _browse_board_output_dir(self) -> None:
+            current = self._board_out_dir.text().strip()
+            start_dir = current or str(default_boards_dir(self._current_project_root()))
+            selected = QtWidgets.QFileDialog.getExistingDirectory(
+                self,
+                "Select board YAML output folder",
+                start_dir,
+            )
+            if selected:
+                self._board_out_dir.setText(selected)
+
+        def _browse_board_registry(self) -> None:
+            current = self._board_registry_path.text().strip()
+            start_path = current or str(
+                default_boards_dir(self._current_project_root())
+                / "tag_registry.yaml"
+            )
+            selected, _ = QtWidgets.QFileDialog.getSaveFileName(
+                self,
+                "Select tag registry YAML",
+                start_path,
+                "YAML files (*.yaml *.yml);;All files (*)",
+            )
+            if selected:
+                self._board_registry_path.setText(selected)
+
+        def _browse_board_shots_dir(self) -> None:
+            current = self._board_shots_dir.text().strip()
+            start_dir = current or str(
+                default_boards_dir(self._current_project_root()) / "shots"
+            )
+            selected = QtWidgets.QFileDialog.getExistingDirectory(
+                self,
+                "Select audit-shot output folder",
+                start_dir,
+            )
+            if selected:
+                self._board_shots_dir.setText(selected)
+
+        def _board_identity_changed(self) -> None:
+            self._sync_board_definition_name()
+            self._update_board_batch_preview()
+            self._update_board_building_flow()
+
+        def _board_tag_size_changed(self) -> None:
+            if not getattr(self, "_board_tag_size_autofilling", False):
+                self._board_tag_size_user_edited = True
+            self._update_board_building_flow()
+
+        def _board_batch_fields_changed(self) -> None:
+            self._update_board_batch_preview()
+            self._save_board_batch_draft_if_needed(show_errors=False)
+
+        def _sync_board_definition_name(self) -> None:
+            try:
+                object_name = compose_board_object_name(
+                    self._board_object_label.text(),
+                    self._board_side_label.currentText(),
+                )
+            except Exception:
+                object_name = ""
+            self._board_object_name.setText(object_name)
+
+        def _set_next_board_side_label(self) -> None:
+            try:
+                side_label = next_default_side_label(
+                    self._current_project_root(),
+                    self._board_object_label.text(),
+                    out_dir=Path(self._board_out_dir.text()).expanduser()
+                    if self._board_out_dir.text().strip()
+                    else None,
+                )
+            except Exception as exc:
+                message = f"Could not choose next side label: {exc}"
+                self.statusBar().showMessage(message, 5000)
+                self._update_board_building_flow()
+                return
+            self._board_side_label.setCurrentText(side_label)
+            self._board_identity_changed()
+
+        def _sync_board_tag_size_from_object_tags(self) -> None:
+            if not hasattr(self, "_board_tag_size"):
+                return
+            configured = float(self._object_tags_tag_size.value())
+            inferred = infer_latest_object_tag_size_mm(self._current_project_root())
+            if abs(configured - DEFAULT_OBJECT_TAG_SIZE_MM) > 1e-9:
+                candidate = configured
+            elif inferred is not None:
+                candidate = inferred
+            else:
+                candidate = configured
+
+            current = float(self._board_tag_size.value())
+            should_update = not getattr(self, "_board_tag_size_user_edited", False)
+            if not should_update or abs(current - candidate) <= 1e-9:
+                return
+            self._board_tag_size_autofilling = True
+            self._board_tag_size.blockSignals(True)
+            self._board_tag_size.setValue(candidate)
+            self._board_tag_size.blockSignals(False)
+            self._board_tag_size_autofilling = False
+            self._board_tag_size_autofill_mm = candidate
+
+        def _board_batch_rows_for_persistence(self) -> tuple[BoardBatchRow, ...]:
+            rows_text = self._board_batch_rows.toPlainText().strip()
+            if rows_text:
+                return parse_board_batch_rows(rows_text)
+            if self._board_batch_rows_model:
+                return tuple(self._board_batch_rows_model)
+            return ()
+
+        def _select_board_batch_row(self, row_index: int) -> None:
+            if row_index < 0 or row_index >= len(self._board_batch_rows_model):
+                return
+            row = self._board_batch_rows_model[row_index]
+            try:
+                first_item = build_board_batch_items((row,))[0]
+            except Exception:
+                first_item = None
+
+            fields = (
+                self._board_object_label,
+                self._board_batch_instances,
+                self._board_batch_sides,
+                self._board_side_label,
+                self._board_tag_size,
+            )
+            for field in fields:
+                field.blockSignals(True)
+            try:
+                self._board_object_label.setText(row.object_label)
+                self._board_batch_instances.setText(row.instances)
+                self._board_batch_sides.setText(row.sides)
+                if first_item is not None:
+                    self._board_side_label.setCurrentText(first_item.side_label)
+                if row.tag_size_mm is not None:
+                    self._board_tag_size.setValue(float(row.tag_size_mm))
+                    self._board_tag_size_user_edited = True
+            finally:
+                for field in fields:
+                    field.blockSignals(False)
+
+            self._sync_board_definition_name()
+            self._update_board_batch_preview()
+            self._update_board_building_flow()
+
+        def _save_board_batch_draft_if_needed(
+            self,
+            *,
+            show_errors: bool = True,
+        ) -> None:
+            if getattr(self, "_board_batch_draft_loading", False):
+                return
+            try:
+                rows = self._board_batch_rows_for_persistence()
+            except Exception as exc:
+                if show_errors:
+                    message = f"Could not save board queue draft: {exc}"
+                    self.statusBar().showMessage(message, 5000)
+                return
+            if not rows:
+                return
+
+            try:
+                path = save_board_batch_draft(
+                    self._current_project_root(),
+                    rows,
+                    self._board_building_config(),
+                )
+            except Exception as exc:
+                if show_errors:
+                    message = f"Could not save board queue draft: {exc}"
+                    self.statusBar().showMessage(message, 5000)
+                return
+            self._loaded_board_batch_draft_path = path
+            self._loaded_board_batch_draft_mtime_ns = _path_mtime_ns(path)
+
+        def _delete_board_batch_draft(self) -> None:
+            if getattr(self, "_board_batch_draft_loading", False):
+                return
+            path = default_board_batch_draft_path(self._current_project_root())
+            try:
+                delete_board_batch_draft(self._current_project_root())
+            except Exception as exc:
+                message = f"Could not remove board queue draft: {exc}"
+                self.statusBar().showMessage(message, 5000)
+                return
+            self._loaded_board_batch_draft_path = path
+            self._loaded_board_batch_draft_mtime_ns = None
+
+        def _load_board_batch_draft(self) -> None:
+            if not hasattr(self, "_board_batch_row_list"):
+                return
+            root = self._current_project_root()
+            path = default_board_batch_draft_path(root)
+            mtime = _path_mtime_ns(path)
+            if (
+                path == self._loaded_board_batch_draft_path
+                and mtime == self._loaded_board_batch_draft_mtime_ns
+            ):
+                return
+            if mtime is None:
+                if self._loaded_board_batch_draft_path != path:
+                    self._board_batch_rows_model = []
+                    self._board_batch_rows.blockSignals(True)
+                    self._board_batch_rows.clear()
+                    self._board_batch_rows.blockSignals(False)
+                    self._render_board_batch_rows()
+                    self._update_board_batch_preview()
+                self._loaded_board_batch_draft_path = path
+                self._loaded_board_batch_draft_mtime_ns = None
+                return
+
+            try:
+                draft = load_board_batch_draft(root)
+            except Exception as exc:
+                message = f"Could not load board queue draft: {exc}"
+                self._board_batch_preview.setText(message)
+                self.statusBar().showMessage(message, 6000)
+                self._loaded_board_batch_draft_path = path
+                self._loaded_board_batch_draft_mtime_ns = mtime
+                return
+            if draft is None:
+                self._loaded_board_batch_draft_path = path
+                self._loaded_board_batch_draft_mtime_ns = None
+                return
+
+            self._apply_board_batch_draft(draft)
+            self._loaded_board_batch_draft_path = draft.path
+            self._loaded_board_batch_draft_mtime_ns = _path_mtime_ns(draft.path)
+
+        def _apply_board_batch_draft(self, draft: BoardBatchDraft) -> None:
+            self._board_batch_draft_loading = True
+            widgets = (
+                self._board_family,
+                self._board_tag_size,
+                self._board_source,
+                self._board_camera_index,
+                self._board_video_path,
+                self._board_width,
+                self._board_height,
+                self._board_fps,
+                self._board_calibration_path,
+                self._board_out_dir,
+                self._board_registry_path,
+                self._board_save_shot,
+                self._board_shots_dir,
+                self._board_z_threshold,
+                self._board_allow_nonplanar,
+                self._board_batch_rows,
+                self._board_batch_row_list,
+            )
+            for widget in widgets:
+                widget.blockSignals(True)
+            try:
+                self._board_batch_rows_model = list(draft.rows)
+                self._board_batch_rows.clear()
+                self._board_family.setText(draft.family)
+                self._board_tag_size.setValue(float(draft.tag_size_mm))
+                source_index = self._board_source.findData(draft.source)
+                if source_index >= 0:
+                    self._board_source.setCurrentIndex(source_index)
+                self._board_camera_index.setValue(int(draft.camera_index))
+                self._board_video_path.setText(draft.video_path)
+                self._board_width.setValue(int(draft.width))
+                self._board_height.setValue(int(draft.height))
+                self._board_fps.setValue(int(draft.fps))
+                self._board_calibration_path.setText(draft.calibration_path)
+                self._board_out_dir.setText(draft.out_dir)
+                self._board_registry_path.setText(draft.registry_path)
+                self._board_save_shot.setChecked(bool(draft.save_shot))
+                self._board_shots_dir.setText(draft.shots_dir)
+                self._board_z_threshold.setValue(float(draft.z_threshold_m))
+                self._board_allow_nonplanar.setChecked(bool(draft.allow_nonplanar))
+                self._board_tag_size_user_edited = True
+            finally:
+                for widget in widgets:
+                    widget.blockSignals(False)
+                self._board_batch_draft_loading = False
+
+            self._render_board_batch_rows()
+            if self._board_batch_rows_model:
+                self._board_batch_row_list.setCurrentRow(0)
+                if self._board_batch_row_list.currentRow() != 0:
+                    self._select_board_batch_row(0)
+            self._render_board_source_fields()
+            self._render_board_save_shot_fields()
+            self._update_board_batch_preview()
+            self._update_board_building_flow()
+
+        def _board_batch_items(self) -> tuple[BoardBatchItem, ...]:
+            rows_text = self._board_batch_rows.toPlainText().strip()
+            if rows_text:
+                rows = parse_board_batch_rows(rows_text)
+            elif self._board_batch_rows_model:
+                rows = tuple(self._board_batch_rows_model)
+            else:
+                rows = (
+                    BoardBatchRow(
+                        object_label=self._board_object_label.text(),
+                        instances=self._board_batch_instances.text(),
+                        sides=self._board_batch_sides.text(),
+                    ),
+                )
+            return build_board_batch_items(rows)
+
+        def _add_board_batch_row(self) -> None:
+            row = BoardBatchRow(
+                object_label=self._board_object_label.text(),
+                instances=self._board_batch_instances.text(),
+                sides=self._board_batch_sides.text(),
+                tag_size_mm=float(self._board_tag_size.value()),
+            )
+            candidate_rows = (*self._board_batch_rows_model, row)
+            try:
+                build_board_batch_items(candidate_rows)
+            except Exception as exc:
+                message = f"Could not add object row: {exc}"
+                self._board_batch_preview.setText(message)
+                self.statusBar().showMessage(message, 5000)
+                return
+            self._board_batch_rows_model.append(row)
+            self._render_board_batch_rows()
+            self._board_batch_row_list.setCurrentRow(
+                len(self._board_batch_rows_model) - 1
+            )
+            self._update_board_batch_preview()
+            self._save_board_batch_draft_if_needed()
+            self._update_board_building_flow()
+            self.statusBar().showMessage("Added object row to board batch.", 3000)
+
+        def _remove_selected_board_batch_row(self) -> None:
+            row_index = self._board_batch_row_list.currentRow()
+            if row_index < 0 or row_index >= len(self._board_batch_rows_model):
+                self.statusBar().showMessage("Select an object row to remove.", 3000)
+                return
+            del self._board_batch_rows_model[row_index]
+            self._render_board_batch_rows()
+            if self._board_batch_rows_model:
+                self._board_batch_row_list.setCurrentRow(
+                    min(row_index, len(self._board_batch_rows_model) - 1)
+                )
+                self._save_board_batch_draft_if_needed()
+            else:
+                self._delete_board_batch_draft()
+            self._update_board_batch_preview()
+            self._update_board_building_flow()
+            self.statusBar().showMessage("Removed object row from board batch.", 3000)
+
+        def _clear_board_batch_rows(self) -> None:
+            if not self._board_batch_rows_model:
+                self.statusBar().showMessage("No object rows to clear.", 3000)
+                return
+            self._board_batch_rows_model.clear()
+            self._render_board_batch_rows()
+            self._delete_board_batch_draft()
+            self._update_board_batch_preview()
+            self._update_board_building_flow()
+            self.statusBar().showMessage("Cleared object rows from board batch.", 3000)
+
+        def _render_board_batch_rows(self) -> None:
+            if not hasattr(self, "_board_batch_row_list"):
+                return
+            self._board_batch_row_list.blockSignals(True)
+            self._board_batch_row_list.clear()
+            if not self._board_batch_rows_model:
+                item = QtWidgets.QListWidgetItem(
+                    "No saved object rows; current fields define the queue."
+                )
+                item.setFlags(QtCore.Qt.ItemFlag.NoItemFlags)
+                self._board_batch_row_list.addItem(item)
+                self._board_batch_row_list.blockSignals(False)
+                return
+            for row in self._board_batch_rows_model:
+                instances = row.instances.strip() or "single"
+                sides = row.sides.strip() or DEFAULT_BOARD_SIDE_LABEL
+                tag_size = (
+                    f"{row.tag_size_mm:g}"
+                    if row.tag_size_mm is not None
+                    else "default"
+                )
+                self._board_batch_row_list.addItem(
+                    f"{row.object_label.strip()} | {instances} | {sides} | {tag_size} mm"
+                )
+            self._board_batch_row_list.blockSignals(False)
+
+        def _update_board_batch_preview(self) -> None:
+            if not hasattr(self, "_board_batch_preview"):
+                return
+            try:
+                items = self._board_batch_items()
+            except Exception as exc:
+                self._board_batch_preview.setText(f"Batch setup error: {exc}")
+                return
+            self._board_batch_preview.setText(_format_board_batch_preview(items))
+
         def _browse_calibration_video(self) -> None:
             current = self._calibration_video_path.text().strip()
             start_path = current or str(self._current_project_root())
@@ -1522,6 +3354,14 @@ def build_main_window(qt: Any, project_root: Path) -> Any:
         def _object_tag_paper_changed(self) -> None:
             self._render_object_tag_paper_fields()
             self._update_object_tag_flow()
+
+        def _board_source_changed(self) -> None:
+            self._render_board_source_fields()
+            self._update_board_building_flow()
+
+        def _board_save_shot_changed(self) -> None:
+            self._render_board_save_shot_fields()
+            self._update_board_building_flow()
 
         def _generate_charuco_board(self) -> None:
             self._charuco_generate_button.setEnabled(False)
@@ -1749,6 +3589,7 @@ def build_main_window(qt: Any, project_root: Path) -> Any:
         def _refresh(self) -> None:
             root = Path(self._root_input.text()).expanduser()
             self._render_project_context(root)
+            self._load_board_batch_draft()
             try:
                 self._models = inspect_project_view(root)
             except Exception as exc:  # pragma: no cover - defensive UI boundary
@@ -1839,11 +3680,15 @@ def build_main_window(qt: Any, project_root: Path) -> Any:
             self._charuco_card.setVisible(model.stage_id == 1)
             self._calibration_card.setVisible(model.stage_id == 2)
             self._object_tags_card.setVisible(model.stage_id == 3)
+            self._board_building_card.setVisible(model.stage_id == 4)
             if model.stage_id == 2:
                 self._sync_calibration_from_project_metadata()
                 self._update_calibration_flow()
             if model.stage_id == 3:
                 self._update_object_tag_flow()
+            if model.stage_id == 4:
+                self._sync_board_tag_size_from_object_tags()
+                self._update_board_building_flow()
             self._render_side_panel_calibration_result()
             self._render_stage_rail_selection()
 
@@ -1923,6 +3768,7 @@ def build_main_window(qt: Any, project_root: Path) -> Any:
             self._charuco_card.setVisible(False)
             self._calibration_card.setVisible(False)
             self._object_tags_card.setVisible(False)
+            self._board_building_card.setVisible(False)
             self._render_health()
 
         def _render_stage_rail_selection(self) -> None:
@@ -2102,6 +3948,62 @@ def build_main_window(qt: Any, project_root: Path) -> Any:
                 )
             )
 
+        def _update_board_building_flow(self) -> None:
+            if not hasattr(self, "_board_readiness"):
+                return
+            self._render_board_source_fields()
+            self._render_board_save_shot_fields()
+            self._update_board_batch_preview()
+            self._save_board_batch_draft_if_needed(show_errors=False)
+            readiness = inspect_board_building(self._board_building_config())
+            self._board_readiness.setText(
+                _format_board_building_readiness(readiness)
+            )
+            self._board_outputs.setText(
+                _format_board_building_outputs(readiness)
+            )
+            if self._board_process_state.state == BOARD_PROCESS_NOT_STARTED:
+                self._set_board_process_state(
+                    board_building_process_not_started(
+                        readiness.expected_board_yaml,
+                        readiness.expected_registry,
+                    )
+                )
+            process_running = self._board_process_is_running()
+            try:
+                batch_ready = bool(self._board_batch_items())
+            except Exception:
+                batch_ready = False
+            self._board_batch_capture_button.setEnabled(
+                readiness.ready and batch_ready and not process_running
+            )
+            self._board_guided_capture_button.setEnabled(
+                readiness.ready and not process_running
+            )
+            self._board_run_button.setEnabled(readiness.ready and not process_running)
+            self._board_run_button.setText(
+                _board_building_run_button_label(self._board_process_state)
+            )
+            self._board_prompt_input.setEnabled(process_running)
+            self._board_send_prompt_button.setEnabled(process_running)
+
+            model = self._model_by_stage_id(self._selected_stage_id)
+            if model is None or model.stage_id != 4:
+                return
+
+            self._command_preview.setText(readiness.command_preview)
+            self._command_preview.setCursorPosition(0)
+            self._copy_button.setEnabled(bool(readiness.command_preview))
+            self._command_note.setText(
+                _board_building_command_card_note(readiness, model)
+            )
+            self._copy_feedback.setText(
+                _board_building_command_ready_message(
+                    readiness,
+                    stage_complete=model.status == "complete",
+                )
+            )
+
         def _copy_calibration_command(self) -> None:
             command = self._calibration_command_preview.text()
             if command:
@@ -2115,6 +4017,277 @@ def build_main_window(qt: Any, project_root: Path) -> Any:
             )
             self._calibration_copy_feedback.setText(message)
             self.statusBar().showMessage(message, 3000)
+
+        def _open_native_board_capture(self) -> None:
+            if self._board_process_is_running():
+                message = "Stop the CLI board builder before guided capture."
+                self.statusBar().showMessage(message, 4000)
+                return
+
+            config = self._board_building_config()
+            readiness = inspect_board_building(config)
+            if not readiness.ready:
+                message = "Resolve board-building readiness messages before guided capture."
+                self._copy_feedback.setText(message)
+                self.statusBar().showMessage(message, 5000)
+                self._update_board_building_flow()
+                return
+
+            dialog = _NativeBoardCaptureDialog(self, config)
+            result = dialog.exec()
+            if (
+                result == QtWidgets.QDialog.DialogCode.Accepted
+                and dialog.result_payload is not None
+            ):
+                saved = dialog.result_payload
+                message = (
+                    "Saved board definition: "
+                    f"{_display_path(saved.board_yaml_path)}"
+                )
+                self._append_board_log(f"[gui] {message}")
+                self.statusBar().showMessage(message, 6000)
+                self._refresh()
+                return
+            self._update_board_building_flow()
+
+        def _open_native_board_batch_capture(self) -> None:
+            if self._board_process_is_running():
+                message = "Stop the CLI board builder before batch capture."
+                self.statusBar().showMessage(message, 4000)
+                return
+
+            config = self._board_building_config()
+            readiness = inspect_board_building(config)
+            if not readiness.ready:
+                message = "Resolve board-building readiness messages before batch capture."
+                self._copy_feedback.setText(message)
+                self.statusBar().showMessage(message, 5000)
+                self._update_board_building_flow()
+                return
+            try:
+                items = self._board_batch_items()
+            except Exception as exc:
+                message = f"Resolve batch setup before starting: {exc}"
+                self._board_batch_preview.setText(message)
+                self.statusBar().showMessage(message, 5000)
+                return
+
+            dialog = _NativeBoardBatchCaptureDialog(self, config, items)
+            result = dialog.exec()
+            if result == QtWidgets.QDialog.DialogCode.Accepted:
+                message = (
+                    f"Batch capture saved {len(dialog.saved_results)} board "
+                    f"definition{'s' if len(dialog.saved_results) != 1 else ''}."
+                )
+                if dialog.skipped_items:
+                    message += f" Skipped {len(dialog.skipped_items)}."
+                self._append_board_log(f"[gui] {message}")
+                self.statusBar().showMessage(message, 6000)
+                self._refresh()
+                return
+            self._update_board_building_flow()
+
+        def _run_board_building(self) -> None:
+            if self._board_process_is_running():
+                message = "Board builder is already running."
+                self.statusBar().showMessage(message, 3000)
+                return
+
+            config = self._board_building_config()
+            readiness = inspect_board_building(config)
+            if not readiness.ready:
+                message = "Resolve board-building readiness messages before running."
+                self._copy_feedback.setText(message)
+                self.statusBar().showMessage(message, 5000)
+                self._update_board_building_flow()
+                return
+
+            try:
+                launch = build_board_building_launch(config)
+            except Exception as exc:
+                message = f"Could not prepare board-builder launch: {exc}"
+                self._set_board_process_state(
+                    board_building_process_failed(
+                        message,
+                        expected_board_yaml=readiness.expected_board_yaml,
+                        expected_registry=readiness.expected_registry,
+                    )
+                )
+                self._append_board_log(f"[gui] {message}")
+                self.statusBar().showMessage(message, 6000)
+                self._update_board_building_flow()
+                return
+
+            process = QtCore.QProcess(self)
+            process.setProgram(launch.program)
+            process.setArguments(list(launch.arguments))
+            process.setProcessChannelMode(
+                QtCore.QProcess.ProcessChannelMode.SeparateChannels
+            )
+            if hasattr(QtCore, "QProcessEnvironment"):
+                env = QtCore.QProcessEnvironment.systemEnvironment()
+                env.insert("PYTHONUNBUFFERED", "1")
+                process.setProcessEnvironment(env)
+            process.readyReadStandardOutput.connect(self._read_board_stdout)
+            process.readyReadStandardError.connect(self._read_board_stderr)
+            process.finished.connect(self._board_process_finished)
+            process.errorOccurred.connect(self._board_process_error)
+
+            self._board_process = process
+            self._board_running_expected_yaml = launch.expected_board_yaml
+            self._board_running_expected_registry = launch.expected_registry
+            self._board_outputs_existed_at_launch = (
+                launch.expected_board_yaml.exists()
+                and launch.expected_registry.exists()
+            )
+            self._board_previous_yaml_mtime_ns = _path_mtime_ns(
+                launch.expected_board_yaml
+            )
+            self._board_previous_registry_mtime_ns = _path_mtime_ns(
+                launch.expected_registry
+            )
+            self._board_output_seen = self._board_outputs_existed_at_launch
+            self._board_log.clear()
+            self._append_board_log(f"$ {launch.display_command}")
+            self._append_board_log(
+                "[gui] Launching with the current Python interpreter."
+            )
+            self._append_board_log(
+                "[gui] Use the OpenCV window for ENTER/ESC, then send "
+                "terminal prompt responses here."
+            )
+            self._set_board_process_state(
+                board_building_process_running(
+                    launch.expected_board_yaml,
+                    launch.expected_registry,
+                )
+            )
+            self._board_output_timer.start()
+            self._update_board_building_flow()
+            process.start()
+            self.statusBar().showMessage("Board builder process started.", 4000)
+
+        def _send_board_prompt_response(self) -> None:
+            process = self._board_process
+            response = self._board_prompt_input.text()
+            if process is None or not self._board_process_is_running():
+                message = "Board builder is not running."
+                self.statusBar().showMessage(message, 3000)
+                return
+            if not response.strip():
+                message = "Enter a response before sending it to the board builder."
+                self.statusBar().showMessage(message, 3000)
+                return
+            process.write((response + "\n").encode("utf-8"))
+            self._append_board_log(f"[gui stdin] {response}")
+            self._board_prompt_input.clear()
+
+        def _read_board_stdout(self) -> None:
+            process = self._board_process
+            if process is None:
+                return
+            self._append_board_output(process.readAllStandardOutput(), "")
+
+        def _read_board_stderr(self) -> None:
+            process = self._board_process
+            if process is None:
+                return
+            self._append_board_output(process.readAllStandardError(), "stderr")
+
+        def _board_process_finished(
+            self,
+            exit_code: int,
+            exit_status: Any,
+        ) -> None:
+            self._read_board_stdout()
+            self._read_board_stderr()
+            crashed = exit_status == QtCore.QProcess.ExitStatus.CrashExit
+            state = summarize_board_building_process_result(
+                exit_code=int(exit_code),
+                crashed=crashed,
+                expected_board_yaml=self._board_running_expected_yaml,
+                expected_registry=self._board_running_expected_registry,
+                previous_board_mtime_ns=self._board_previous_yaml_mtime_ns,
+                previous_registry_mtime_ns=self._board_previous_registry_mtime_ns,
+                require_output_update=self._board_outputs_existed_at_launch,
+            )
+            self._board_process = None
+            self._board_output_timer.stop()
+            self._set_board_process_state(state)
+            self._append_board_log(f"[gui] {state.message}")
+            self._refresh()
+            self.statusBar().showMessage(state.message, 7000)
+
+        def _board_process_error(self, error: Any) -> None:
+            process = self._board_process
+            error_name = _qt_enum_name(error)
+            detail = process.errorString() if process is not None else error_name
+            self._append_board_log(f"[gui] Process error: {detail}")
+            failed_to_start = QtCore.QProcess.ProcessError.FailedToStart
+            if error != failed_to_start:
+                return
+
+            state = board_building_process_failed(
+                f"Board-builder process failed to start: {detail}",
+                expected_board_yaml=self._board_running_expected_yaml,
+                expected_registry=self._board_running_expected_registry,
+            )
+            self._board_process = None
+            self._board_output_timer.stop()
+            self._set_board_process_state(state)
+            self._update_board_building_flow()
+            self.statusBar().showMessage(state.message, 7000)
+
+        def _poll_board_output(self) -> None:
+            board_yaml = self._board_running_expected_yaml
+            registry = self._board_running_expected_registry
+            if board_yaml is None or registry is None or self._board_output_seen:
+                return
+            if not (board_yaml.exists() and registry.exists()):
+                return
+            self._board_output_seen = True
+            self._append_board_log(
+                f"[gui] Detected board outputs: {_display_path(board_yaml)} "
+                f"and {_display_path(registry)}"
+            )
+            self._refresh()
+
+        def _append_board_output(self, data: Any, prefix: str) -> None:
+            text = bytes(data).decode("utf-8", errors="replace")
+            if not text:
+                return
+            if prefix:
+                for line in text.rstrip().splitlines():
+                    self._append_board_log(f"[{prefix}] {line}")
+            else:
+                self._append_board_log(text.rstrip())
+
+        def _append_board_log(self, text: str) -> None:
+            if not text:
+                return
+            self._board_log.appendPlainText(text)
+            scrollbar = self._board_log.verticalScrollBar()
+            scrollbar.setValue(scrollbar.maximum())
+
+        def _set_board_process_state(
+            self,
+            state: BoardBuildingProcessState,
+        ) -> None:
+            self._board_process_state = state
+            if hasattr(self, "_board_process_state_label"):
+                self._board_process_state_label.setText(
+                    _format_board_building_process_state(state)
+                )
+            if hasattr(self, "_board_run_button"):
+                self._board_run_button.setText(
+                    _board_building_run_button_label(state)
+                )
+
+        def _board_process_is_running(self) -> bool:
+            process = self._board_process
+            if process is None:
+                return False
+            return process.state() != QtCore.QProcess.ProcessState.NotRunning
 
         def _run_calibration(self) -> None:
             if self._calibration_process_is_running():
@@ -2315,6 +4488,26 @@ def build_main_window(qt: Any, project_root: Path) -> Any:
             )
             self._object_tags_paper_mm_field.setVisible(custom)
 
+        def _render_board_source_fields(self) -> None:
+            source = self._board_source_value()
+            is_webcam = source == BOARD_SOURCE_OPENCV
+            is_video = source == BOARD_SOURCE_VIDEO
+            uses_capture_size = source in {
+                BOARD_SOURCE_OPENCV,
+                BOARD_SOURCE_REALSENSE,
+            }
+            self._board_camera_field.setVisible(is_webcam)
+            self._board_video_field.setVisible(is_video)
+            self._board_video_path.setEnabled(is_video)
+            self._board_video_browse_button.setEnabled(is_video)
+            for field in (self._board_width, self._board_height, self._board_fps):
+                field.setEnabled(uses_capture_size)
+
+        def _render_board_save_shot_fields(self) -> None:
+            save_shot = bool(self._board_save_shot.isChecked())
+            self._board_shots_field.setVisible(save_shot)
+            self._board_shots_dir.setEnabled(save_shot)
+
         def _calibration_config(self) -> CameraCalibrationConfig:
             return CameraCalibrationConfig(
                 project_root=self._current_project_root(),
@@ -2369,12 +4562,51 @@ def build_main_window(qt: Any, project_root: Path) -> Any:
                 prefix=self._object_tags_prefix.text(),
             )
 
+        def _board_building_config(self) -> BoardBuildingConfig:
+            self._sync_board_definition_name()
+            calib_text = self._board_calibration_path.text().strip()
+            video_text = self._board_video_path.text().strip()
+            out_dir_text = self._board_out_dir.text().strip()
+            registry_text = self._board_registry_path.text().strip()
+            shots_text = self._board_shots_dir.text().strip()
+            return BoardBuildingConfig(
+                project_root=self._current_project_root(),
+                object_name=self._board_object_name.text(),
+                tag_size_mm=float(self._board_tag_size.value()),
+                family=self._board_family.text(),
+                calibration_path=Path(calib_text).expanduser()
+                if calib_text
+                else None,
+                source=self._board_source_value(),
+                camera_index=int(self._board_camera_index.value()),
+                video_path=Path(video_text).expanduser() if video_text else None,
+                width=int(self._board_width.value()),
+                height=int(self._board_height.value()),
+                fps=int(self._board_fps.value()),
+                out_dir=Path(out_dir_text).expanduser() if out_dir_text else None,
+                registry_path=Path(registry_text).expanduser()
+                if registry_text
+                else None,
+                save_shot=bool(self._board_save_shot.isChecked()),
+                shots_dir=Path(shots_text).expanduser() if shots_text else None,
+                z_threshold_m=float(self._board_z_threshold.value()),
+                allow_nonplanar=bool(self._board_allow_nonplanar.isChecked()),
+            )
+
         def _object_tag_id_mode_value(self) -> str:
             data = self._object_tags_id_mode.currentData()
             raw = str(data if data is not None else self._object_tags_id_mode.currentText())
             if raw in OBJECT_TAG_ID_MODE_CHOICES:
                 return raw
             return OBJECT_TAG_ID_MODE_RANGE if "count" in raw.lower() else OBJECT_TAG_ID_MODE_LIST
+
+        def _board_source_value(self) -> str:
+            data = self._board_source.currentData()
+            raw = str(data if data is not None else self._board_source.currentText())
+            try:
+                return normalize_board_source(raw)
+            except Exception:
+                return BOARD_SOURCE_OPENCV
 
         def _model_by_stage_id(self, stage_id: int) -> Optional[StageViewModel]:
             for model in self._models:
@@ -2573,12 +4805,110 @@ def _format_object_tag_expected_output(
     return f"{_display_path(readiness.expected_output_dir)}\nStatus: {state}"
 
 
+def _format_board_building_readiness(
+    readiness: BoardBuildingReadiness,
+) -> str:
+    lines = [
+        (
+            "Ready to capture board definitions."
+            if readiness.ready
+            else "Not ready yet."
+        )
+    ]
+    if readiness.errors:
+        lines.extend(["", "Errors", *_format_items(readiness.errors)])
+    if readiness.warnings:
+        lines.extend(["", "Warnings", *_format_items(readiness.warnings)])
+    return "\n".join(lines)
+
+
+def _format_board_building_outputs(readiness: BoardBuildingReadiness) -> str:
+    outputs = readiness.output_status
+    lines = [
+        "Calibration YAML",
+        f"{_display_path(readiness.calibration_path)}",
+        f"Status: {'present' if readiness.calibration_path.exists() else 'missing'}",
+        "",
+        "Board YAML",
+        f"{_display_path(outputs.board_yaml_path)}",
+        f"Status: {'present' if outputs.board_yaml_exists else 'missing'}",
+        "",
+        "Tag registry",
+        f"{_display_path(outputs.registry_path)}",
+        f"Status: {'present' if outputs.registry_exists else 'missing'}",
+    ]
+    if outputs.shots_dir in outputs.checked_paths:
+        lines.extend(
+            [
+                "",
+                "Audit shots",
+                f"{_display_path(outputs.shots_dir)}",
+                f"Status: {'present' if outputs.shots_dir_exists else 'missing'}",
+            ]
+        )
+    return "\n".join(lines)
+
+
+def _format_board_building_process_state(
+    state: BoardBuildingProcessState,
+) -> str:
+    lines = [state.label, "", state.message]
+    if state.expected_board_yaml is not None:
+        lines.extend(
+            ["", f"Expected board: {_display_path(state.expected_board_yaml)}"]
+        )
+    if state.expected_registry is not None:
+        lines.append(f"Expected registry: {_display_path(state.expected_registry)}")
+    if state.exit_code is not None:
+        lines.append(f"Exit code: {state.exit_code}")
+    return "\n".join(lines)
+
+
 def _format_id_summary(ids: tuple[int, ...]) -> str:
     if not ids:
         return "none"
     if len(ids) <= 12:
         return ", ".join(str(tag_id) for tag_id in ids)
     return f"{ids[0]}-{ids[-1]} ({len(ids)} IDs)"
+
+
+def _checked_tag_ids_for_update(
+    ids: tuple[int, ...],
+    current_checked: set[int],
+    *,
+    force_all: bool = False,
+) -> set[int]:
+    id_set = set(ids)
+    if force_all or not current_checked:
+        return id_set
+    retained = current_checked & id_set
+    return retained if retained else id_set
+
+
+def _format_board_batch_preview(items: tuple[BoardBatchItem, ...]) -> str:
+    if not items:
+        return "No boards queued."
+    shown = [
+        (
+            f"{item.object_name} ({item.tag_size_mm:g} mm)"
+            if item.tag_size_mm is not None
+            else item.object_name
+        )
+        for item in items[:8]
+    ]
+    lines = [f"{len(items)} board{'s' if len(items) != 1 else ''} queued."]
+    lines.extend(f"- {name}" for name in shown)
+    if len(items) > len(shown):
+        lines.append(f"- ... {len(items) - len(shown)} more")
+    return "\n".join(lines)
+
+
+def _format_batch_item_tag_size(
+    item: BoardBatchItem,
+    base_config: BoardBuildingConfig,
+) -> str:
+    value = item.tag_size_mm if item.tag_size_mm is not None else base_config.tag_size_mm
+    return f"{value:g}"
 
 
 def _format_calibration_metadata(readiness: CameraCalibrationReadiness) -> str:
@@ -2776,6 +5106,14 @@ def _calibration_run_button_label(state: CameraCalibrationProcessState) -> str:
     return "Run Calibration"
 
 
+def _board_building_run_button_label(state: BoardBuildingProcessState) -> str:
+    if state.running:
+        return "Board Builder Running..."
+    if state.success:
+        return "Run Board Builder Again"
+    return "Run Board Builder"
+
+
 def _qt_enum_name(value: Any) -> str:
     return str(getattr(value, "name", value))
 
@@ -2939,12 +5277,49 @@ def _object_tag_command_ready_message(
     return "Ready to generate or copy an object AprilTag command."
 
 
+def _board_building_command_card_note(
+    readiness: BoardBuildingReadiness,
+    model: StageViewModel,
+) -> str:
+    if not readiness.command_preview:
+        return (
+            "Resolve the board-building readiness messages above before "
+            "copying a posetag-make-board command."
+        )
+    if model.status == "complete":
+        return (
+            "Board YAML and tag registry outputs already pass the current "
+            "checks. Copy this command only if you need to rebuild a board."
+        )
+    return (
+        "Start Batch opens the native guided capture flow for every queued "
+        "object side. Guided Capture handles the current board only. Run "
+        "Board Builder starts the existing posetag-make-board CLI fallback, "
+        "and Copy Command keeps the terminal fallback. In the CLI path, press "
+        "ENTER in the OpenCV preview to capture, then answer the selected-ID "
+        "and origin-ID prompts in the Stage 4 prompt box."
+    )
+
+
+def _board_building_command_ready_message(
+    readiness: BoardBuildingReadiness,
+    *,
+    stage_complete: bool = False,
+) -> str:
+    if not readiness.command_preview:
+        return "No runnable board-building command is available yet."
+    if stage_complete:
+        return "Board definition outputs exist. Copy only if you need to rerun it."
+    return "Ready for batch capture, single-board capture, CLI launch, or copy."
+
+
 def _project_root_hint(root: Path) -> str:
     if root.is_dir():
         return (
             "Project folder found. Status checks are read-only except guided "
             "Stage 1 board generation, Stage 2 calibration launch, and Stage "
-            "3 object tag generation."
+            "3 object tag generation. Stage 4 can launch the existing "
+            "board-building workflow."
         )
     if root.exists():
         return "Selected path exists but is not a folder."
@@ -3082,6 +5457,20 @@ QFrame#ActionCard {
     border-left: 3px solid #087966;
     border-radius: 8px;
 }
+QGroupBox#CollapsibleGroup {
+    background: #fbfdff;
+    border: 1px solid #d7e4ed;
+    border-radius: 7px;
+    margin-top: 8px;
+    padding-top: 8px;
+    font-weight: 700;
+}
+QGroupBox#CollapsibleGroup::title {
+    subcontrol-origin: margin;
+    left: 8px;
+    padding: 0 4px;
+    color: #203245;
+}
 QFrame#CharucoPreviewColumn,
 QFrame#ObjectTagPreviewColumn {
     background: #f4f8fb;
@@ -3199,6 +5588,43 @@ QListWidget#WorkflowRail {
     background: transparent;
     border: none;
     padding: 0;
+}
+QListWidget#BatchCaptureQueue {
+    background: #ffffff;
+    border: 1px solid #b8ccda;
+    border-radius: 7px;
+    padding: 5px;
+}
+QListWidget#BatchCaptureQueue::item {
+    padding: 7px 8px;
+    border: 1px solid transparent;
+    border-radius: 6px;
+}
+QListWidget#BatchCaptureQueue::item:hover {
+    background: #eff7fb;
+    border: 1px solid #bad7e7;
+}
+QListWidget#BatchCaptureQueue::item:selected,
+QListWidget#BatchCaptureQueue::item:selected:!active {
+    background: #d9efff;
+    color: #08253d;
+    border: 2px solid #0b6f8f;
+}
+QListWidget#BoardObjectRows {
+    background: #ffffff;
+    border: 1px solid #c7d3df;
+    border-radius: 6px;
+}
+QListWidget#BoardObjectRows::item {
+    padding: 5px 7px;
+    border: 1px solid transparent;
+    border-radius: 5px;
+}
+QListWidget#BoardObjectRows::item:selected,
+QListWidget#BoardObjectRows::item:selected:!active {
+    background: #d9efff;
+    color: #08253d;
+    border: 1px solid #0b6f8f;
 }
 QListWidget::item {
     padding: 0;

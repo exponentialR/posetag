@@ -121,14 +121,35 @@ process output into a compact log, and watches for the expected
 generate object AprilTag PNG/PDF sheets with `posetag-gen-tags`, including tag
 size, ID list or start/count range, paper, DPI, layout, prefix, and output
 folder settings. It previews the first generated PNG sheet and can open
-selected folders in the system file manager. The
+selected folders in the system file manager. In Stage 4 it guides object board
+definition setup for `posetag-make-board`: object/face name, tag size, family,
+calibration YAML, webcam/RealSense/video source settings, optional output paths,
+and expected `boards/<object_name>.yaml` plus `boards/tag_registry.yaml`
+status. The GUI splits the board identity into an object label and side/face
+label, then passes the composed board definition name, for example
+`connection_plate_white_sideA`, to the same board-building writer used by the
+CLI. Stage 4 offers a native Batch Guided Capture flow for repeated object
+types and instances such as `connection_plate | 01-08 | sideA, sideB`. The
+dashboard keeps the object queue, tag size, source, and calibration path
+visible, with single-board, bulk-paste, advanced output, and CLI fallback
+details in expandable sections. It keeps the camera open, walks through the
+generated board queue, auto-captures when the visible tag IDs are stable, lets
+you confirm the selected tag IDs and origin tag, and writes each board YAML
+plus the tag registry through the shared board-building helpers. It can also
+persist the pre-capture queue to
+`<project_root>/boards/board_building_queue.yaml` as a reloadable draft. That
+draft records planned object rows and capture settings only; PoseTag does not
+create board YAML or tag-registry entries until a real capture is saved. It can
+also launch the existing `posetag-make-board` workflow as a fallback, stream
+process output, and provide a prompt-response box for the selected tag IDs and
+origin tag while keeping the OpenCV `ENTER`/`ESC` controls unchanged. The
 calibration capture window also shows
 state-driven guidance based on detected ChArUco corners and accepted sample
 coverage, such as moving the board toward missing frame edges/corners or
 changing distance. Guided auto-capture saves good frames as the board covers
 the grid, while `SPACE` remains available as a manual override. The GUI does
-not reimplement AprilTag rendering, camera capture, calibration solving,
-board-building, annotation, or dataset workflows.
+not reimplement AprilTag rendering, calibration solving, board-frame math,
+board YAML schemas, registry writing, annotation, or dataset workflows.
 
 ## Scientific Contract
 
@@ -415,6 +436,46 @@ Tips:
 - source and calibration failures are checked before board YAML or registry
   output artifacts are created
 
+The optional `posetag-gui` dashboard exposes this as guided Stage 4. It
+prepares board-building state from object label, side/face label, tag size,
+family, calibration YAML path, webcam/RealSense/video source settings, and
+optional output paths. The composed board definition name is the single
+`--object_name` value used by the existing CLI and by
+`boards/<object_name>.yaml`; sideA-sideF presets help keep repeated object
+faces labelled consistently.
+
+The preferred GUI path is **Start Batch**. Stage 4 carries over the Stage 3
+object-tag size when it can, either from the current GUI value or from the
+latest generated pattern filename. Add object rows from the compact
+object/instances/sides/tag-size controls, or expand **Bulk Paste** for
+multi-object rows in this format:
+
+```text
+connection_plate | 01-08 | sideA, sideB | 80
+column | 01-04 | sideA-sideB | 40
+column | 01-04 | sideC-sideD | 80
+```
+
+PoseTag generates board names such as `connection_plate_01_sideA`, keeps one
+native live preview open, detects pose-estimated tags, gives stability
+guidance, auto-captures once the visible IDs hold steady, then lets you confirm
+the selected tag IDs and origin tag before saving and advancing. The save step
+uses the per-board tag size and the shared board-frame, planarity, board YAML,
+and tag-registry helpers. The existing board YAML schema stores one
+`tag_size_m` per board definition, so different sides can use different sizes
+as separate queued boards. Pressing **Add Object** immediately saves the
+planned queue and current capture settings to
+`<project_root>/boards/board_building_queue.yaml`; reopening the dashboard
+loads that draft so rows can be selected, inspected, or captured later. This
+draft is not a board definition and does not mark Stage 4 complete. The board
+name is the idempotent identity: recapturing `connection_plate_01_sideA`
+replaces `boards/connection_plate_01_sideA.yaml` and removes stale registry
+entries that used to point at that same board YAML.
+The dashboard still keeps single **Guided Capture**, copyable
+`posetag-make-board`, and CLI launch paths as fallbacks; the CLI paths explain
+that `ENTER` captures and `ESC` quits, then accept selected tag IDs plus
+origin tag through the GUI prompt-response box.
+
 **Example board YAML** (`connection_plate_white_sideA.yaml`)
 
 ```yaml
@@ -448,9 +509,11 @@ tags:
     yaml: my_project/boards/connection_plate_white_sideA.yaml
 ```
 
-The registry is updated each time you run `posetag-make-board`. If the same tag
-ID is already mapped to another board YAML, PoseTag warns and preserves the
-existing mapping so conflicts are not silently overwritten.
+The registry is updated each time you run `posetag-make-board`. Recapturing the
+same board YAML removes stale tag IDs for that board before writing the new
+membership. If the same tag ID is already mapped to another board YAML, PoseTag
+warns and preserves the existing mapping so conflicts are not silently
+overwritten.
 
 Faces may use different tag sizes; each face YAML stores its own `tag_size_m`.
 
@@ -878,7 +941,8 @@ are:
 - `posetag-annotate` -> single, batch, and browse annotation flows
 - `posetag-collect` -> dataset capture
 - `posetag-gui` -> optional workflow dashboard for status, ChArUco board
-  setup, guided calibration launch, and object AprilTag generation
+  setup, guided calibration launch, object AprilTag generation, and
+  board-building guidance
 - `python3 -m gen_keypoints` -> canonical keypoint generation
 - `python3 -m view_keypoints` -> mesh/keypoint visualisation
 
