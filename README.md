@@ -117,14 +117,18 @@ RealSense, or video source settings, and can launch the existing
 `posetag-calib-charuco` workflow with a `Run Calibration` button when
 readiness checks pass. The panel keeps a copyable command fallback, streams
 process output into a compact log, and watches for the expected
-`<project_root>/calib/calib_color.yaml` output path. It can open selected
-folders in the system file manager. The calibration capture window also shows
+`<project_root>/calib/calib_color.yaml` output path. In Stage 3 it can
+generate object AprilTag PNG/PDF sheets with `posetag-gen-tags`, including tag
+size, ID list or start/count range, paper, DPI, layout, prefix, and output
+folder settings. It previews the first generated PNG sheet and can open
+selected folders in the system file manager. The
+calibration capture window also shows
 state-driven guidance based on detected ChArUco corners and accepted sample
 coverage, such as moving the board toward missing frame edges/corners or
 changing distance. Guided auto-capture saves good frames as the board covers
 the grid, while `SPACE` remains available as a manual override. The GUI does
-not reimplement camera capture, calibration solving, board-building,
-annotation, or dataset workflows.
+not reimplement AprilTag rendering, camera capture, calibration solving,
+board-building, annotation, or dataset workflows.
 
 ## Scientific Contract
 
@@ -200,6 +204,12 @@ Options you might tweak later: `--paper {A4,LETTER,LEGAL}`, `--paper-mm WxH`,
 `--orientation`, `--dpi`, and `--out_dir`.
 
 Standard PoseTag installs write both PNG and PDF sheets.
+
+In the calibration-first GUI workflow, generate these object tags from
+`posetag-gui` Stage 3 after `calib/calib_color.yaml` exists. The Stage 3 panel
+uses the same generator, shows the exact command fallback, refreshes project
+status after generation, previews the first generated sheet, and reminds you to
+print at **100%** / **Actual Size** without “Fit to page”.
 
 ---
 
@@ -868,7 +878,7 @@ are:
 - `posetag-annotate` -> single, batch, and browse annotation flows
 - `posetag-collect` -> dataset capture
 - `posetag-gui` -> optional workflow dashboard for status, ChArUco board
-  setup, and guided calibration launch
+  setup, guided calibration launch, and object AprilTag generation
 - `python3 -m gen_keypoints` -> canonical keypoint generation
 - `python3 -m view_keypoints` -> mesh/keypoint visualisation
 

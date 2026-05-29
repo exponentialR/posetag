@@ -28,6 +28,9 @@ from posetag.gui.main_window import (
     _format_calibration_process_state,
     _format_charuco_outputs,
     _format_health_counts,
+    _format_object_tag_expected_output,
+    _format_object_tag_outputs,
+    _format_object_tag_readiness,
     _health_status_style,
     _project_root_hint,
     _stage_list_label,
@@ -43,6 +46,10 @@ from posetag.workflows.calibration_flow import (
     CameraCalibrationOutputSummary,
     calibration_process_not_started,
     calibration_process_running,
+)
+from posetag.workflows.object_tags import (
+    ObjectTagGenerationReadiness,
+    ObjectTagGenerationResult,
 )
 from posetag.gui.models import inspect_project_view, project_health_view
 from posetag.workflows.commands import command_preview
@@ -316,6 +323,7 @@ class WorkflowGuiTests(unittest.TestCase):
         self.assertIn("QFrame#RailPanel", style)
         self.assertIn("QFrame#HealthPanel", style)
         self.assertIn("QScrollArea#HealthScroll", style)
+        self.assertIn("QFrame#ObjectTagPreviewColumn", style)
         self.assertIn("background: #f2f7fb", style)
         self.assertIn("background: #f6fafc", style)
         self.assertIn("QLabel#StageTitle", style)
@@ -329,6 +337,7 @@ class WorkflowGuiTests(unittest.TestCase):
         self.assertIn("QLabel#RailStageDot", style)
         self.assertIn("QLabel#RailStageStatus", style)
         self.assertIn("QLabel#CharucoPreviewCanvas", style)
+        self.assertIn("QLabel#ObjectTagPreviewCanvas", style)
         self.assertIn("QPlainTextEdit#CalibrationYamlView", style)
         self.assertIn("monospace", style)
         self.assertIn("font-weight: 800", style)
@@ -349,6 +358,42 @@ class WorkflowGuiTests(unittest.TestCase):
         self.assertIn("PNG:    board.png", summary)
         self.assertIn("YAML:   board.yaml", summary)
         self.assertIn("PDF:    not requested", summary)
+
+    def test_object_tag_output_summary_lists_generated_sheets(self) -> None:
+        result = ObjectTagGenerationResult(
+            png_paths=(Path("apriltag_36h11_IDs1-4_40mm_A4_80dpi.png"),),
+            pdf_paths=(Path("apriltag_36h11_IDs1-4_40mm_A4_80dpi.pdf"),),
+            out_dir=Path("/tmp/project/boards/patterns"),
+            parsed_ids=(1, 2, 3, 4),
+        )
+
+        summary = _format_object_tag_outputs(result)
+
+        self.assertIn("Folder:", summary)
+        self.assertIn("IDs:    1, 2, 3, 4", summary)
+        self.assertIn("PNG:    1 sheet", summary)
+        self.assertIn("PDF:    1 sheet", summary)
+
+    def test_object_tag_readiness_summary_reports_errors_and_output(self) -> None:
+        readiness = ObjectTagGenerationReadiness(
+            ready=False,
+            command_preview="",
+            expected_output_dir=Path("/tmp/project/boards/patterns"),
+            parsed_ids=(1, 2),
+            checked_paths=(Path("/tmp/project/calib/calib_color.yaml"),),
+            warnings=("Printer scaling must be checked.",),
+            errors=("Complete Stage 2 camera calibration first.",),
+        )
+
+        summary = _format_object_tag_readiness(readiness)
+        output = _format_object_tag_expected_output(readiness)
+
+        self.assertIn("Not ready yet", summary)
+        self.assertIn("IDs: 1, 2", summary)
+        self.assertIn("Complete Stage 2", summary)
+        self.assertIn("Printer scaling", summary)
+        self.assertIn("boards/patterns", output)
+        self.assertIn("Status: missing", output)
 
     def test_calibration_process_state_text_and_run_button_labels(self) -> None:
         expected_output = Path("/tmp/project/calib/calib_color.yaml")
