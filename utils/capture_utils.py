@@ -2,7 +2,10 @@ import argparse, os, sys, json, time, datetime, re
 import yaml
 import numpy as np
 import cv2
-import pyrealsense2 as rs
+try:
+    import pyrealsense2 as rs
+except Exception:
+    rs = None
 from pathlib import Path
 from typing import List, Dict, Tuple, Optional, Set
 import csv
