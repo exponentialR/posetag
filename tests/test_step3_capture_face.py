@@ -21,6 +21,7 @@ from posetag.pipelines.capture_face import (
     append_capture_manifest,
     build_capture_metadata,
     build_shot_paths,
+    CaptureFaceError,
     load_capture_registry,
     load_registered_faces,
     prepare_capture_paths,
@@ -372,6 +373,42 @@ class CaptureFaceStep3Tests(unittest.TestCase):
             self.assertTrue(selection.auto_side)
             self.assertEqual(selection.faces[0]["yaml"], str(board_path))
             self.assertEqual(selection.faces[0]["tag_ids"], (52, 53))
+
+    def test_stale_registry_missing_board_tag_fails_clearly(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            project_root = Path(tmpdir) / "project"
+            _board_path, registry_path = _write_board_and_registry(project_root)
+            registry = yaml.safe_load(registry_path.read_text(encoding="utf-8"))
+            del registry["tags"]["53"]
+            registry_path.write_text(yaml.safe_dump(registry), encoding="utf-8")
+
+            with self.assertRaises(CaptureFaceError) as ctx:
+                load_registered_faces(
+                    load_capture_registry(registry_path),
+                    project_root=project_root,
+                    registry_path=registry_path,
+                )
+
+            self.assertIn("do not cover all board YAML tag IDs", str(ctx.exception))
+            self.assertIn("53", str(ctx.exception))
+
+    def test_project_calibration_takes_precedence_over_cwd_file(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            base = Path(tmpdir)
+            project_root = base / "project"
+            project_calib = project_root / "calib" / "calib_color.yaml"
+            cwd_calib = base / "cwd" / "calib_color.yaml"
+            _write_calibration(project_calib)
+            _write_calibration(cwd_calib)
+
+            previous_cwd = Path.cwd()
+            os.chdir(cwd_calib.parent)
+            try:
+                resolved = resolve_capture_calibration_path(project_root, "calib_color.yaml")
+            finally:
+                os.chdir(previous_cwd)
+
+            self.assertEqual(resolved.resolve(), project_calib.resolve())
 
     def test_path_metadata_and_manifest_helpers(self) -> None:
         with TemporaryDirectory() as tmpdir:

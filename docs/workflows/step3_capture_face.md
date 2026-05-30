@@ -54,7 +54,9 @@ my_project/boards/tag_registry.yaml
 ```
 
 Every registry entry used by Step 3 must reference an existing board YAML, and
-the registry object/tag IDs must match the referenced board YAML.
+the registry object/tag IDs must match the referenced board YAML. The registry
+membership for a referenced board must cover all tag IDs listed in that board
+YAML, so Step 3 does not under-report expected tags for stale registries.
 
 ## Command Examples
 
@@ -244,6 +246,8 @@ CSV row.
 - Registry entries that reference missing board YAML files fail before preview.
 - Registry object/tag mismatches with referenced board YAML files fail before
   preview.
+- Registry membership that does not cover all tag IDs in the referenced board
+  YAML fails before preview.
 - Unknown `--object_name` selections fail before preview.
 - `ESC` / `q` exits cleanly without writing another shot.
 - Video EOF exits cleanly without hanging.

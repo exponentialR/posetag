@@ -565,10 +565,10 @@ regular USB webcam or laptop camera.
   `<root>/calib/calib_color.yaml` and `<root>/boards/tag_registry.yaml`
 - The registry must reference readable board YAML files created by
   `posetag-make-board`.
-- Missing calibration, missing or malformed registries, missing board YAML
-  references, unknown object selections, missing `--video`, unreadable videos,
-  and unavailable RealSense support fail clearly before capture artifacts are
-  written.
+- Missing calibration, missing or malformed registries, incomplete registry
+  membership, missing board YAML references, unknown object selections, missing
+  `--video`, unreadable videos, and unavailable RealSense support fail clearly
+  before capture artifacts are written.
 
 **Workflow in the viewer**
 

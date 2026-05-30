@@ -44,6 +44,9 @@ annotation. It does not compute board-to-object transforms, dataset outputs, or
 - Missing, malformed, and empty tag registries fail before preview.
 - Registry references to missing board YAML files fail before preview.
 - Registry object/tag mismatches against board YAML files fail before preview.
+- Registry membership that omits tag IDs from a referenced board YAML fails
+  before preview, so `expected_tag_ids` cannot be under-reported from stale
+  registry entries.
 - Unknown `--object_name` selections fail before preview.
 - Video EOF exits cleanly instead of hanging.
 - `ESC` exits cleanly without writing capture outputs.
@@ -61,7 +64,7 @@ python3 -m unittest tests.test_step3_capture_face -v
 Result:
 
 ```text
-16 tests passed
+18 tests passed
 ```
 
 ```bash
@@ -71,7 +74,7 @@ python3 -m unittest discover -s tests -v
 Result:
 
 ```text
-218 tests passed
+220 tests passed
 ```
 
 ```bash

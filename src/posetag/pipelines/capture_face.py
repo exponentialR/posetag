@@ -143,13 +143,13 @@ def resolve_capture_calibration_path(
     raw = Path(calib or "calib_color.yaml").expanduser()
     if raw.is_absolute():
         return raw
-    if raw.exists():
-        return raw
 
     candidates = (root / "calib" / raw, root / raw)
     for candidate in candidates:
         if candidate.exists():
             return candidate
+    if raw.exists():
+        return raw
     return candidates[0]
 
 
@@ -362,14 +362,23 @@ def load_registered_faces(
 
         grouped.setdefault((board_path, object_name), set()).add(tag_id)
 
-    faces = [
-        {
-            "yaml": str(board_path),
-            "object": object_name,
-            "tag_ids": tuple(sorted(tag_ids)),
-        }
-        for (board_path, object_name), tag_ids in grouped.items()
-    ]
+    faces = []
+    for (board_path, object_name), registry_tag_ids in grouped.items():
+        board_object, board_tag_ids = board_cache[board_path]
+        missing_tag_ids = sorted(board_tag_ids.difference(registry_tag_ids))
+        if missing_tag_ids:
+            joined = ", ".join(str(tag_id) for tag_id in missing_tag_ids)
+            raise CaptureFaceError(
+                f"Tag registry entries for {board_path} do not cover all board "
+                f"YAML tag IDs; missing {joined}."
+            )
+        faces.append(
+            {
+                "yaml": str(board_path),
+                "object": board_object,
+                "tag_ids": tuple(sorted(board_tag_ids)),
+            }
+        )
     faces.sort(key=lambda face: (str(face["object"]), Path(str(face["yaml"])).name))
     if not faces:
         raise CaptureFaceError("Tag registry YAML did not resolve to any readable board faces.")
