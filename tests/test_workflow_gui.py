@@ -20,6 +20,9 @@ from posetag.gui.main_window import (
     _board_building_command_card_note,
     _board_building_command_ready_message,
     _board_building_run_button_label,
+    _capture_face_command_card_note,
+    _capture_face_command_ready_message,
+    _capture_face_run_button_label,
     _command_button_label,
     _command_card_note,
     _command_card_title,
@@ -34,6 +37,9 @@ from posetag.gui.main_window import (
     _format_board_building_process_state,
     _format_board_building_readiness,
     _format_board_batch_preview,
+    _format_capture_face_outputs,
+    _format_capture_face_process_state,
+    _format_capture_face_readiness,
     _format_charuco_outputs,
     _format_health_counts,
     _format_object_tag_expected_output,
@@ -62,6 +68,14 @@ from posetag.workflows.board_building import (
     BoardBuildingReadiness,
     board_building_process_not_started,
     board_building_process_running,
+)
+from posetag.pipelines.capture_face import CaptureFacePaths
+from posetag.workflows.capture_face import (
+    CaptureFaceOutputStatus,
+    CaptureFaceProcessState,
+    CaptureFaceReadiness,
+    capture_face_process_not_started,
+    capture_face_process_running,
 )
 from posetag.workflows.object_tags import (
     ObjectTagGenerationReadiness,
@@ -590,6 +604,142 @@ class WorkflowGuiTests(unittest.TestCase):
         self.assertIn("not started", _format_board_building_process_state(idle))
         self.assertIn("Expected board:", _format_board_building_process_state(idle))
         self.assertIn("selected tag IDs", _format_board_building_process_state(running))
+
+    def test_capture_face_readiness_summary_reports_coverage_outputs(self) -> None:
+        outputs = CaptureFaceOutputStatus(
+            registry_path=Path("/tmp/project/boards/tag_registry.yaml"),
+            manifest_path=Path("/tmp/project/shots/manifest.csv"),
+            out_dir=Path("/tmp/project/shots"),
+            checked_paths=(
+                Path("/tmp/project/boards/tag_registry.yaml"),
+                Path("/tmp/project/shots/manifest.csv"),
+            ),
+            registered_faces=(
+                "connection_plate_white_sideA",
+                "connection_plate_white_sideB",
+            ),
+            covered_faces=("connection_plate_white_sideA",),
+            missing_faces=("connection_plate_white_sideB",),
+            valid_shot_count=1,
+            invalid_shot_count=1,
+            manifest_exists=True,
+            errors=(),
+            warnings=("One manifest row is missing a raw image.",),
+        )
+        paths = CaptureFacePaths(
+            project_root=Path("/tmp/project"),
+            calib_path=Path("/tmp/project/calib/calib_color.yaml"),
+            registry_path=outputs.registry_path,
+            out_dir=outputs.out_dir,
+            manifest_path=outputs.manifest_path,
+            log_path=Path("/tmp/project/logs/capture_face.log"),
+        )
+        readiness = CaptureFaceReadiness(
+            ready=False,
+            command_preview="",
+            calibration_path=paths.calib_path,
+            paths=paths,
+            output_status=outputs,
+            registered_bases=("connection_plate_white",),
+            registered_faces=outputs.registered_faces,
+            selected_faces=("connection_plate_white_sideA",),
+            checked_paths=(paths.calib_path, outputs.registry_path),
+            warnings=outputs.warnings,
+            errors=("Choose a registered object or face before capture.",),
+        )
+
+        summary = _format_capture_face_readiness(readiness)
+        output = _format_capture_face_outputs(readiness)
+
+        self.assertIn("Not ready yet", summary)
+        self.assertIn("Registered objects", summary)
+        self.assertIn("Selected faces", summary)
+        self.assertIn("Choose a registered object", summary)
+        self.assertIn("Calibration YAML", output)
+        self.assertIn("Tag registry", output)
+        self.assertIn("Manifest", output)
+        self.assertIn("1/2 registered faces", output)
+        self.assertIn("connection_plate_white_sideB", output)
+        self.assertIn("Invalid rows", output)
+
+    def test_capture_face_command_note_keeps_existing_workflow_boundary(self) -> None:
+        outputs = CaptureFaceOutputStatus(
+            registry_path=Path("/tmp/project/boards/tag_registry.yaml"),
+            manifest_path=Path("/tmp/project/shots/manifest.csv"),
+            out_dir=Path("/tmp/project/shots"),
+            checked_paths=(),
+            registered_faces=("connection_plate_white_sideA",),
+            covered_faces=(),
+            missing_faces=("connection_plate_white_sideA",),
+            valid_shot_count=0,
+            invalid_shot_count=0,
+            manifest_exists=False,
+            errors=(),
+            warnings=(),
+        )
+        paths = CaptureFacePaths(
+            project_root=Path("/tmp/project"),
+            calib_path=Path("/tmp/project/calib/calib_color.yaml"),
+            registry_path=outputs.registry_path,
+            out_dir=outputs.out_dir,
+            manifest_path=outputs.manifest_path,
+            log_path=Path("/tmp/project/logs/capture_face.log"),
+        )
+        readiness = CaptureFaceReadiness(
+            ready=True,
+            command_preview="posetag-capture-face --project_root /tmp/project",
+            calibration_path=paths.calib_path,
+            paths=paths,
+            output_status=outputs,
+            registered_bases=("connection_plate_white",),
+            registered_faces=outputs.registered_faces,
+            selected_faces=outputs.registered_faces,
+            checked_paths=(),
+            warnings=(),
+            errors=(),
+        )
+        active = SimpleNamespace(status="missing")
+        complete = SimpleNamespace(status="complete")
+
+        note = _capture_face_command_card_note(readiness, active)
+        complete_note = _capture_face_command_card_note(readiness, complete)
+
+        self.assertIn("Run Capture Face", note)
+        self.assertIn("posetag-capture-face", note)
+        self.assertIn("OpenCV preview", note)
+        self.assertIn("ENTER", note)
+        self.assertIn("manifest row", note)
+        self.assertIn("every registered face", complete_note)
+        self.assertEqual(
+            _capture_face_command_ready_message(readiness),
+            "Ready to launch or copy a face-shot capture command.",
+        )
+
+    def test_capture_face_process_state_text_and_run_button_labels(self) -> None:
+        manifest = Path("/tmp/project/shots/manifest.csv")
+        idle = capture_face_process_not_started(manifest)
+        running = capture_face_process_running(manifest)
+        success = CaptureFaceProcessState(
+            state="finished",
+            label="finished",
+            message="Face-shot manifest was updated.",
+            success=True,
+            expected_manifest=manifest,
+            exit_code=0,
+        )
+
+        self.assertEqual(_capture_face_run_button_label(idle), "Run Capture Face")
+        self.assertEqual(
+            _capture_face_run_button_label(running),
+            "Capture Running...",
+        )
+        self.assertEqual(
+            _capture_face_run_button_label(success),
+            "Run Capture Again",
+        )
+        self.assertIn("not started", _format_capture_face_process_state(idle))
+        self.assertIn("Expected manifest:", _format_capture_face_process_state(idle))
+        self.assertIn("ENTER", _format_capture_face_process_state(running))
 
     def test_calibration_process_state_text_and_run_button_labels(self) -> None:
         expected_output = Path("/tmp/project/calib/calib_color.yaml")

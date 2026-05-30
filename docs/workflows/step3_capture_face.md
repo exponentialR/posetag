@@ -95,6 +95,32 @@ posetag-capture-face --project_root my_project \
 The default source remains `realsense` for compatibility with the legacy script.
 For a normal USB webcam, pass `--source opencv --cam 0` explicitly.
 
+## Guided GUI Stage 5 Flow
+
+The optional `posetag-gui` dashboard presents face-shot capture as Stage 5 in
+the calibration-first workflow. It does not reimplement camera capture,
+AprilTag detection, overlays, metadata writing, or manifest updates. Instead,
+it validates dashboard settings and launches the existing
+`posetag-capture-face` command in a child process.
+
+The Stage 5 panel:
+
+- reads registered object bases and full face names from
+  `boards/tag_registry.yaml`
+- validates the calibration YAML, registry, selected object/face, source,
+  video path, and output paths before launch
+- supports webcam/OpenCV, RealSense, and video sources
+- previews the exact command and keeps a copy-command fallback
+- runs `posetag-capture-face` with the current Python interpreter
+- streams stdout/stderr into the dashboard log
+- refreshes project status when `shots/manifest.csv` appears or changes
+
+Stage 5 status is coverage-based. It is complete only when every registered
+board face has at least one valid saved shot with existing raw image,
+annotated image, metadata JSON, and manifest row. Partial coverage, missing
+files, malformed metadata, or shots saved with `validation_ok: false` keep the
+stage in a missing or needs-attention state.
+
 ## Object And Face Selection
 
 `--object_name` accepts either:

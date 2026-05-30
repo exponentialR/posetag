@@ -142,7 +142,13 @@ draft records planned object rows and capture settings only; PoseTag does not
 create board YAML or tag-registry entries until a real capture is saved. It can
 also launch the existing `posetag-make-board` workflow as a fallback, stream
 process output, and provide a prompt-response box for the selected tag IDs and
-origin tag while keeping the OpenCV `ENTER`/`ESC` controls unchanged. The
+origin tag while keeping the OpenCV `ENTER`/`ESC` controls unchanged. In Stage
+5 it can guide and launch the existing `posetag-capture-face` workflow with
+registered object/face selection, webcam/RealSense/video source settings,
+calibration and registry paths, output layout, expected manifest path, process
+state, and logs. Stage 5 status is coverage-based: it is complete only when
+every registered board face has at least one valid saved raw image, annotated
+image, metadata JSON, and `shots/manifest.csv` row. The
 calibration capture window also shows
 state-driven guidance based on detected ChArUco corners and accepted sample
 coverage, such as moving the board toward missing frame edges/corners or
@@ -603,6 +609,17 @@ shots/
 tag IDs, validation status, camera intrinsics, image size, timestamp, and save
 paths. `shots/manifest.csv` appends one row per saved shot with the same core
 provenance fields.
+
+**Guided GUI Stage 5**
+
+The optional `posetag-gui` dashboard exposes this workflow as guided Stage 5
+after Stage 4 board definitions are valid. It populates registered object and
+face choices from `boards/tag_registry.yaml`, validates calibration, registry,
+source, video, and output settings, and can launch `posetag-capture-face` in
+the current Python environment with a `Run Capture Face` button. The OpenCV
+capture window remains the capture UI; the dashboard streams process output,
+keeps a copyable command fallback, and refreshes coverage when
+`shots/manifest.csv` is written or updated.
 
 **Alternative layouts**
 
