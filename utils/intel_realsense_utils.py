@@ -1,5 +1,8 @@
 import time, os
-import pyrealsense2 as rs
+try:
+    import pyrealsense2 as rs
+except Exception:
+    rs = None
 import yaml
 import numpy as np
 

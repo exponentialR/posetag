@@ -31,29 +31,52 @@ g panels | h help | q / ESC quit
 """
 
 from __future__ import annotations
-import argparse, os, json, time
+import argparse, time
 from pathlib import Path
 from typing import List, Dict, Tuple, Optional, Set
 
 import numpy as np
 import cv2
 
-from utils.capture_source import open_source
-from utils.intel_realsense_utils import load_calib, _face_label
+from utils import capture_source
 from utils.capture_utils import (
     draw_detections, make_info_panel, make_recent_panel, text_lines,
-    load_registry, unique_bases, faces_for_base, faces_for_object,
-    parse_base_and_side, ensure_dir, timestamp, _append_manifest
 )
-from utils.project_config import resolve_project_root, ensure_project_dirs
 from utils.logger import init_project_logger
-
-try:
-    from pupil_apriltags import Detector
-except Exception as e:
-    raise SystemExit("Please install pupil-apriltags: pip install pupil-apriltags") from e
+from posetag.pipelines.capture_face import (
+    activate_capture_project_root,
+    CaptureFaceError,
+    build_capture_metadata,
+    build_shot_paths,
+    capture_timestamp,
+    create_apriltag_detector,
+    create_capture_output_dirs,
+    faces_for_base,
+    load_apriltag_detector_class,
+    load_capture_calibration,
+    load_capture_registry,
+    load_registered_faces,
+    prepare_capture_paths,
+    preview_capture_project_root,
+    resolve_capture_calibration_path,
+    select_initial_faces,
+    unique_bases,
+    validate_capture_source_args,
+    write_capture_outputs,
+)
 
 KEY_UP, KEY_DOWN, KEY_LEFT, KEY_RIGHT = 2490368, 2621440, 2424832, 2555904
+
+
+def _face_label(face_entry, max_chars=28, default="unregistered"):
+    """Short label for overlay: YAML basename, truncated; safe if face_entry is None."""
+    if not face_entry:
+        return default
+    yml = face_entry.get("yaml", "")
+    base = Path(yml).stem if yml else default
+    if len(base) > max_chars:
+        base = base[:max_chars - 1] + "..."
+    return base
 
 
 def object_picker_panel(h: int, w: int, bases: List[str], sel: int,
@@ -94,9 +117,12 @@ def best_face_by_overlap(faces: List[Dict], det_ids: Set[int], prev_idx: int | N
     return best_i, best_k
 
 
-def main():
-  # Parse command-line arguments for capture settings
-    ap = argparse.ArgumentParser("Capture wide shots per face for later annotation")
+def main(argv=None):
+    # Parse command-line arguments for capture settings
+    ap = argparse.ArgumentParser(
+        prog="posetag-capture-face",
+        description="Capture wide shots per face for later annotation",
+    )
     ap.add_argument("--project_root", type=Path, default=None,
                     help="Root for boards/shots/objects/datasets (default: resolver/env/config).")
     ap.add_argument("--calib", default="calib_color.yaml",
@@ -132,66 +158,56 @@ def main():
                     help="Capture source: Intel RealSense (default), OpenCV webcam, or a video file")
     ap.add_argument("--cam", type=int, default=0, help="OpenCV camera index when --source=opencv")
     ap.add_argument("--video", type=str, default=None, help="Video path when --source=video")
-    args = ap.parse_args()
+    args = ap.parse_args(argv)
 
-    # ---------- project root + path resolution ----------
-    pr = Path(resolve_project_root(args.project_root))
-    ensure_project_dirs(pr)
+    # ---------- validate project inputs before opening hardware or writing outputs ----------
+    try:
+        validate_capture_source_args(args.source, args.video, capture_source.rs)
+        pr = preview_capture_project_root(args.project_root)
+        calibration = load_capture_calibration(resolve_capture_calibration_path(pr, args.calib))
+        paths = prepare_capture_paths(
+            project_root=pr,
+            calib_path=calibration.path,
+            registry=args.registry,
+            out_dir=args.out_dir,
+            manifest=args.manifest,
+            log_file=args.log_file,
+            layout=args.layout,
+            raw_dir=args.raw_dir,
+            ann_dir=args.ann_dir,
+            meta_dir=args.meta_dir,
+        )
+        registry = load_capture_registry(paths.registry_path)
+        registered_faces = load_registered_faces(
+            registry,
+            project_root=paths.project_root,
+            registry_path=paths.registry_path,
+        )
+        initial_selection = select_initial_faces(args.object_name, registered_faces)
+        Detector = load_apriltag_detector_class()
+        det = create_apriltag_detector(args.family, detector_class=Detector)
+    except CaptureFaceError as exc:
+        raise SystemExit(str(exc)) from exc
 
-    def _under_pr(p: Optional[str | Path], default_rel: Optional[str]) -> Path:
-        if p is None:
-            return (pr / default_rel) if default_rel else pr
-        pth = Path(p)
-        return pth if pth.is_absolute() else (pr / pth)
-
-    # calib: prefer given path; else <pr>/calib/calib_color.yaml or <pr>/calib_color.yaml
-    calib_path = Path(args.calib)
-    if not calib_path.exists():
-        for cand in (pr / "calib" / "calib_color.yaml", pr / "calib_color.yaml"):
-            if cand.exists():
-                calib_path = cand
-                break
-
-    registry_path = _under_pr(args.registry, "boards/tag_registry.yaml")
-    out_dir = _under_pr(args.out_dir, "shots")
-
-    # logs
-    logs_dir = pr / "logs"; logs_dir.mkdir(parents=True, exist_ok=True)
-    log_path = (Path(args.log_file) if args.log_file and Path(args.log_file).is_absolute()
-                else logs_dir / (Path(args.log_file).name if args.log_file else "capture_face.log"))
-
-    # split-type dirs
-    if args.layout == "split_type":
-        raw_dir  = _under_pr(args.raw_dir,  str(out_dir / "images"))
-        ann_dir  = _under_pr(args.ann_dir,  str(out_dir / "ann"))
-        meta_dir = _under_pr(args.meta_dir, str(out_dir / "meta"))
-        for d in (raw_dir, ann_dir, meta_dir): d.mkdir(parents=True, exist_ok=True)
-    else:
-        raw_dir = ann_dir = meta_dir = None
-        out_dir.mkdir(parents=True, exist_ok=True)
-
-    # manifest
-    manifest_path = (pr / "shots" / "manifest.csv") if args.manifest is None else (
-        Path(args.manifest) if Path(args.manifest).is_absolute() else (pr / args.manifest)
-    )
-    manifest_path.parent.mkdir(parents=True, exist_ok=True)
-
-    # ---------- logging & announce ----------
-    logger = init_project_logger(log_path, level=args.log_level, console=args.log_console)
-    logger.info("Using project root: %s", pr)
-    logger.info("Using calib: %s", str(calib_path))
-    logger.info("Using registry: %s", str(registry_path))
-    logger.info("Shots will be saved to: %s", str(out_dir))
-
-    # ---------- data & detector ----------
-    (fx, fy, cx, cy), K = load_calib(str(calib_path))
-    reg = load_registry(str(registry_path))
-    det = Detector(families=args.family, nthreads=4, quad_decimate=1.0, refine_edges=True)
-
-    # unified source
-    read_frame, stop, _ = open_source(
+    # unified source; keep this before output-directory creation so unreadable
+    # videos fail without leaving capture artifacts.
+    read_frame, stop, _ = capture_source.open_source(
         args.source, cam=args.cam, video=args.video, width=args.width, height=args.height, fps=args.fps, warmup=10
     )
+
+    try:
+        activate_capture_project_root(paths.project_root)
+        create_capture_output_dirs(paths, layout=args.layout)
+        logger = init_project_logger(paths.log_path, level=args.log_level, console=args.log_console)
+    except Exception:
+        stop()
+        raise
+
+    # ---------- logging & announce ----------
+    logger.info("Using project root: %s", paths.project_root)
+    logger.info("Using calib: %s", str(paths.calib_path))
+    logger.info("Using registry: %s", str(paths.registry_path))
+    logger.info("Shots will be saved to: %s", str(paths.out_dir))
 
     # ---------- UI state ----------
     state = {
@@ -200,15 +216,13 @@ def main():
         "save_warn": False, "save_warn_t0": 0.0,
     }
 
-    bases = unique_bases(reg)
+    bases = unique_bases(registered_faces)
 
     # Initial object from CLI
-    cli_obj = args.object_name.strip() if args.object_name else None
-    if cli_obj:
-        base, side = parse_base_and_side(cli_obj)
-        state["object_base"] = base
-        state["faces"] = faces_for_base(base, reg, pr) if side is None else faces_for_object(cli_obj, reg, pr)
-        state["auto_side"] = (side is None)
+    if initial_selection:
+        state["object_base"] = initial_selection.object_base
+        state["faces"] = list(initial_selection.faces)
+        state["auto_side"] = initial_selection.auto_side
         state["face_idx"] = 0
 
     mode, pick_sel, gallery_on, show_help = ('preview' if state["object_base"] else 'pick_object', 0, bool(args.gallery), False)
@@ -222,6 +236,9 @@ def main():
         while True:
             c = read_frame()
             if c is None:
+                if args.source == "video":
+                    logger.info("Video ended before another face shot was saved; exiting cleanly.")
+                    return 0
                 continue
 
             # Sync actual width/height for non-hardware-timestamped sources
@@ -305,11 +322,14 @@ def main():
                     base = bases[pick_sel] if bases else None
                     if base:
                         state["object_base"] = base
-                        state["faces"] = faces_for_base(base, reg, pr)
+                        state["faces"] = faces_for_base(base, registered_faces)
                         state["face_idx"] = 0
                         state["auto_side"] = True
                     mode = 'preview'
-                elif k in CANCEL_KEYS: mode = 'preview'
+                elif k in CANCEL_KEYS:
+                    if state["object_base"] is None:
+                        break
+                    mode = 'preview'
                 elif k == ord('q'):     break
                 continue
 
@@ -335,52 +355,44 @@ def main():
                         continue
                 state["save_warn"] = False
               
-                # Generate timestamp and determine save paths based on layout
-                ts = timestamp()
-                obj_full = face["object"] if face else (state["object_base"] or "unknown")
-                base_name, side = parse_base_and_side(obj_full)
-                side_code = (side or "unresolved").upper()
-
-                if args.layout == "flat":
-                    save_root, file_stub = out_dir, f"{obj_full}_{ts}"
-                elif args.layout == "by_object":
-                    save_root, file_stub = out_dir / base_name, f"{base_name}_side{side_code}_{ts}"
-                elif args.layout == "by_object_side":
-                    save_root, file_stub = out_dir / base_name / f"side{side_code}", f"{base_name}_side{side_code}_{ts}"
-                else:  # split_type
-                    save_root, file_stub = None, f"{base_name}_side{side_code}_{ts}"
-
-                raw_path = str((save_root / f"{file_stub}_raw.png") if save_root else (raw_dir / f"{file_stub}_raw.png"))
-                ann_path = str((save_root / f"{file_stub}_ann.png") if save_root else (ann_dir / f"{file_stub}_ann.png"))
-                meta_path = str((save_root / f"{file_stub}_meta.json") if save_root else (meta_dir / f"{file_stub}_meta.json"))
-                if save_root: ensure_dir(save_root)
-
-                cv2.imwrite(raw_path, c)
-                cv2.imwrite(ann_path, vis)
+                # Generate timestamp and determine save paths based on layout.
+                ts = capture_timestamp()
+                obj_full = face["object"]
+                shot_paths = build_shot_paths(
+                    layout=args.layout,
+                    out_dir=paths.out_dir,
+                    object_full=obj_full,
+                    timestamp=ts,
+                    raw_dir=paths.raw_dir,
+                    ann_dir=paths.ann_dir,
+                    meta_dir=paths.meta_dir,
+                )
+                meta = build_capture_metadata(
+                    face=face,
+                    shot_paths=shot_paths,
+                    detected_tag_ids=det_ids,
+                    validation_ok=ok,
+                    auto_face=state["auto_side"],
+                    frame_shape=c.shape,
+                    camera_params=calibration.camera_params,
+                    timestamp=ts,
+                )
+                try:
+                    write_capture_outputs(
+                        raw_frame=c,
+                        annotated_frame=vis,
+                        metadata=meta,
+                        shot_paths=shot_paths,
+                        manifest_path=paths.manifest_path,
+                        image_writer=cv2.imwrite,
+                    )
+                except CaptureFaceError as exc:
+                    raise SystemExit(str(exc)) from exc
                 state["last_saved_ann"] = vis.copy()
 
-                meta = {
-                    "object_base": base_name,
-                    "object_full": obj_full,
-                    "side": side_code,
-                    "face_yaml": face["yaml"] if face else None,
-                    "expected_tag_ids": sorted(list(set(face["tag_ids"]))) if face else [],
-                    "detected_tag_ids": sorted(list(det_ids)),
-                    "validation_ok": bool(ok),
-                    "auto_face": bool(state["auto_side"]),
-                    "image": {
-                        "path_raw": raw_path, "path_ann": ann_path, "path_meta": meta_path,
-                        "width": int(c.shape[1]), "height": int(c.shape[0]),
-                    },
-                    "camera": {"fx": float(fx), "fy": float(fy), "cx": float(cx), "cy": float(cy)},
-                    "timestamp": ts,
-                }
-                with open(meta_path, "w") as f:
-                    json.dump(meta, f, indent=2)
-                logger.info(f"[+] Saved {raw_path}")
-                logger.info(f"[+] Saved {ann_path}")
-                logger.info(f"[+] Saved {meta_path}")
-                _append_manifest(str(manifest_path), meta)
+                logger.info(f"[+] Saved {shot_paths.raw_path}")
+                logger.info(f"[+] Saved {shot_paths.ann_path}")
+                logger.info(f"[+] Saved {shot_paths.meta_path}")
 
                 # Update thumbnails for gallery panel
                 try:
@@ -393,7 +405,8 @@ def main():
     finally:
         stop()
         cv2.destroyAllWindows()
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

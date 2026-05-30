@@ -525,12 +525,18 @@ Faces may use different tag sizes; each face YAML stores its own `tag_size_m`.
 
 Once per-face boards and the tag registry exist, the next step is to capture
 wide shots of each face with detections overlaid. These images and metadata are
-later used to solve the board-to-object transform.
+later used to solve the board-to-object transform. This step records reference
+images and provenance only; annotation, board-to-object transforms, dataset
+collection, and pose estimation happen later.
+
+Detailed workflow notes: [`docs/workflows/step3_capture_face.md`](docs/workflows/step3_capture_face.md)
 
 **Quick start**
 
 ```bash
-posetag-capture-face --object_name connection_plate_white
+posetag-capture-face --project_root my_project \
+  --source opencv --cam 0 \
+  --object_name connection_plate_white
 # Optional UI sizing
 #   --panel_w 560
 #   --recent_w 480
@@ -542,9 +548,13 @@ posetag-capture-face --object_name connection_plate_white
 **Other sources**
 
 ```bash
+posetag-capture-face --project_root my_project --source realsense --object_name connection_plate_white
 posetag-capture-face --source opencv --cam 0 --object_name connection_plate_white
 posetag-capture-face --source video --video sample.mp4 --object_name connection_plate_white
 ```
+
+The command's legacy default source is `realsense`; use `--source opencv` for a
+regular USB webcam or laptop camera.
 
 **Notes**
 
@@ -553,10 +563,16 @@ posetag-capture-face --source video --video sample.mp4 --object_name connection_
 - `--manifest` appends rows to `<root>/shots/manifest.csv`
 - `--calib` and `--registry` default to
   `<root>/calib/calib_color.yaml` and `<root>/boards/tag_registry.yaml`
+- The registry must reference readable board YAML files created by
+  `posetag-make-board`.
+- Missing calibration, missing or malformed registries, incomplete registry
+  membership, missing board YAML references, unknown object selections, missing
+  `--video`, unreadable videos, and unavailable RealSense support fail clearly
+  before capture artifacts are written.
 
 **Workflow in the viewer**
 
-- `o` picker with `↑/↓` or `W/S/K/J`, `Enter` to select
+- `o` picker with arrow keys or `W/S/K/J`, `Enter` to select
 - `a` auto-side on or off
 - `f` cycle faces when auto mode is off
 - `ENTER` save, with double-press within 3 seconds to force a save if expected
@@ -583,8 +599,10 @@ shots/
       <object_base>_side<SideLetter>_<YYYYMMDD_HHMMSS>_meta.json
 ```
 
-`*_meta.json` includes camera intrinsics, detected and expected IDs, face YAML,
-and save paths.
+`*_meta.json` includes object identity, side, face YAML, expected and detected
+tag IDs, validation status, camera intrinsics, image size, timestamp, and save
+paths. `shots/manifest.csv` appends one row per saved shot with the same core
+provenance fields.
 
 **Alternative layouts**
 
