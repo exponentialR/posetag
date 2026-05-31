@@ -30,6 +30,7 @@ from posetag.pipelines.capture_face import (
     validate_capture_metadata_schema,
 )
 from posetag.pipelines.make_board import build_board_yaml, write_board_yaml
+from utils.capture_utils import make_info_panel, make_recent_panel
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -147,6 +148,53 @@ class CaptureFaceStep3Tests(unittest.TestCase):
 
         self.assertEqual(result.returncode, 0, msg=result.stderr)
         self.assertIn("Capture wide shots per face", result.stdout)
+
+    def test_capture_view_panels_are_lightweight_and_navigable(self) -> None:
+        state = {
+            "object_base": "connection_plate_white",
+            "faces": [
+                {
+                    "object": "connection_plate_white_sideA",
+                    "tag_ids": (1, 2),
+                    "yaml": "sideA.yaml",
+                },
+                {
+                    "object": "connection_plate_white_sideB",
+                    "tag_ids": (3, 4),
+                    "yaml": "sideB.yaml",
+                },
+            ],
+            "face_idx": 0,
+            "auto_side": True,
+            "detected_ids": {1},
+            "validation_ok": True,
+            "face": {"object": "connection_plate_white_sideA", "tag_ids": (1, 2), "yaml": "sideA.yaml"},
+        }
+
+        cycled = legacy_capture_face.cycle_face_selection(state, 1)
+        picker = legacy_capture_face.object_picker_panel(
+            240,
+            360,
+            ["connection_plate_white", "column_white"],
+            1,
+        )
+        info = make_info_panel(360, 420, state)
+        recent = make_recent_panel(240, 320, None, True)
+        overlay = legacy_capture_face.draw_capture_overlay(
+            np.zeros((240, 320, 3), dtype=np.uint8),
+            face=state["face"],
+            state=state,
+            ok=True,
+            min_expected=1,
+        )
+
+        self.assertTrue(cycled)
+        self.assertFalse(state["auto_side"])
+        self.assertEqual(state["face_idx"], 1)
+        self.assertGreater(float(picker.mean()), 180.0)
+        self.assertGreater(float(info.mean()), 180.0)
+        self.assertGreater(float(recent.mean()), 180.0)
+        self.assertGreater(float(overlay.mean()), 2.0)
 
     def test_missing_video_for_video_source_fails_clearly(self) -> None:
         with TemporaryDirectory() as tmpdir:

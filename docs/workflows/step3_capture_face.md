@@ -142,7 +142,8 @@ using the registered bases from `boards/tag_registry.yaml`.
 - `o`: open the object picker.
 - Up/down or `W` / `S` / `K` / `J`: move in the picker.
 - `a`: toggle auto-side mode.
-- `f`: cycle faces when auto-side mode is off.
+- `Left` / `Right`, `f` / `n`, or `[` / `]`: cycle faces and switch to
+  manual face selection.
 - `g`: toggle gallery panels.
 - `h`: toggle help overlay.
 - `q` or `ESC`: quit cleanly without saving another shot.

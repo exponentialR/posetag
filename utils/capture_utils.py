@@ -80,39 +80,63 @@ def _wrap_lines(lines, max_w, scale=0.60, thick=1, font=cv2.FONT_HERSHEY_SIMPLEX
     return out
 
 def make_recent_panel(h: int, w: int, last_img: np.ndarray, show: bool) -> np.ndarray:
-    # black background
-    panel = np.zeros((h, w, 3), np.uint8)
-    if not show or last_img is None:
-        return panel  # keep black
+    bg = (245, 249, 251)
+    card = (255, 255, 255)
+    border = (212, 226, 234)
+    text = (36, 49, 61)
+    muted = (98, 113, 126)
+    panel = np.full((h, w, 3), bg, np.uint8)
+    margin = 14
+    cv2.rectangle(panel, (margin, margin), (w - margin, h - margin), card, -1)
+    cv2.rectangle(panel, (margin, margin), (w - margin, h - margin), border, 1)
+    cv2.putText(panel, "Last saved", (margin + 14, margin + 30),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.72, text, 2, cv2.LINE_AA)
+
+    if not show:
+        cv2.putText(panel, "Panel hidden. Press g to show it.",
+                    (margin + 14, margin + 66),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.52, muted, 1, cv2.LINE_AA)
+        return panel
+
+    if last_img is None:
+        lines = [
+            "No face shot saved yet.",
+            "Press ENTER when the selected face is framed.",
+            "The saved annotated image will appear here.",
+        ]
+        y = margin + 66
+        for line in _wrap_lines(lines, max(1, w - 2 * margin - 28), 0.52, 1):
+            cv2.putText(panel, line, (margin + 14, y),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.52, muted, 1, cv2.LINE_AA)
+            y += 24
+        return panel
 
     # fit-preserving resize with 12px margins
-    INNER = 12
-    tgt_w = max(1, w - 2*INNER)
-    tgt_h = max(1, h - 2*INNER)
+    INNER = 22
+    header_h = 52
+    tgt_w = max(1, w - 2*margin - 2*INNER)
+    tgt_h = max(1, h - 2*margin - header_h - INNER)
     scale = min(tgt_w / last_img.shape[1], tgt_h / last_img.shape[0])
     new_w = max(1, int(last_img.shape[1] * scale))
     new_h = max(1, int(last_img.shape[0] * scale))
     img = cv2.resize(last_img, (new_w, new_h))
 
-    x0 = INNER + (tgt_w - new_w) // 2
-    y0 = INNER + (tgt_h - new_h) // 2
+    x0 = margin + INNER + (tgt_w - new_w) // 2
+    y0 = margin + header_h + (tgt_h - new_h) // 2
     panel[y0:y0+new_h, x0:x0+new_w] = img
 
-    # header tag
-    cv2.putText(panel, "Last saved", (12, 26),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (200,200,200), 2, cv2.LINE_AA)
     return panel
 
 
 def make_info_panel(h: int, w: int, state: dict, gallery_on: bool=True) -> np.ndarray:
     # Colours
-    BG = (245, 245, 245)
+    BG = (245, 249, 251)
     CARD_BG = (255, 255, 255)
-    BORDER = (210, 210, 210)
-    TITLE = (40, 40, 40)
-    TEXT  = (30, 30, 30)
-    OK_BG = (40, 160, 60)
-    BAD_BG = (30, 70, 190)
+    BORDER = (212, 226, 234)
+    TITLE = (36, 49, 61)
+    TEXT = (44, 58, 71)
+    OK_BG = (64, 134, 29)
+    BAD_BG = (24, 139, 204)
 
     panel = np.full((h, w, 3), BG, np.uint8)
     M, S = 14, 12  # margin, spacing
@@ -176,8 +200,13 @@ def make_info_panel(h: int, w: int, state: dict, gallery_on: bool=True) -> np.nd
         ]
     else:
         lines.append("Resolved face: (none)")
-    lines += [f"Auto-face: {'ON' if auto else 'OFF'}",
-              f"Seen IDs: {det_ids}"]
+    faces = state.get("faces") or []
+    face_idx = int(state.get("face_idx", 0)) + 1 if faces else 0
+    lines += [
+        f"Mode: {'auto face' if auto else 'manual face'}",
+        f"Face navigation: {face_idx}/{len(faces)}",
+        f"Seen IDs: {det_ids}",
+    ]
     if face:
         lines += [f"Expected IDs: {exp_ids}", f"Overlap: {overlap}"]
 
@@ -186,13 +215,10 @@ def make_info_panel(h: int, w: int, state: dict, gallery_on: bool=True) -> np.nd
 
     # ----- INSTRUCTIONS card (ASCII-only)
     instr = [
-        "- ENTER: Save (double-press within 3s to force if tags missing)",
-        "- a: Toggle auto face/side (when base is chosen)",
-        "- f: Cycle faces (works when auto is OFF)",
-        "- o: Object picker (Up/Down or W/S/K/J; Enter selects; Esc cancels)",
-        "- g: Toggle gallery thumbnails",
-        "- h: Help overlay",
-        "- q or Esc: Quit",
+        "- ENTER: Save; double-press to force",
+        "- Left/Right or f/n: Cycle faces",
+        "- o: Object picker; a: Auto/manual",
+        "- g: Panels; h: Help; q/Esc: Quit",
     ]
     y = draw_card(y, "Instructions", instr) + S
 
@@ -235,7 +261,7 @@ def make_info_panel(h: int, w: int, state: dict, gallery_on: bool=True) -> np.nd
         warn = "Press ENTER again within 3s to confirm save"
         (tw, th), _ = cv2.getTextSize(warn, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
         cv2.putText(panel, warn, (max(M, (w - tw)//2), h - 16),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,0,200), 2, cv2.LINE_AA)
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, BAD_BG, 2, cv2.LINE_AA)
 
     return panel
 

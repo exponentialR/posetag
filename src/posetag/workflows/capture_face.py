@@ -50,8 +50,8 @@ DEFAULT_WIDTH = 640
 DEFAULT_HEIGHT = 480
 DEFAULT_FPS = 30
 DEFAULT_MIN_EXPECTED = 1
-DEFAULT_PANEL_WIDTH = 560
-DEFAULT_RECENT_WIDTH = 480
+DEFAULT_PANEL_WIDTH = 420
+DEFAULT_RECENT_WIDTH = 320
 CAPTURE_FACE_GUIDANCE = (
     "Run Capture Face starts the existing posetag-capture-face workflow. Use "
     "the OpenCV preview to select an object/face, press ENTER to save, and "

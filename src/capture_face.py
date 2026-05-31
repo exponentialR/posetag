@@ -26,8 +26,8 @@ Default (by object and side):
 
 Keys
 ----
-ENTER save (double-press to force) | o object picker | a auto-side | f cycle faces |
-g panels | h help | q / ESC quit
+ENTER save (double-press to force) | Left/Right cycle faces | o object picker |
+a auto-side | f next face | g panels | h help | q / ESC quit
 """
 
 from __future__ import annotations
@@ -39,9 +39,7 @@ import numpy as np
 import cv2
 
 from utils import capture_source
-from utils.capture_utils import (
-    draw_detections, make_info_panel, make_recent_panel, text_lines,
-)
+from utils.capture_utils import draw_detections, make_info_panel, make_recent_panel, text_lines
 from utils.logger import init_project_logger
 from posetag.pipelines.capture_face import (
     activate_capture_project_root,
@@ -68,6 +66,20 @@ from posetag.pipelines.capture_face import (
 KEY_UP, KEY_DOWN, KEY_LEFT, KEY_RIGHT = 2490368, 2621440, 2424832, 2555904
 
 
+UI_BG = (245, 249, 251)
+UI_CARD = (255, 255, 255)
+UI_BORDER = (212, 226, 234)
+UI_TEXT = (36, 49, 61)
+UI_MUTED = (98, 113, 126)
+UI_BLUE = (160, 91, 0)
+UI_GREEN = (64, 134, 29)
+UI_AMBER = (24, 139, 204)
+UI_RED = (44, 65, 190)
+UI_DARK = (38, 45, 52)
+UI_DARK_2 = (62, 72, 82)
+UI_WHITE = (255, 255, 255)
+
+
 def _face_label(face_entry, max_chars=28, default="unregistered"):
     """Short label for overlay: YAML basename, truncated; safe if face_entry is None."""
     if not face_entry:
@@ -79,27 +91,202 @@ def _face_label(face_entry, max_chars=28, default="unregistered"):
     return base
 
 
-def object_picker_panel(h: int, w: int, bases: List[str], sel: int,
-                        hint: str = "Select object (Enter):") -> np.ndarray:
-    pan = np.full((h, w, 3), 240, np.uint8)
-    cv2.putText(pan, hint, (12, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (20, 20, 20), 2, cv2.LINE_AA)
+def _put(
+    image: np.ndarray,
+    text: str,
+    xy: Tuple[int, int],
+    *,
+    scale: float = 0.55,
+    colour: Tuple[int, int, int] = UI_TEXT,
+    thickness: int = 1,
+) -> None:
+    cv2.putText(
+        image,
+        text,
+        xy,
+        cv2.FONT_HERSHEY_SIMPLEX,
+        scale,
+        colour,
+        thickness,
+        cv2.LINE_AA,
+    )
+
+
+def _fill_alpha(
+    image: np.ndarray,
+    p0: Tuple[int, int],
+    p1: Tuple[int, int],
+    colour: Tuple[int, int, int],
+    alpha: float,
+) -> None:
+    overlay = image.copy()
+    cv2.rectangle(overlay, p0, p1, colour, -1)
+    cv2.addWeighted(overlay, alpha, image, 1.0 - alpha, 0, image)
+
+
+def object_picker_panel(
+    h: int,
+    w: int,
+    bases: List[str],
+    sel: int,
+    hint: str = "Choose object",
+) -> np.ndarray:
+    pan = np.full((h, w, 3), UI_BG, np.uint8)
+    margin = 14
+    cv2.rectangle(pan, (margin, margin), (w - margin, h - margin), UI_CARD, -1)
+    cv2.rectangle(pan, (margin, margin), (w - margin, h - margin), UI_BORDER, 1)
+    _put(pan, hint, (margin + 16, margin + 30), scale=0.78, thickness=2)
+
+    total = len(bases)
+    status = f"{min(sel + 1, total) if total else 0}/{total} registered objects"
+    _put(pan, status, (margin + 16, margin + 58), colour=UI_MUTED)
+    if not bases:
+        _put(
+            pan,
+            "No registered object bases found in the tag registry.",
+            (margin + 16, margin + 96),
+            colour=UI_RED,
+        )
+        return pan
 
     max_show = min(12, len(bases))
     start = max(0, min(sel - max_show // 2, len(bases) - max_show))
     end = min(len(bases), start + max_show)
 
-    y = 60
+    y = margin + 92
     for i in range(start, end):
-        s = bases[i]
-        col = (0, 0, 0) if i != sel else (0, 50, 200)
-        thick = 1 if i != sel else 2
-        prefix = "  " if i != sel else "> "
-        cv2.putText(pan, prefix + s, (18, y), cv2.FONT_HERSHEY_SIMPLEX, 0.65, col, thick, cv2.LINE_AA)
-        y += 26
+        selected = i == sel
+        row_top = y - 21
+        row_bottom = y + 9
+        if selected:
+            cv2.rectangle(
+                pan,
+                (margin + 10, row_top),
+                (w - margin - 10, row_bottom),
+                (236, 246, 251),
+                -1,
+            )
+            cv2.rectangle(
+                pan,
+                (margin + 10, row_top),
+                (margin + 14, row_bottom),
+                UI_BLUE,
+                -1,
+            )
+        prefix = ">" if selected else " "
+        colour = UI_TEXT if selected else UI_MUTED
+        _put(
+            pan,
+            f"{prefix} {i + 1:02d}  {_truncate_middle(bases[i], 34)}",
+            (margin + 20, y),
+            scale=0.58,
+            colour=colour,
+            thickness=2 if selected else 1,
+        )
+        y += 34
 
-    tips = "Move: ↑/↓ or W/S (K/J)   Select: Enter   Cancel: Esc   Jump: 1–9"
-    cv2.putText(pan, tips, (12, h - 16), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (60, 60, 60), 1, cv2.LINE_AA)
+    tips = "Up/Down or W/S navigate   Enter select   Esc cancel   1-9 jump"
+    _put(pan, tips, (margin + 16, h - margin - 18), scale=0.45, colour=UI_MUTED)
     return pan
+
+
+def cycle_face_selection(state: Dict, delta: int = 1) -> bool:
+    """Cycle the active face explicitly and disable auto-side selection."""
+
+    faces = state.get("faces") or []
+    if not faces:
+        return False
+    current = int(state.get("face_idx", 0))
+    state["face_idx"] = (current + int(delta)) % len(faces)
+    state["auto_side"] = False
+    state["face"] = faces[state["face_idx"]]
+    state["save_warn"] = False
+    return True
+
+
+def draw_capture_overlay(
+    frame: np.ndarray,
+    *,
+    face: Optional[Dict],
+    state: Dict,
+    ok: bool,
+    min_expected: int,
+) -> np.ndarray:
+    """Draw a compact capture HUD over the camera frame."""
+
+    vis = frame.copy()
+    h, w = vis.shape[:2]
+    det_ids = sorted(list(state.get("detected_ids", [])))
+    exp_ids = sorted(list(set(face["tag_ids"])) if face else [])
+    overlap = sorted(list(set(det_ids).intersection(exp_ids))) if face else []
+    face_label = _face_label(face, max_chars=44, default="unresolved")
+    status = "READY" if ok else "TAGS MISSING"
+    status_colour = UI_GREEN if ok else UI_AMBER
+    auto_text = "auto" if state.get("auto_side") else "manual"
+    faces = state.get("faces") or []
+    face_idx = int(state.get("face_idx", 0)) + 1 if faces else 0
+    face_count = len(faces)
+
+    card_w = min(w - 20, 640)
+    card_h = 92
+    _fill_alpha(vis, (10, 10), (10 + card_w, 10 + card_h), UI_DARK, 0.76)
+    cv2.rectangle(vis, (10, 10), (10 + card_w, 10 + card_h), UI_DARK_2, 1)
+    cv2.rectangle(vis, (22, 23), (34, 35), status_colour, -1)
+    _put(
+        vis,
+        f"{status}  {face_label}",
+        (42, 36),
+        scale=0.62,
+        colour=UI_WHITE,
+        thickness=2,
+    )
+    _put(
+        vis,
+        f"mode: {auto_text}    face: {face_idx}/{face_count}    min tags: {min_expected}",
+        (24, 61),
+        scale=0.48,
+        colour=(223, 232, 238),
+    )
+    _put(
+        vis,
+        f"seen: {_format_ids(det_ids)}    expected seen: {_format_ids(overlap)}",
+        (24, 83),
+        scale=0.48,
+        colour=(223, 232, 238) if ok else (108, 219, 255),
+        thickness=1 if ok else 2,
+    )
+
+    footer = "Enter save   Left/Right face   o object   a auto   h help   q/Esc quit"
+    footer_h = 36
+    y0 = max(0, h - footer_h - 10)
+    _fill_alpha(vis, (10, y0), (min(w - 10, 780), y0 + footer_h), UI_DARK, 0.70)
+    _put(vis, footer, (24, y0 + 24), scale=0.48, colour=UI_WHITE)
+
+    if state.get("save_warn"):
+        warn = "Tags are missing. Press Enter again within 3 seconds to force save."
+        (tw, _), _ = cv2.getTextSize(warn, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 2)
+        x0 = max(10, (w - tw) // 2 - 12)
+        y1 = y0 - 12
+        _fill_alpha(vis, (x0, y1 - 30), (min(w - 10, x0 + tw + 24), y1 + 4), UI_AMBER, 0.90)
+        _put(vis, warn, (x0 + 12, y1 - 8), scale=0.55, colour=UI_DARK, thickness=2)
+
+    return vis
+
+
+def _format_ids(ids: List[int]) -> str:
+    if not ids:
+        return "-"
+    if len(ids) <= 8:
+        return ",".join(str(tag_id) for tag_id in ids)
+    return ",".join(str(tag_id) for tag_id in ids[:8]) + f" +{len(ids) - 8}"
+
+
+def _truncate_middle(text: str, max_chars: int) -> str:
+    if len(text) <= max_chars:
+        return text
+    keep = max(4, (max_chars - 3) // 2)
+    return f"{text[:keep]}...{text[-keep:]}"
+
 
 # Select the best face based on overlap of expected vs detected tag IDs
 def best_face_by_overlap(faces: List[Dict], det_ids: Set[int], prev_idx: int | None = None) -> Tuple[Optional[int], int]:
@@ -139,8 +326,8 @@ def main(argv=None):
     ap.add_argument("--fps", type=int, default=30)
     ap.add_argument("--min_expected", type=int, default=1, help="min expected tags to see from the chosen face")
     ap.add_argument("--gallery", action="store_true", default=True, help="show thumbnails in panel")
-    ap.add_argument("--panel_w", type=int, default=560, help="info panel width (right side)")
-    ap.add_argument("--recent_w", type=int, default=480, help="right panel width for last-saved preview")
+    ap.add_argument("--panel_w", type=int, default=420, help="info panel width (right side)")
+    ap.add_argument("--recent_w", type=int, default=320, help="right panel width for last-saved preview")
     ap.add_argument("--layout", choices=["flat", "by_object", "by_object_side", "split_type"],
                     default="by_object_side", help="folder layout for saved captures")
     ap.add_argument("--raw_dir", default=None, help="when layout=split_type: raw images dir")
@@ -252,7 +439,7 @@ def main(argv=None):
             det_ids = {int(d.tag_id) for d in dd}
             state["detected_ids"] = det_ids
 
-            vis = draw_detections(c, dd)
+            detection_vis = draw_detections(c, dd)
             face = None
 
             # Resolve face from detections + selection
@@ -272,18 +459,13 @@ def main(argv=None):
                     ok = len(expected.intersection(det_ids)) >= max(1, args.min_expected)
             state["validation_ok"] = ok
 
-            # Left overlay
-            label = _face_label(face) if face else "(unresolved)"
-            cv2.putText(vis, f"Face: {label}", (12, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
-            if face:
-                expected = set(face["tag_ids"])
-                inter = sorted(list(expected.intersection(det_ids)))
-                msg = f"seen={sorted(list(det_ids))}  exp&seen={inter}"
-                col = (0, 200, 0) if ok else (0, 0, 255)
-            else:
-                msg = f"seen={sorted(list(det_ids))}"
-                col = (0, 200, 200)
-            cv2.putText(vis, msg, (12, 56), cv2.FONT_HERSHEY_SIMPLEX, 0.7, col, 2)
+            vis = draw_capture_overlay(
+                detection_vis,
+                face=face,
+                state=state,
+                ok=ok,
+                min_expected=args.min_expected,
+            )
 
             # Panels
             if mode == 'pick_object':
@@ -296,7 +478,7 @@ def main(argv=None):
                         "Help:",
                         "ENTER: Save (twice within 3s to force if not OK)",
                         "a: Toggle auto face/side (when base given)",
-                        "f: Cycle faces (auto OFF)",
+                        "Left/Right or f: Cycle faces (manual mode)",
                         "o: Pick object (on-screen picker)",
                         "g: Toggle gallery thumbnails",
                         "h: Toggle this help",
@@ -342,9 +524,10 @@ def main(argv=None):
                 mode = 'pick_object'
             elif k == ord('a'):
                 state["auto_side"] = not state["auto_side"] if state["faces"] else False
-            elif k == ord('f'):
-                if state["faces"] and not state["auto_side"]:
-                    state["face_idx"] = (state["face_idx"] + 1) % len(state["faces"])
+            elif k in {KEY_RIGHT, ord('f'), ord('n'), ord(']')}:
+                cycle_face_selection(state, 1)
+            elif k in {KEY_LEFT, ord('p'), ord('[')}:
+                cycle_face_selection(state, -1)
             elif k in ENTER_KEYS:
                 if face is None:
                     continue

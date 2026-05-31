@@ -544,8 +544,8 @@ posetag-capture-face --project_root my_project \
   --source opencv --cam 0 \
   --object_name connection_plate_white
 # Optional UI sizing
-#   --panel_w 560
-#   --recent_w 480
+#   --panel_w 420
+#   --recent_w 320
 # Optional saving layout / manifest
 #   --layout {flat,by_object,by_object_side,split_type}
 #   --manifest shots/manifest.csv
@@ -580,7 +580,8 @@ regular USB webcam or laptop camera.
 
 - `o` picker with arrow keys or `W/S/K/J`, `Enter` to select
 - `a` auto-side on or off
-- `f` cycle faces when auto mode is off
+- `Left` / `Right`, `f` / `n`, or `[` / `]` cycle faces and switch to manual
+  face selection
 - `ENTER` save, with double-press within 3 seconds to force a save if expected
   tags are missing
 - `g` panels, `h` help, `q` or `ESC` quit
@@ -593,7 +594,7 @@ You can pass either a base object name such as
 
 ```bash
 posetag-capture-face --layout split_type --raw_dir shots/images --ann_dir shots/ann --meta_dir shots/meta
-posetag-capture-face --panel_w 560 --recent_w 480
+posetag-capture-face --panel_w 420 --recent_w 320
 ```
 
 ```text
