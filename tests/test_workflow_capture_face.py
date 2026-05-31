@@ -240,6 +240,34 @@ class WorkflowCaptureFaceTests(unittest.TestCase):
             any("expected tag IDs do not match" in warning for warning in status.warnings)
         )
 
+    def test_empty_expected_tags_do_not_count_toward_coverage(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            project_root = Path(tmpdir) / "project"
+            _write_valid_calibration(project_root / "calib" / "calib_color.yaml")
+            board_paths, _registry_path = _write_board_and_registry(
+                project_root,
+                ("sideA",),
+            )
+            _write_capture(
+                project_root,
+                board_paths["sideA"],
+                timestamp="20260530_120000",
+                expected_tag_ids=(),
+            )
+
+            status = inspect_capture_face_outputs(project_root)
+
+        self.assertFalse(status.complete)
+        self.assertEqual(status.valid_shot_count, 0)
+        self.assertEqual(status.invalid_shot_count, 1)
+        self.assertEqual(status.missing_faces, ("connection_plate_white_sideA",))
+        self.assertEqual(len(status.saved_shots), 1)
+        self.assertEqual(status.saved_shots[0].expected_tag_ids, ())
+        self.assertFalse(status.saved_shots[0].coverage_ok)
+        self.assertTrue(
+            any("expected tag IDs do not match" in warning for warning in status.warnings)
+        )
+
     def test_process_state_summarizes_manifest_update(self) -> None:
         with TemporaryDirectory() as tmpdir:
             manifest = Path(tmpdir) / "project" / "shots" / "manifest.csv"
@@ -432,7 +460,9 @@ def _write_capture(
         timestamp=timestamp,
     )
     raw_ids = [int(tag["id"]) for tag in _read_board_tags(board_path)]
-    metadata_expected_ids = list(expected_tag_ids or tuple(raw_ids))
+    metadata_expected_ids = list(
+        raw_ids if expected_tag_ids is None else expected_tag_ids
+    )
     metadata = build_capture_metadata(
         face={
             "yaml": str(board_path),

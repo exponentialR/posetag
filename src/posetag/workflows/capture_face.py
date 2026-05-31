@@ -1320,9 +1320,7 @@ def _inspect_metadata_row(
         side = side or (parsed_side or "")
 
     registered = _registered_ids_for_warning(face_yaml)
-    expected_matches_registry = not (
-        registered and expected and sorted(registered) != list(expected)
-    )
+    expected_matches_registry = not registered or registered == expected
     coverage_ok = (
         key in face_keys
         and expected_matches_registry
