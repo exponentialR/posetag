@@ -213,6 +213,33 @@ class WorkflowCaptureFaceTests(unittest.TestCase):
         self.assertFalse(status.saved_shots[0].coverage_ok)
         self.assertTrue(any("raw image was not found" in warning for warning in status.warnings))
 
+    def test_expected_tag_mismatch_does_not_count_toward_coverage(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            project_root = Path(tmpdir) / "project"
+            _write_valid_calibration(project_root / "calib" / "calib_color.yaml")
+            board_paths, _registry_path = _write_board_and_registry(
+                project_root,
+                ("sideA",),
+            )
+            _write_capture(
+                project_root,
+                board_paths["sideA"],
+                timestamp="20260530_120000",
+                expected_tag_ids=(52,),
+            )
+
+            status = inspect_capture_face_outputs(project_root)
+
+        self.assertFalse(status.complete)
+        self.assertEqual(status.valid_shot_count, 0)
+        self.assertEqual(status.invalid_shot_count, 1)
+        self.assertEqual(status.missing_faces, ("connection_plate_white_sideA",))
+        self.assertEqual(len(status.saved_shots), 1)
+        self.assertFalse(status.saved_shots[0].coverage_ok)
+        self.assertTrue(
+            any("expected tag IDs do not match" in warning for warning in status.warnings)
+        )
+
     def test_process_state_summarizes_manifest_update(self) -> None:
         with TemporaryDirectory() as tmpdir:
             manifest = Path(tmpdir) / "project" / "shots" / "manifest.csv"
@@ -285,6 +312,48 @@ class WorkflowCaptureFaceTests(unittest.TestCase):
         self.assertEqual(len(status.saved_shots), 2)
         self.assertTrue(all(shot.coverage_ok for shot in status.saved_shots))
 
+    def test_native_face_capture_session_source_failure_writes_no_output_dirs(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            project_root = Path(tmpdir) / "project"
+            _write_valid_calibration(project_root / "calib" / "calib_color.yaml")
+            _write_board_and_registry(project_root, ("sideA",))
+
+            with patch(
+                "posetag.workflows.capture_face.open_frame_source",
+                side_effect=RuntimeError("camera unavailable"),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "camera unavailable"):
+                    NativeFaceCaptureSession(
+                        CaptureFaceConfig(project_root=project_root),
+                        detector=_NativeFaceDetector((52, 53)),
+                    )
+
+            shots_exists = (project_root / "shots").exists()
+            logs_exists = (project_root / "logs").exists()
+
+        self.assertFalse(shots_exists)
+        self.assertFalse(logs_exists)
+
+    def test_native_face_capture_session_detector_failure_writes_no_output_dirs(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            project_root = Path(tmpdir) / "project"
+            _write_valid_calibration(project_root / "calib" / "calib_color.yaml")
+            _write_board_and_registry(project_root, ("sideA",))
+
+            with patch(
+                "posetag.workflows.capture_face.create_apriltag_detector",
+                side_effect=RuntimeError("detector unavailable"),
+            ), patch("posetag.workflows.capture_face.open_frame_source") as open_source:
+                with self.assertRaisesRegex(RuntimeError, "detector unavailable"):
+                    NativeFaceCaptureSession(CaptureFaceConfig(project_root=project_root))
+
+            shots_exists = (project_root / "shots").exists()
+            logs_exists = (project_root / "logs").exists()
+
+        open_source.assert_not_called()
+        self.assertFalse(shots_exists)
+        self.assertFalse(logs_exists)
+
 
 def _write_valid_calibration(path: Path) -> None:
     camera_matrix = np.array(
@@ -352,6 +421,7 @@ def _write_capture(
     *,
     timestamp: str,
     write_raw: bool = True,
+    expected_tag_ids: tuple[int, ...] | None = None,
 ) -> None:
     object_full = board_path.stem
     base, _side = object_full.rsplit("_", 1)
@@ -362,10 +432,15 @@ def _write_capture(
         timestamp=timestamp,
     )
     raw_ids = [int(tag["id"]) for tag in _read_board_tags(board_path)]
+    metadata_expected_ids = list(expected_tag_ids or tuple(raw_ids))
     metadata = build_capture_metadata(
-        face={"yaml": str(board_path), "object": object_full, "tag_ids": raw_ids},
+        face={
+            "yaml": str(board_path),
+            "object": object_full,
+            "tag_ids": metadata_expected_ids,
+        },
         shot_paths=shot_paths,
-        detected_tag_ids=raw_ids,
+        detected_tag_ids=metadata_expected_ids,
         validation_ok=True,
         auto_face=True,
         frame_shape=(480, 640, 3),

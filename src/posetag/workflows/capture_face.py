@@ -316,7 +316,6 @@ class NativeFaceCaptureSession:
             raise CaptureFaceWorkflowError(
                 "No registered face shots are available for native capture."
             )
-        create_capture_output_dirs(self.paths, layout=self.validated.layout)
         self.detector = detector or create_apriltag_detector(self.validated.family)
         self.frame_source = frame_source or open_frame_source(
             source=self.validated.source,
@@ -326,6 +325,11 @@ class NativeFaceCaptureSession:
             height=self.validated.height,
             fps=self.validated.fps,
         )
+        try:
+            create_capture_output_dirs(self.paths, layout=self.validated.layout)
+        except Exception:
+            self.frame_source.stop()
+            raise
         self.stable_frames_required = max(
             1,
             int(
@@ -1315,8 +1319,13 @@ def _inspect_metadata_row(
         object_base = object_base or parsed_base
         side = side or (parsed_side or "")
 
+    registered = _registered_ids_for_warning(face_yaml)
+    expected_matches_registry = not (
+        registered and expected and sorted(registered) != list(expected)
+    )
     coverage_ok = (
         key in face_keys
+        and expected_matches_registry
         and bool(data.get("validation_ok"))
         and raw_path is not None
         and ann_path is not None
@@ -1349,12 +1358,12 @@ def _inspect_metadata_row(
         )
         return False, warnings, None, tuple(checked_paths), _with_shot_warnings(shot, warnings)
 
-    registered = _registered_ids_for_warning(face_yaml)
-    if registered and expected and sorted(registered) != list(expected):
+    if not expected_matches_registry:
         warnings.append(
             f"Manifest row {row_index} expected tag IDs do not match "
-            f"{face_yaml}."
+            f"{face_yaml} and does not count toward coverage."
         )
+        return False, warnings, key, tuple(checked_paths), _with_shot_warnings(shot, warnings)
 
     if not bool(data.get("validation_ok")):
         warnings.append(
