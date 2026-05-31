@@ -201,14 +201,17 @@ class CaptureFaceStep3Tests(unittest.TestCase):
             ["connection_plate_white", "column_white"],
             1,
         )
+        queue_layout: dict[str, object] = {}
         queue = legacy_capture_face.face_queue_panel(
             260,
             420,
             state["faces"],
             0,
             captured_faces=state["captured_faces"],
+            interaction=queue_layout,
         )
-        info = make_info_panel(360, 420, state)
+        info_layout: dict[str, object] = {}
+        info = make_info_panel(360, 420, state, interaction=info_layout)
         recent = make_recent_panel(240, 320, None, True)
         overlay = legacy_capture_face.draw_capture_overlay(
             np.zeros((240, 320, 3), dtype=np.uint8),
@@ -230,6 +233,48 @@ class CaptureFaceStep3Tests(unittest.TestCase):
         self.assertGreater(float(info.mean()), 180.0)
         self.assertGreater(float(recent.mean()), 180.0)
         self.assertGreater(float(overlay.mean()), 2.0)
+        queue_rows = queue_layout["queue_rows"]
+        info_rows = info_layout["queue_rows"]
+        self.assertGreaterEqual(len(queue_rows), 1)
+        self.assertGreaterEqual(len(info_rows), 1)
+        self.assertEqual(
+            legacy_capture_face.queue_row_at(
+                queue_rows,
+                queue_rows[0][1] + 2,
+                queue_rows[0][2] + 2,
+            ),
+            0,
+        )
+        action = legacy_capture_face.capture_face_mouse_action(
+            getattr(legacy_capture_face.cv2, "EVENT_LBUTTONDOWN", 1),
+            320 + info_rows[0][1] + 2,
+            info_rows[0][2] + 2,
+            0,
+            {
+                "frame_w": 320,
+                "panel_w": 420,
+                "queue_rows": tuple(info_rows),
+            },
+        )
+        self.assertEqual(action, ("select", 0))
+        with patch.object(
+            legacy_capture_face.cv2,
+            "getMouseWheelDelta",
+            return_value=-120,
+            create=True,
+        ):
+            self.assertEqual(
+                legacy_capture_face.capture_face_mouse_action(
+                    getattr(legacy_capture_face.cv2, "EVENT_MOUSEWHEEL", 10),
+                    100,
+                    100,
+                    0,
+                    {"frame_w": 320, "panel_w": 420, "queue_rows": ()},
+                ),
+                ("scroll", 1),
+            )
+        self.assertIn(63232, legacy_capture_face.KEY_UP_CODES)
+        self.assertIn(63233, legacy_capture_face.KEY_DOWN_CODES)
 
     def test_missing_video_for_video_source_fails_clearly(self) -> None:
         with TemporaryDirectory() as tmpdir:

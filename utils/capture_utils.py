@@ -140,7 +140,20 @@ def make_recent_panel(h: int, w: int, last_img: np.ndarray, show: bool) -> np.nd
     return panel
 
 
-def make_info_panel(h: int, w: int, state: dict, gallery_on: bool=True) -> np.ndarray:
+def _truncate_middle(text: str, max_chars: int) -> str:
+    if len(text) <= max_chars:
+        return text
+    keep = max(4, (max_chars - 3) // 2)
+    return f"{text[:keep]}...{text[-keep:]}"
+
+
+def make_info_panel(
+    h: int,
+    w: int,
+    state: dict,
+    gallery_on: bool=True,
+    interaction: Optional[dict]=None,
+) -> np.ndarray:
     # Colours
     BG = (245, 249, 251)
     CARD_BG = (255, 255, 255)
@@ -156,6 +169,9 @@ def make_info_panel(h: int, w: int, state: dict, gallery_on: bool=True) -> np.nd
     SCALE = 0.44
     THICK = 1
     TITLE_SCALE = 0.48
+    if interaction is not None:
+        interaction.clear()
+        interaction["queue_rows"] = []
 
     def draw_card(y, title, body_lines, h_fixed=None, status=None):
         inner_w = w - 2*M - 2*INNER
@@ -188,6 +204,71 @@ def make_info_panel(h: int, w: int, state: dict, gallery_on: bool=True) -> np.nd
             cv2.putText(panel, s, (x0 + INNER, yy),
                         cv2.FONT_HERSHEY_SIMPLEX, SCALE, TEXT, THICK, cv2.LINE_AA)
             yy += 18
+        return y1
+
+    def draw_queue_card(y, queue_faces, current, captured):
+        max_rows = min(6, len(queue_faces))
+        start = max(0, min(current - max_rows // 2, len(queue_faces) - max_rows))
+        end = min(len(queue_faces), start + max_rows)
+        done = 0
+        for item in queue_faces:
+            name = str(item.get("object", "")).strip()
+            if name in captured:
+                done += 1
+
+        row_h = 24
+        H = 50 + row_h * max_rows + INNER
+        x0, y0, x1, y1 = M, y, w - M, min(h - M, y + H)
+        cv2.rectangle(panel, (x0, y0), (x1, y1), CARD_BG, -1)
+        cv2.rectangle(panel, (x0, y0), (x1, y1), BORDER, 1)
+        cv2.putText(panel, "FACE QUEUE", (x0 + INNER, y0 + 24),
+                    cv2.FONT_HERSHEY_SIMPLEX, TITLE_SCALE, TITLE, 1, cv2.LINE_AA)
+        cv2.putText(panel, f"{done}/{len(queue_faces)} captured",
+                    (x0 + INNER, y0 + 44),
+                    cv2.FONT_HERSHEY_SIMPLEX, SCALE, TEXT, THICK, cv2.LINE_AA)
+
+        yy = y0 + 68
+        for index in range(start, end):
+            item = queue_faces[index]
+            name = str(item.get("object", "")).strip() or os.path.splitext(
+                os.path.basename(str(item.get("yaml", "")))
+            )[0]
+            marker = "[x]" if name in captured else "[ ]"
+            selected = index == current
+            row_top = yy - 18
+            row_bottom = min(y1 - INNER, yy + 6)
+            if interaction is not None:
+                interaction.setdefault("queue_rows", []).append(
+                    (index, x0 + INNER - 2, row_top, x1 - INNER + 2, row_bottom)
+                )
+            if selected:
+                cv2.rectangle(
+                    panel,
+                    (x0 + INNER - 4, row_top),
+                    (x1 - INNER + 4, row_bottom),
+                    (236, 246, 251),
+                    -1,
+                )
+                cv2.rectangle(
+                    panel,
+                    (x0 + INNER - 4, row_top),
+                    (x0 + INNER, row_bottom),
+                    OK_BG if name in captured else BAD_BG,
+                    -1,
+                )
+            pointer = ">" if selected else " "
+            colour = OK_BG if name in captured else (TEXT if selected else (98, 113, 126))
+            cv2.putText(
+                panel,
+                f"{pointer} {marker} {_truncate_middle(name, 34)}",
+                (x0 + INNER + 4, yy),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                SCALE,
+                colour,
+                1 if not selected else 2,
+                cv2.LINE_AA,
+            )
+            yy += row_h
         return y1
 
     # ----- gather state
@@ -230,31 +311,14 @@ def make_info_panel(h: int, w: int, state: dict, gallery_on: bool=True) -> np.nd
     captured = state.get("captured_faces") or set()
     if queue_faces:
         current = int(state.get("face_idx", 0))
-        max_show = min(6, len(queue_faces))
-        start = max(0, min(current - max_show // 2, len(queue_faces) - max_show))
-        end = min(len(queue_faces), start + max_show)
-        done = 0
-        for item in queue_faces:
-            name = str(item.get("object", "")).strip()
-            if name in captured:
-                done += 1
-        queue_lines = [f"{done}/{len(queue_faces)} captured"]
-        for index in range(start, end):
-            item = queue_faces[index]
-            name = str(item.get("object", "")).strip() or os.path.splitext(
-                os.path.basename(str(item.get("yaml", "")))
-            )[0]
-            marker = "[x]" if name in captured else "[ ]"
-            pointer = ">" if index == current else " "
-            queue_lines.append(f"{pointer} {marker} {name}")
-        y = draw_card(y, "Face queue", queue_lines) + S
+        y = draw_queue_card(y, queue_faces, current, captured) + S
 
     # ----- INSTRUCTIONS card (ASCII-only)
     instr = [
         "- ENTER: Save; double-press to force",
+        "- Click or scroll: Move through face queue",
         "- Arrow keys: Move through face queue",
-        "- o: Queue picker; a: Auto/manual",
-        "- g: Panels; h: Help; q/Esc: Quit",
+        "- a: Auto/manual; h: Help; q/Esc: Quit",
     ]
     y = draw_card(y, "Controls", instr) + S
 

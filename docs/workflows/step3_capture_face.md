@@ -170,7 +170,9 @@ The optional auto-capture controls are:
 
 - `ENTER`: save the current frame.
 - `ENTER` twice within 3 seconds: force-save when expected tags are missing.
-- arrow keys: move through the visible face queue.
+- click a visible queue row: select that face.
+- mouse wheel or trackpad scroll: move through the face queue.
+- arrow keys: move through the face queue, including macOS/OpenCV arrow codes.
 - `o`: open the face queue picker.
 - Up/down or `W` / `S` / `K` / `J`: move in the queue picker.
 - `a`: toggle auto-side mode.

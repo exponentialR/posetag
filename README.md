@@ -148,8 +148,9 @@ registered face capture queue, webcam/RealSense/video source settings,
 calibration and registry paths, output layout, expected manifest path, process
 state, and logs. Users can start the full missing-face batch, capture a
 selected subset, or capture one current face. The OpenCV capture window can
-auto-save stable valid face shots from that queue while keeping `ENTER` as the
-manual save fallback. Stage
+auto-save stable valid face shots from that queue, and the visible queue can be
+selected with mouse clicks, trackpad/mouse-wheel scrolling, or arrow keys while
+keeping `ENTER` as the manual save fallback. Stage
 5 status is coverage-based: it is complete only when
 every registered board face has at least one valid saved raw image, annotated
 image, metadata JSON, and `shots/manifest.csv` row. The
@@ -625,9 +626,10 @@ current Python environment. Like Stage 4, it has a batch action for all
 missing faces, a selected-subset action from the queue, and a current-face
 action for one-off captures. The OpenCV capture window remains the capture UI,
 but GUI launches default to stable-tag auto-capture; `ENTER` still saves
-manually. The dashboard streams process output, keeps a copyable command
-fallback, and refreshes coverage when `shots/manifest.csv` is written or
-updated.
+manually, and queue rows can be selected with mouse clicks, scroll/trackpad
+gestures, or arrow keys. The dashboard streams process output, keeps a
+copyable command fallback, and refreshes coverage when `shots/manifest.csv` is
+written or updated.
 
 **Alternative layouts**
 

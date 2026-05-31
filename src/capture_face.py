@@ -64,6 +64,10 @@ from posetag.pipelines.capture_face import (
 )
 
 KEY_UP, KEY_DOWN, KEY_LEFT, KEY_RIGHT = 2490368, 2621440, 2424832, 2555904
+KEY_UP_CODES = {KEY_UP, 63232, 65362, 82}
+KEY_DOWN_CODES = {KEY_DOWN, 63233, 65364, 84}
+KEY_LEFT_CODES = {KEY_LEFT, 63234, 65361, 81}
+KEY_RIGHT_CODES = {KEY_RIGHT, 63235, 65363, 83}
 
 
 UI_BG = (245, 249, 251)
@@ -198,6 +202,7 @@ def face_queue_panel(
     *,
     captured_faces: Optional[Set[str]] = None,
     hint: str = "Capture queue",
+    interaction: Optional[Dict[str, object]] = None,
 ) -> np.ndarray:
     """Draw a scrollable registered-face queue for the OpenCV side panel."""
 
@@ -210,6 +215,10 @@ def face_queue_panel(
     cv2.rectangle(pan, (margin, margin), (w - margin, h - margin), UI_CARD, -1)
     cv2.rectangle(pan, (margin, margin), (w - margin, h - margin), UI_BORDER, 1)
     _put(pan, hint, (margin + 16, margin + 30), scale=0.78, thickness=2)
+    if interaction is not None:
+        interaction.clear()
+        interaction["queue_rows"] = []
+        interaction["queue_rect"] = (margin, margin, w - margin, h - margin)
 
     done = sum(1 for face in faces if face_key(face) in captured)
     status = f"{done}/{total} captured"
@@ -235,6 +244,10 @@ def face_queue_panel(
         captured_here = key in captured
         row_top = y - 22
         row_bottom = y + 12
+        if interaction is not None:
+            interaction.setdefault("queue_rows", []).append(
+                (i, margin + 10, row_top, w - margin - 10, row_bottom)
+            )
         if selected:
             cv2.rectangle(
                 pan,
@@ -264,7 +277,7 @@ def face_queue_panel(
         )
         y += 36
 
-    tips = "Up/Down scroll   Enter select/save   q/Esc quit"
+    tips = "Click row or scroll   Enter save   q/Esc quit"
     _put(pan, tips, (margin + 16, h - margin - 18), scale=0.44, colour=UI_MUTED)
     return pan
 
@@ -350,6 +363,66 @@ def select_face_index(state: Dict, index: int, *, auto_side: bool = False) -> bo
     state["auto_candidate"] = None
     state["auto_streak"] = 0
     return True
+
+
+def queue_row_at(
+    rows: Sequence[Tuple[int, int, int, int, int]],
+    x: int,
+    y: int,
+) -> Optional[int]:
+    """Return the queue item index under local panel coordinates."""
+
+    for index, x0, y0, x1, y1 in rows:
+        if x0 <= x <= x1 and y0 <= y <= y1:
+            return int(index)
+    return None
+
+
+def mouse_wheel_queue_delta(flags: int) -> int:
+    """Return a face-selection delta from an OpenCV mouse-wheel event."""
+
+    try:
+        raw_delta = int(cv2.getMouseWheelDelta(flags))
+    except Exception:
+        raw_delta = int(flags)
+    if raw_delta > 0:
+        return -1
+    if raw_delta < 0:
+        return 1
+    return 0
+
+
+def capture_face_mouse_action(
+    event: int,
+    x: int,
+    y: int,
+    flags: int,
+    layout: Mapping[str, object],
+) -> Optional[Tuple[str, int]]:
+    """Translate an OpenCV mouse event into a queue selection action."""
+
+    wheel_events = {
+        getattr(cv2, "EVENT_MOUSEWHEEL", 10),
+        getattr(cv2, "EVENT_MOUSEHWHEEL", 11),
+    }
+    if event in wheel_events:
+        delta = mouse_wheel_queue_delta(flags)
+        if delta:
+            return ("scroll", delta)
+        return None
+
+    if event != getattr(cv2, "EVENT_LBUTTONDOWN", 1):
+        return None
+
+    frame_w = int(layout.get("frame_w", 0) or 0)
+    panel_w = int(layout.get("panel_w", 0) or 0)
+    if not (frame_w <= x < frame_w + panel_w):
+        return None
+    rows = layout.get("queue_rows") or ()
+    index = queue_row_at(rows, x - frame_w, y)
+    if index is None:
+        return None
+    return ("select", index)
 
 
 def update_auto_capture_state(
@@ -470,7 +543,7 @@ def draw_capture_overlay(
         thickness=1 if ok else 2,
     )
 
-    footer = "Enter save   Arrows face queue   o queue   a auto   h help   q/Esc quit"
+    footer = "Enter save   Click/scroll queue   Arrows queue   h help   q/Esc quit"
     footer_h = 36
     y0 = max(0, h - footer_h - 10)
     _fill_alpha(vis, (10, y0), (min(w - 10, 780), y0 + footer_h), UI_DARK, 0.70)
@@ -666,8 +739,26 @@ def main(argv=None):
     pick_sel = int(state.get("face_idx", 0))
     gallery_on, show_help = bool(args.gallery), False
     WINDOW_NAME = "Capture Face"
+    mouse_state: Dict[str, object] = {"layout": {}, "action": None}
+
+    def on_mouse(event, x, y, flags, param) -> None:
+        action = capture_face_mouse_action(
+            event,
+            int(x),
+            int(y),
+            int(flags),
+            mouse_state.get("layout") or {},
+        )
+        if action is not None:
+            mouse_state["action"] = action
+
     cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
     cv2.resizeWindow(WINDOW_NAME, args.width + args.panel_w + args.recent_w, args.height)
+    try:
+        cv2.setMouseCallback(WINDOW_NAME, on_mouse)
+    except Exception:
+        # Headless tests patch window creation; real HighGUI windows support this.
+        pass
 
     def save_current_face(raw_frame, annotated_frame, face_entry, validation_ok: bool) -> None:
         ts = capture_timestamp()
@@ -782,6 +873,7 @@ def main(argv=None):
             )
 
             # Panels
+            info_layout: Dict[str, object] = {}
             if mode == 'pick_face':
                 panel_info = face_queue_panel(
                     args.height,
@@ -789,14 +881,22 @@ def main(argv=None):
                     state.get("faces", []),
                     pick_sel,
                     captured_faces=state.get("captured_faces", set()),
+                    interaction=info_layout,
                 )
             else:
-                panel_info = make_info_panel(args.height, args.panel_w, state, gallery_on=gallery_on)
+                panel_info = make_info_panel(
+                    args.height,
+                    args.panel_w,
+                    state,
+                    gallery_on=gallery_on,
+                    interaction=info_layout,
+                )
                 if show_help:
                     overlay = np.full((args.height, args.panel_w, 3), 230, np.uint8)
                     text_lines(overlay, [
                         "Help:",
                         "ENTER: Save (twice within 3s to force if not OK)",
+                        "Click queue rows or scroll: Select face",
                         "Up/Down or Left/Right: Move through face queue",
                         "a: Toggle auto face/side (when base given)",
                         "o: Open face queue",
@@ -805,9 +905,15 @@ def main(argv=None):
                         "q/ESC: Quit",
                     ], y0=40)
                     panel_info = cv2.addWeighted(panel_info, 0.1, overlay, 0.9, 0)
+                    info_layout = {}
 
             panel_recent = make_recent_panel(args.height, args.recent_w, state.get("last_saved_ann"), gallery_on)
             combo = cv2.hconcat([vis, panel_info, panel_recent])
+            mouse_state["layout"] = {
+                "frame_w": int(vis.shape[1]),
+                "panel_w": int(panel_info.shape[1]),
+                "queue_rows": tuple(info_layout.get("queue_rows", ())),
+            }
             cv2.imshow(WINDOW_NAME, combo)
 
             if args.auto_capture and mode == "preview" and update_auto_capture_state(
@@ -828,12 +934,26 @@ def main(argv=None):
                     return 0
 
             k = cv2.waitKeyEx(1) or 0
+            mouse_action = mouse_state.get("action")
+            mouse_state["action"] = None
             ENTER_KEYS, CANCEL_KEYS = {13, 10}, {27}
-            UP_KEYS, DOWN_KEYS = {KEY_UP, ord('w'), ord('k')}, {KEY_DOWN, ord('s'), ord('j')}
+            UP_KEYS = KEY_UP_CODES | {ord('w'), ord('k')}
+            DOWN_KEYS = KEY_DOWN_CODES | {ord('s'), ord('j')}
+            LEFT_KEYS = KEY_LEFT_CODES | {ord('p'), ord('[')}
+            RIGHT_KEYS = KEY_RIGHT_CODES | {ord('f'), ord('n'), ord(']')}
 
             # Face queue picker
             if mode == 'pick_face':
                 faces = state.get("faces") or []
+                if mouse_action:
+                    action, value = mouse_action
+                    if action == "scroll":
+                        pick_sel = (pick_sel + int(value)) % max(1, len(faces))
+                    elif action == "select" and faces:
+                        pick_sel = max(0, min(int(value), len(faces) - 1))
+                        select_face_index(state, pick_sel)
+                        mode = 'preview'
+                    continue
                 if k in UP_KEYS:   pick_sel = (pick_sel - 1) % max(1, len(faces))
                 elif k in DOWN_KEYS: pick_sel = (pick_sel + 1) % max(1, len(faces))
                 elif ord('1') <= k <= ord('9'):
@@ -850,6 +970,14 @@ def main(argv=None):
                 continue
 
             # Preview
+            faces = state.get("faces") or []
+            if mouse_action:
+                action, value = mouse_action
+                if action == "select" and faces:
+                    select_face_index(state, int(value))
+                elif action == "scroll":
+                    cycle_face_selection(state, int(value))
+                continue
             if k in (ord('q'),) or k in CANCEL_KEYS: break
             if k == ord('h'): show_help = not show_help
             elif k == ord('g'): gallery_on = not gallery_on
@@ -858,9 +986,9 @@ def main(argv=None):
                 mode = 'pick_face'
             elif k == ord('a'):
                 state["auto_side"] = not state["auto_side"] if state["faces"] else False
-            elif k in {KEY_RIGHT, KEY_DOWN, ord('f'), ord('n'), ord(']')}:
+            elif k in RIGHT_KEYS or k in DOWN_KEYS:
                 cycle_face_selection(state, 1)
-            elif k in {KEY_LEFT, KEY_UP, ord('p'), ord('[')}:
+            elif k in LEFT_KEYS or k in UP_KEYS:
                 cycle_face_selection(state, -1)
             elif k in ENTER_KEYS:
                 if face is None:
