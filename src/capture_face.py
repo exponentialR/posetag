@@ -8,11 +8,12 @@ Capture wide shots per object face with AprilTag overlays and metadata for
 subsequent T_board_object (board→object) computation. Project-aware: resolves
 an active project root and writes under <project_root>/shots/… by default.
 
-What’s new (rev)
+What is current
 ----------------
 - Full face (e.g., connection_plate_white_sideA) or base-only (e.g., connection_plate_white);
   base auto-resolves side via boards/tag_registry.yaml using live detections.
-- In-window object picker ('o'); no terminal prompts in preview.
+- In-window registered-face queue ('o'); no terminal prompts in preview.
+- Optional stable-tag auto-capture for queued faces.
 - Info + last-saved side panels ('g' toggles). Panels are UI-only.
 - Safety save: press Enter twice within 3 s if expected tags aren’t seen.
 - Resizable window; camera frame stays at requested resolution.
@@ -26,14 +27,14 @@ Default (by object and side):
 
 Keys
 ----
-ENTER save (double-press to force) | Left/Right cycle faces | o object picker |
-a auto-side | f next face | g panels | h help | q / ESC quit
+ENTER save (double-press to force) | arrow keys cycle face queue |
+o queue | a auto-side | g panels | h help | q / ESC quit
 """
 
 from __future__ import annotations
-import argparse, time
+import argparse, csv, time
 from pathlib import Path
-from typing import List, Dict, Tuple, Optional, Set
+from typing import List, Dict, Tuple, Optional, Set, Mapping, Sequence
 
 import numpy as np
 import cv2
@@ -49,16 +50,15 @@ from posetag.pipelines.capture_face import (
     capture_timestamp,
     create_apriltag_detector,
     create_capture_output_dirs,
-    faces_for_base,
     load_apriltag_detector_class,
     load_capture_calibration,
     load_capture_registry,
     load_registered_faces,
+    parse_base_and_side,
     prepare_capture_paths,
     preview_capture_project_root,
     resolve_capture_calibration_path,
     select_initial_faces,
-    unique_bases,
     validate_capture_source_args,
     write_capture_outputs,
 )
@@ -190,6 +190,135 @@ def object_picker_panel(
     return pan
 
 
+def face_queue_panel(
+    h: int,
+    w: int,
+    faces: Sequence[Mapping[str, object]],
+    sel: int,
+    *,
+    captured_faces: Optional[Set[str]] = None,
+    hint: str = "Capture queue",
+) -> np.ndarray:
+    """Draw a scrollable registered-face queue for the OpenCV side panel."""
+
+    pan = np.full((h, w, 3), UI_BG, np.uint8)
+    margin = 14
+    captured = captured_faces or set()
+    total = len(faces)
+    sel = max(0, min(sel, total - 1)) if total else 0
+
+    cv2.rectangle(pan, (margin, margin), (w - margin, h - margin), UI_CARD, -1)
+    cv2.rectangle(pan, (margin, margin), (w - margin, h - margin), UI_BORDER, 1)
+    _put(pan, hint, (margin + 16, margin + 30), scale=0.78, thickness=2)
+
+    done = sum(1 for face in faces if face_key(face) in captured)
+    status = f"{done}/{total} captured"
+    _put(pan, status, (margin + 16, margin + 58), colour=UI_MUTED)
+    if not faces:
+        _put(
+            pan,
+            "No registered faces were found in the tag registry.",
+            (margin + 16, margin + 96),
+            colour=UI_RED,
+        )
+        return pan
+
+    max_show = min(11, len(faces))
+    start = max(0, min(sel - max_show // 2, len(faces) - max_show))
+    end = min(len(faces), start + max_show)
+
+    y = margin + 92
+    for i in range(start, end):
+        face = faces[i]
+        key = face_key(face)
+        selected = i == sel
+        captured_here = key in captured
+        row_top = y - 22
+        row_bottom = y + 12
+        if selected:
+            cv2.rectangle(
+                pan,
+                (margin + 10, row_top),
+                (w - margin - 10, row_bottom),
+                (236, 246, 251),
+                -1,
+            )
+            cv2.rectangle(
+                pan,
+                (margin + 10, row_top),
+                (margin + 14, row_bottom),
+                UI_GREEN if captured_here else UI_BLUE,
+                -1,
+            )
+        marker = "[x]" if captured_here else "[ ]"
+        prefix = ">" if selected else " "
+        colour = UI_GREEN if captured_here else (UI_TEXT if selected else UI_MUTED)
+        label = _truncate_middle(face_label(face), 34)
+        _put(
+            pan,
+            f"{prefix} {marker} {label}",
+            (margin + 20, y),
+            scale=0.54,
+            colour=colour,
+            thickness=2 if selected else 1,
+        )
+        y += 36
+
+    tips = "Up/Down scroll   Enter select/save   q/Esc quit"
+    _put(pan, tips, (margin + 16, h - margin - 18), scale=0.44, colour=UI_MUTED)
+    return pan
+
+
+def face_key(face: Mapping[str, object]) -> str:
+    """Return the queue key for a registered face."""
+
+    return str(face.get("object", "")).strip() or str(face.get("yaml", "")).strip()
+
+
+def face_label(face: Mapping[str, object]) -> str:
+    """Return the user-facing queue label for a registered face."""
+
+    return face_key(face) or Path(str(face.get("yaml", ""))).stem or "unregistered"
+
+
+def load_existing_captured_faces(manifest_path: Path) -> Set[str]:
+    """Return valid captured face labels already present in the manifest."""
+
+    captured: Set[str] = set()
+    if not manifest_path.exists():
+        return captured
+    try:
+        with manifest_path.open("r", newline="", encoding="utf-8") as handle:
+            for row in csv.DictReader(handle):
+                validation = str(row.get("validation_ok", "")).strip().lower()
+                if validation not in {"1", "true", "yes"}:
+                    continue
+                object_full = str(row.get("object_full", "")).strip()
+                if object_full:
+                    captured.add(object_full)
+    except OSError:
+        return set()
+    return captured
+
+
+def first_uncaptured_index(
+    faces: Sequence[Mapping[str, object]],
+    captured_faces: Set[str],
+    *,
+    start: int = 0,
+) -> Optional[int]:
+    """Return the next uncaptured face index, wrapping once through the queue."""
+
+    if not faces:
+        return None
+    count = len(faces)
+    for offset in range(count):
+        idx = (start + offset) % count
+        if face_key(faces[idx]) not in captured_faces:
+            return idx
+    return None
+
+
 def cycle_face_selection(state: Dict, delta: int = 1) -> bool:
     """Cycle the active face explicitly and disable auto-side selection."""
 
@@ -200,8 +329,62 @@ def cycle_face_selection(state: Dict, delta: int = 1) -> bool:
     state["face_idx"] = (current + int(delta)) % len(faces)
     state["auto_side"] = False
     state["face"] = faces[state["face_idx"]]
+    base, _side = parse_base_and_side(str(state["face"].get("object", "")))
+    state["object_base"] = base or state.get("object_base")
     state["save_warn"] = False
     return True
+
+
+def select_face_index(state: Dict, index: int, *, auto_side: bool = False) -> bool:
+    """Select a face by index and update display state."""
+
+    faces = state.get("faces") or []
+    if not faces:
+        return False
+    state["face_idx"] = max(0, min(int(index), len(faces) - 1))
+    state["auto_side"] = bool(auto_side)
+    state["face"] = faces[state["face_idx"]]
+    base, _side = parse_base_and_side(str(state["face"].get("object", "")))
+    state["object_base"] = base or state.get("object_base")
+    state["save_warn"] = False
+    state["auto_candidate"] = None
+    state["auto_streak"] = 0
+    return True
+
+
+def update_auto_capture_state(
+    state: Dict,
+    face: Optional[Mapping[str, object]],
+    ok: bool,
+    *,
+    now: float,
+    required_frames: int,
+    cooldown_s: float,
+) -> bool:
+    """Return true when a valid face has remained stable long enough to save."""
+
+    if face is None or not ok:
+        state["auto_candidate"] = None
+        state["auto_streak"] = 0
+        return False
+
+    key = face_key(face)
+    if key in (state.get("captured_faces") or set()):
+        state["auto_candidate"] = key
+        state["auto_streak"] = 0
+        return False
+
+    if state.get("auto_candidate") == key:
+        state["auto_streak"] = int(state.get("auto_streak", 0)) + 1
+    else:
+        state["auto_candidate"] = key
+        state["auto_streak"] = 1
+
+    last_save = float(state.get("last_auto_save_t", 0.0))
+    return (
+        int(state["auto_streak"]) >= max(1, int(required_frames))
+        and now - last_save >= max(0.0, float(cooldown_s))
+    )
 
 
 def draw_capture_overlay(
@@ -256,7 +439,7 @@ def draw_capture_overlay(
         thickness=1 if ok else 2,
     )
 
-    footer = "Enter save   Left/Right face   o object   a auto   h help   q/Esc quit"
+    footer = "Enter save   Arrows face queue   o queue   a auto   h help   q/Esc quit"
     footer_h = 36
     y0 = max(0, h - footer_h - 10)
     _fill_alpha(vis, (10, y0), (min(w - 10, 780), y0 + footer_h), UI_DARK, 0.70)
@@ -320,6 +503,16 @@ def main(argv=None):
                     help="Where to save shots (default: <project_root>/shots).")
     ap.add_argument("--object_name", default=None,
                     help="Either full (e.g. connection_plate_white_sideA) or base (e.g. connection_plate_white).")
+    ap.add_argument("--capture_all", action="store_true",
+                    help="queue all registered faces from the tag registry")
+    ap.add_argument("--auto_capture", action="store_true",
+                    help="auto-save when the selected face's expected tags are stable")
+    ap.add_argument("--auto_capture_frames", type=int, default=8,
+                    help="valid consecutive frames required before auto-save")
+    ap.add_argument("--auto_capture_cooldown", type=float, default=1.0,
+                    help="minimum seconds between auto-saves")
+    ap.add_argument("--exit_when_complete", action="store_true",
+                    help="exit cleanly after the queued faces have been captured")
     ap.add_argument("--family", default="tag36h11")
     ap.add_argument("--width", type=int, default=640)
     ap.add_argument("--height", type=int, default=480)
@@ -346,6 +539,10 @@ def main(argv=None):
     ap.add_argument("--cam", type=int, default=0, help="OpenCV camera index when --source=opencv")
     ap.add_argument("--video", type=str, default=None, help="Video path when --source=video")
     args = ap.parse_args(argv)
+    if args.auto_capture_frames <= 0:
+        raise SystemExit("--auto_capture_frames must be positive")
+    if args.auto_capture_cooldown < 0:
+        raise SystemExit("--auto_capture_cooldown must be zero or greater")
 
     # ---------- validate project inputs before opening hardware or writing outputs ----------
     try:
@@ -397,25 +594,98 @@ def main(argv=None):
     logger.info("Shots will be saved to: %s", str(paths.out_dir))
 
     # ---------- UI state ----------
+    captured_faces = load_existing_captured_faces(paths.manifest_path)
     state = {
         "object_base": None, "faces": [], "face_idx": 0, "auto_side": False,
         "detected_ids": set(), "validation_ok": True, "thumbs": [],
         "save_warn": False, "save_warn_t0": 0.0,
+        "captured_faces": captured_faces, "auto_candidate": None,
+        "auto_streak": 0, "last_auto_save_t": 0.0,
     }
 
-    bases = unique_bases(registered_faces)
-
-    # Initial object from CLI
-    if initial_selection:
+    if args.capture_all or initial_selection is None:
+        state["faces"] = list(registered_faces)
+        first_missing = first_uncaptured_index(state["faces"], captured_faces)
+        select_face_index(state, first_missing if first_missing is not None else 0)
+    elif initial_selection:
         state["object_base"] = initial_selection.object_base
         state["faces"] = list(initial_selection.faces)
         state["auto_side"] = initial_selection.auto_side
-        state["face_idx"] = 0
+        first_missing = first_uncaptured_index(state["faces"], captured_faces)
+        select_face_index(
+            state,
+            first_missing if first_missing is not None else 0,
+            auto_side=initial_selection.auto_side,
+        )
 
-    mode, pick_sel, gallery_on, show_help = ('preview' if state["object_base"] else 'pick_object', 0, bool(args.gallery), False)
+    mode = "preview" if state["faces"] and (args.capture_all or initial_selection) else "pick_face"
+    pick_sel = int(state.get("face_idx", 0))
+    gallery_on, show_help = bool(args.gallery), False
     WINDOW_NAME = "Capture Face"
     cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
     cv2.resizeWindow(WINDOW_NAME, args.width + args.panel_w + args.recent_w, args.height)
+
+    def save_current_face(raw_frame, annotated_frame, face_entry, validation_ok: bool) -> None:
+        ts = capture_timestamp()
+        obj_full = face_entry["object"]
+        shot_paths = build_shot_paths(
+            layout=args.layout,
+            out_dir=paths.out_dir,
+            object_full=obj_full,
+            timestamp=ts,
+            raw_dir=paths.raw_dir,
+            ann_dir=paths.ann_dir,
+            meta_dir=paths.meta_dir,
+        )
+        meta = build_capture_metadata(
+            face=face_entry,
+            shot_paths=shot_paths,
+            detected_tag_ids=state.get("detected_ids", set()),
+            validation_ok=validation_ok,
+            auto_face=state["auto_side"],
+            frame_shape=raw_frame.shape,
+            camera_params=calibration.camera_params,
+            timestamp=ts,
+        )
+        try:
+            write_capture_outputs(
+                raw_frame=raw_frame,
+                annotated_frame=annotated_frame,
+                metadata=meta,
+                shot_paths=shot_paths,
+                manifest_path=paths.manifest_path,
+                image_writer=cv2.imwrite,
+            )
+        except CaptureFaceError as exc:
+            raise SystemExit(str(exc)) from exc
+        state["last_saved_ann"] = annotated_frame.copy()
+        state["captured_faces"].add(face_key(face_entry))
+
+        logger.info(f"[+] Saved {shot_paths.raw_path}")
+        logger.info(f"[+] Saved {shot_paths.ann_path}")
+        logger.info(f"[+] Saved {shot_paths.meta_path}")
+
+        try:
+            tw = min(320, annotated_frame.shape[1])
+            th = int(annotated_frame.shape[0] * tw / annotated_frame.shape[1])
+            state["thumbs"].append(cv2.resize(annotated_frame, (tw, th)))
+            if len(state["thumbs"]) > 12:
+                state["thumbs"] = state["thumbs"][-12:]
+        except Exception:
+            pass
+
+    def advance_after_capture() -> bool:
+        faces = state.get("faces") or []
+        if not faces:
+            return False
+        next_idx = first_uncaptured_index(
+            faces,
+            state.get("captured_faces", set()),
+            start=int(state.get("face_idx", 0)) + 1,
+        )
+        if next_idx is None:
+            return False
+        return select_face_index(state, next_idx)
 
     try:
         first = True
@@ -468,8 +738,14 @@ def main(argv=None):
             )
 
             # Panels
-            if mode == 'pick_object':
-                panel_info = object_picker_panel(args.height, args.panel_w, bases, pick_sel)
+            if mode == 'pick_face':
+                panel_info = face_queue_panel(
+                    args.height,
+                    args.panel_w,
+                    state.get("faces", []),
+                    pick_sel,
+                    captured_faces=state.get("captured_faces", set()),
+                )
             else:
                 panel_info = make_info_panel(args.height, args.panel_w, state, gallery_on=gallery_on)
                 if show_help:
@@ -477,9 +753,9 @@ def main(argv=None):
                     text_lines(overlay, [
                         "Help:",
                         "ENTER: Save (twice within 3s to force if not OK)",
+                        "Up/Down or Left/Right: Move through face queue",
                         "a: Toggle auto face/side (when base given)",
-                        "Left/Right or f: Cycle faces (manual mode)",
-                        "o: Pick object (on-screen picker)",
+                        "o: Open face queue",
                         "g: Toggle gallery thumbnails",
                         "h: Toggle this help",
                         "q/ESC: Quit",
@@ -490,26 +766,40 @@ def main(argv=None):
             combo = cv2.hconcat([vis, panel_info, panel_recent])
             cv2.imshow(WINDOW_NAME, combo)
 
+            if args.auto_capture and mode == "preview" and update_auto_capture_state(
+                state,
+                face,
+                ok,
+                now=time.time(),
+                required_frames=args.auto_capture_frames,
+                cooldown_s=args.auto_capture_cooldown,
+            ):
+                state["save_warn"] = False
+                save_current_face(c, vis, face, ok)
+                state["last_auto_save_t"] = time.time()
+                state["auto_streak"] = 0
+                advanced = advance_after_capture()
+                if not advanced and args.exit_when_complete:
+                    logger.info("Queued face-shot capture is complete; exiting cleanly.")
+                    return 0
+
             k = cv2.waitKeyEx(1) or 0
             ENTER_KEYS, CANCEL_KEYS = {13, 10}, {27}
             UP_KEYS, DOWN_KEYS = {KEY_UP, ord('w'), ord('k')}, {KEY_DOWN, ord('s'), ord('j')}
 
-            # Object picker
-            if mode == 'pick_object':
-                if k in UP_KEYS:   pick_sel = (pick_sel - 1) % max(1, len(bases))
-                elif k in DOWN_KEYS: pick_sel = (pick_sel + 1) % max(1, len(bases))
+            # Face queue picker
+            if mode == 'pick_face':
+                faces = state.get("faces") or []
+                if k in UP_KEYS:   pick_sel = (pick_sel - 1) % max(1, len(faces))
+                elif k in DOWN_KEYS: pick_sel = (pick_sel + 1) % max(1, len(faces))
                 elif ord('1') <= k <= ord('9'):
-                    idx = (k - ord('1'));  pick_sel = idx if idx < len(bases) else pick_sel
+                    idx = (k - ord('1'));  pick_sel = idx if idx < len(faces) else pick_sel
                 elif k in ENTER_KEYS:
-                    base = bases[pick_sel] if bases else None
-                    if base:
-                        state["object_base"] = base
-                        state["faces"] = faces_for_base(base, registered_faces)
-                        state["face_idx"] = 0
-                        state["auto_side"] = True
+                    if faces:
+                        select_face_index(state, pick_sel)
                     mode = 'preview'
                 elif k in CANCEL_KEYS:
-                    if state["object_base"] is None:
+                    if not state.get("faces"):
                         break
                     mode = 'preview'
                 elif k == ord('q'):     break
@@ -520,13 +810,13 @@ def main(argv=None):
             if k == ord('h'): show_help = not show_help
             elif k == ord('g'): gallery_on = not gallery_on
             elif k == ord('o'):
-                pick_sel = bases.index(state["object_base"]) if state["object_base"] in bases else 0
-                mode = 'pick_object'
+                pick_sel = int(state.get("face_idx", 0))
+                mode = 'pick_face'
             elif k == ord('a'):
                 state["auto_side"] = not state["auto_side"] if state["faces"] else False
-            elif k in {KEY_RIGHT, ord('f'), ord('n'), ord(']')}:
+            elif k in {KEY_RIGHT, KEY_DOWN, ord('f'), ord('n'), ord(']')}:
                 cycle_face_selection(state, 1)
-            elif k in {KEY_LEFT, ord('p'), ord('[')}:
+            elif k in {KEY_LEFT, KEY_UP, ord('p'), ord('[')}:
                 cycle_face_selection(state, -1)
             elif k in ENTER_KEYS:
                 if face is None:
@@ -537,53 +827,11 @@ def main(argv=None):
                         state["save_warn"], state["save_warn_t0"] = True, now
                         continue
                 state["save_warn"] = False
-              
-                # Generate timestamp and determine save paths based on layout.
-                ts = capture_timestamp()
-                obj_full = face["object"]
-                shot_paths = build_shot_paths(
-                    layout=args.layout,
-                    out_dir=paths.out_dir,
-                    object_full=obj_full,
-                    timestamp=ts,
-                    raw_dir=paths.raw_dir,
-                    ann_dir=paths.ann_dir,
-                    meta_dir=paths.meta_dir,
-                )
-                meta = build_capture_metadata(
-                    face=face,
-                    shot_paths=shot_paths,
-                    detected_tag_ids=det_ids,
-                    validation_ok=ok,
-                    auto_face=state["auto_side"],
-                    frame_shape=c.shape,
-                    camera_params=calibration.camera_params,
-                    timestamp=ts,
-                )
-                try:
-                    write_capture_outputs(
-                        raw_frame=c,
-                        annotated_frame=vis,
-                        metadata=meta,
-                        shot_paths=shot_paths,
-                        manifest_path=paths.manifest_path,
-                        image_writer=cv2.imwrite,
-                    )
-                except CaptureFaceError as exc:
-                    raise SystemExit(str(exc)) from exc
-                state["last_saved_ann"] = vis.copy()
-
-                logger.info(f"[+] Saved {shot_paths.raw_path}")
-                logger.info(f"[+] Saved {shot_paths.ann_path}")
-                logger.info(f"[+] Saved {shot_paths.meta_path}")
-
-                # Update thumbnails for gallery panel
-                try:
-                    tw = min(320, vis.shape[1]); th = int(vis.shape[0] * tw / vis.shape[1])
-                    state["thumbs"].append(cv2.resize(vis, (tw, th)))
-                    if len(state["thumbs"]) > 12: state["thumbs"] = state["thumbs"][-12:]
-                except Exception:
-                    pass
+                save_current_face(c, vis, face, ok)
+                advanced = advance_after_capture()
+                if not advanced and args.exit_when_complete:
+                    logger.info("Queued face-shot capture is complete; exiting cleanly.")
+                    return 0
 
     finally:
         stop()

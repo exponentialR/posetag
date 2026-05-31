@@ -707,7 +707,8 @@ class WorkflowGuiTests(unittest.TestCase):
         self.assertIn("Run Capture Face", note)
         self.assertIn("posetag-capture-face", note)
         self.assertIn("OpenCV preview", note)
-        self.assertIn("ENTER", note)
+        self.assertIn("registered face queue", note)
+        self.assertIn("auto-saves", note)
         self.assertIn("manifest row", note)
         self.assertIn("every registered face", complete_note)
         self.assertEqual(

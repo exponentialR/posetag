@@ -114,6 +114,8 @@ from posetag.workflows.capture_face import (
     DEFAULT_FPS as DEFAULT_CAPTURE_FPS,
     DEFAULT_HEIGHT as DEFAULT_CAPTURE_HEIGHT,
     DEFAULT_MIN_EXPECTED as DEFAULT_CAPTURE_MIN_EXPECTED,
+    DEFAULT_AUTO_CAPTURE_COOLDOWN as DEFAULT_CAPTURE_AUTO_COOLDOWN,
+    DEFAULT_AUTO_CAPTURE_FRAMES as DEFAULT_CAPTURE_AUTO_FRAMES,
     DEFAULT_PANEL_WIDTH as DEFAULT_CAPTURE_PANEL_WIDTH,
     DEFAULT_RECENT_WIDTH as DEFAULT_CAPTURE_RECENT_WIDTH,
     DEFAULT_WIDTH as DEFAULT_CAPTURE_WIDTH,
@@ -161,6 +163,8 @@ from posetag.workflows.object_tags import (
     generate_object_tags,
     inspect_object_tag_generation,
 )
+
+CAPTURE_FACE_QUEUE_LABEL = "All missing registered faces"
 
 
 def build_main_window(qt: Any, project_root: Path) -> Any:
@@ -2742,9 +2746,8 @@ def build_main_window(qt: Any, project_root: Path) -> Any:
             capture_face_title = QtWidgets.QLabel("Face-shot capture")
             capture_face_title.setObjectName("CardTitle")
             capture_face_note = QtWidgets.QLabel(
-                "Prepare and launch the existing posetag-capture-face workflow "
-                "after each object side has a board definition in the tag "
-                "registry."
+                "Capture the registered board faces carried forward from "
+                "Stage 4. Missing faces are queued first."
             )
             capture_face_note.setObjectName("MutedText")
             capture_face_note.setWordWrap(True)
@@ -2754,10 +2757,18 @@ def build_main_window(qt: Any, project_root: Path) -> Any:
             self._capture_face_object.setMinimumWidth(240)
             if self._capture_face_object.lineEdit() is not None:
                 self._capture_face_object.lineEdit().setPlaceholderText(
-                    "Registered object or full face"
+                    "All missing faces, one object, or one face"
                 )
             self._capture_face_object.currentTextChanged.connect(
                 self._update_capture_face_flow
+            )
+
+            self._capture_face_queue = QtWidgets.QListWidget()
+            self._capture_face_queue.setObjectName("BatchCaptureQueue")
+            self._capture_face_queue.setMinimumHeight(120)
+            self._capture_face_queue.setMaximumHeight(190)
+            self._capture_face_queue.itemClicked.connect(
+                self._capture_face_queue_item_clicked
             )
 
             self._capture_face_source = QtWidgets.QComboBox()
@@ -3121,6 +3132,9 @@ def build_main_window(qt: Any, project_root: Path) -> Any:
 
             capture_face_layout.addWidget(capture_face_title)
             capture_face_layout.addWidget(capture_face_note)
+            capture_face_layout.addWidget(
+                _make_field("Registered face queue", self._capture_face_queue)
+            )
             capture_face_layout.addLayout(capture_grid)
             capture_face_layout.addWidget(capture_advanced_group)
             capture_face_layout.addWidget(self._capture_face_guidance)
@@ -4525,6 +4539,7 @@ def build_main_window(qt: Any, project_root: Path) -> Any:
                 readiness = inspect_capture_face_readiness(
                     self._capture_face_config()
                 )
+            self._update_capture_face_queue(readiness)
             self._capture_face_readiness.setText(
                 _format_capture_face_readiness(readiness)
             )
@@ -4572,6 +4587,7 @@ def build_main_window(qt: Any, project_root: Path) -> Any:
             choices = tuple(
                 dict.fromkeys(
                     (
+                        CAPTURE_FACE_QUEUE_LABEL,
                         *readiness.registered_bases,
                         *readiness.registered_faces,
                     )
@@ -4588,11 +4604,49 @@ def build_main_window(qt: Any, project_root: Path) -> Any:
                         self._capture_face_object.addItem(current)
                     self._capture_face_object.setCurrentText(current)
                 elif choices:
-                    self._capture_face_object.setCurrentText(choices[0])
+                    self._capture_face_object.setCurrentText(
+                        CAPTURE_FACE_QUEUE_LABEL
+                    )
                     updated = True
             finally:
                 self._capture_face_object.blockSignals(False)
             return updated
+
+        def _update_capture_face_queue(
+            self,
+            readiness: CaptureFaceReadiness,
+        ) -> None:
+            if not hasattr(self, "_capture_face_queue"):
+                return
+            outputs = readiness.output_status
+            covered = set(outputs.covered_faces)
+            missing = set(outputs.missing_faces)
+            self._capture_face_queue.blockSignals(True)
+            try:
+                self._capture_face_queue.clear()
+                for face in outputs.registered_faces:
+                    status = "missing" if face in missing else "captured"
+                    marker = "[ ]" if face in missing else "[x]"
+                    item = QtWidgets.QListWidgetItem(f"{marker} {face}")
+                    item.setData(QtCore.Qt.ItemDataRole.UserRole, face)
+                    if face in covered:
+                        item.setForeground(QtGui.QBrush(QtGui.QColor("#087a3d")))
+                    elif face in missing:
+                        item.setForeground(QtGui.QBrush(QtGui.QColor("#8a5b00")))
+                    item.setToolTip(status)
+                    self._capture_face_queue.addItem(item)
+                if self._capture_face_queue.count() == 0:
+                    item = QtWidgets.QListWidgetItem(
+                        "No registered faces found in boards/tag_registry.yaml"
+                    )
+                    self._capture_face_queue.addItem(item)
+            finally:
+                self._capture_face_queue.blockSignals(False)
+
+        def _capture_face_queue_item_clicked(self, item: Any) -> None:
+            face = item.data(QtCore.Qt.ItemDataRole.UserRole)
+            if face:
+                self._capture_face_object.setCurrentText(str(face))
 
         def _copy_calibration_command(self) -> None:
             command = self._calibration_command_preview.text()
@@ -4939,8 +4993,8 @@ def build_main_window(qt: Any, project_root: Path) -> Any:
                 "[gui] Launching with the current Python interpreter."
             )
             self._append_capture_face_log(
-                "[gui] Use the OpenCV window for object/face selection, "
-                "ENTER save, and q or ESC quit."
+                "[gui] Use the OpenCV face queue; auto-capture runs when tags "
+                "are stable, ENTER saves manually, and q or ESC quits."
             )
             self._set_capture_face_process_state(
                 capture_face_process_running(launch.expected_manifest)
@@ -5391,9 +5445,12 @@ def build_main_window(qt: Any, project_root: Path) -> Any:
             raw_dir_text = self._capture_face_raw_dir.text().strip()
             ann_dir_text = self._capture_face_ann_dir.text().strip()
             meta_dir_text = self._capture_face_meta_dir.text().strip()
+            object_text = self._capture_face_object.currentText().strip()
+            capture_all = object_text in ("", CAPTURE_FACE_QUEUE_LABEL)
+            object_name = "" if capture_all else object_text
             return CaptureFaceConfig(
                 project_root=self._current_project_root(),
-                object_name=self._capture_face_object.currentText(),
+                object_name=object_name,
                 family=self._capture_face_family.text(),
                 calibration_path=Path(calib_text).expanduser()
                 if calib_text
@@ -5418,6 +5475,11 @@ def build_main_window(qt: Any, project_root: Path) -> Any:
                 meta_dir=Path(meta_dir_text).expanduser() if meta_dir_text else None,
                 panel_width=int(self._capture_face_panel_width.value()),
                 recent_width=int(self._capture_face_recent_width.value()),
+                capture_all=capture_all,
+                auto_capture=True,
+                auto_capture_frames=DEFAULT_CAPTURE_AUTO_FRAMES,
+                auto_capture_cooldown=DEFAULT_CAPTURE_AUTO_COOLDOWN,
+                exit_when_complete=capture_all,
             )
 
         def _object_tag_id_mode_value(self) -> str:
@@ -6252,9 +6314,10 @@ def _capture_face_command_card_note(
         )
     return (
         "Run Capture Face starts the existing posetag-capture-face workflow, "
-        "and Copy Command keeps the terminal fallback. In the OpenCV preview, "
-        "press ENTER to save a raw image, annotated image, metadata JSON, and "
-        "manifest row; press q or ESC to quit cleanly."
+        "and Copy Command keeps the terminal fallback. The OpenCV preview shows "
+        "the registered face queue, auto-saves stable valid shots when launched "
+        "from the GUI, and still writes the same raw image, annotated image, "
+        "metadata JSON, and manifest row."
     )
 
 

@@ -169,14 +169,44 @@ class CaptureFaceStep3Tests(unittest.TestCase):
             "detected_ids": {1},
             "validation_ok": True,
             "face": {"object": "connection_plate_white_sideA", "tag_ids": (1, 2), "yaml": "sideA.yaml"},
+            "captured_faces": {"connection_plate_white_sideA"},
         }
 
         cycled = legacy_capture_face.cycle_face_selection(state, 1)
+        selected = legacy_capture_face.select_face_index(state, 0)
+        first_missing = legacy_capture_face.first_uncaptured_index(
+            state["faces"],
+            state["captured_faces"],
+        )
+        auto_state = {"captured_faces": set()}
+        auto_first = legacy_capture_face.update_auto_capture_state(
+            auto_state,
+            state["face"],
+            True,
+            now=10.0,
+            required_frames=2,
+            cooldown_s=0.0,
+        )
+        auto_second = legacy_capture_face.update_auto_capture_state(
+            auto_state,
+            state["face"],
+            True,
+            now=10.1,
+            required_frames=2,
+            cooldown_s=0.0,
+        )
         picker = legacy_capture_face.object_picker_panel(
             240,
             360,
             ["connection_plate_white", "column_white"],
             1,
+        )
+        queue = legacy_capture_face.face_queue_panel(
+            260,
+            420,
+            state["faces"],
+            0,
+            captured_faces=state["captured_faces"],
         )
         info = make_info_panel(360, 420, state)
         recent = make_recent_panel(240, 320, None, True)
@@ -189,9 +219,14 @@ class CaptureFaceStep3Tests(unittest.TestCase):
         )
 
         self.assertTrue(cycled)
+        self.assertTrue(selected)
         self.assertFalse(state["auto_side"])
-        self.assertEqual(state["face_idx"], 1)
+        self.assertEqual(state["face_idx"], 0)
+        self.assertEqual(first_missing, 1)
+        self.assertFalse(auto_first)
+        self.assertTrue(auto_second)
         self.assertGreater(float(picker.mean()), 180.0)
+        self.assertGreater(float(queue.mean()), 180.0)
         self.assertGreater(float(info.mean()), 180.0)
         self.assertGreater(float(recent.mean()), 180.0)
         self.assertGreater(float(overlay.mean()), 2.0)
@@ -656,6 +691,54 @@ class CaptureFaceStep3Tests(unittest.TestCase):
                 rows = list(csv.DictReader(handle))
             self.assertEqual(len(rows), 1)
             self.assertEqual(rows[0]["path_meta"], str(meta_path))
+
+    def test_synthetic_auto_capture_queue_writes_and_exits_when_complete(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            base = Path(tmpdir)
+            project_root = base / "project"
+            video = base / "input.mp4"
+            video.touch()
+            _write_calibration(project_root / "calib" / "calib_color.yaml")
+            _write_board_and_registry(project_root)
+            frame = np.full((40, 60, 3), 80, dtype=np.uint8)
+
+            def fake_open_source(*args, **kwargs):
+                return lambda: frame.copy(), lambda: None, {"kind": "video"}
+
+            with patch.dict(os.environ, _isolated_env(base), clear=False):
+                with patch("capture_face.load_apriltag_detector_class", return_value=OneTagDetector):
+                    with patch.object(legacy_capture_face.capture_source, "open_source", fake_open_source):
+                        with patch("capture_face.capture_timestamp", return_value="20260529_120000"):
+                            with patch("capture_face.cv2.namedWindow"):
+                                with patch("capture_face.cv2.resizeWindow"):
+                                    with patch("capture_face.cv2.imshow"):
+                                        with patch("capture_face.cv2.waitKeyEx", return_value=0):
+                                            with patch("capture_face.cv2.destroyAllWindows"):
+                                                result = capture_face_cli.main(
+                                                    [
+                                                        "--project_root",
+                                                        str(project_root),
+                                                        "--source",
+                                                        "video",
+                                                        "--video",
+                                                        str(video),
+                                                        "--capture_all",
+                                                        "--auto_capture",
+                                                        "--auto_capture_frames",
+                                                        "1",
+                                                        "--auto_capture_cooldown",
+                                                        "0",
+                                                        "--exit_when_complete",
+                                                    ]
+                                                )
+
+            self.assertEqual(result, 0)
+            manifest_path = project_root.resolve() / "shots" / "manifest.csv"
+            self.assertTrue(manifest_path.is_file())
+            with manifest_path.open("r", newline="", encoding="utf-8") as handle:
+                rows = list(csv.DictReader(handle))
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]["object_full"], "connection_plate_white_sideA")
 
 
 if __name__ == "__main__":

@@ -60,13 +60,13 @@ class WorkflowCaptureFaceTests(unittest.TestCase):
         self.assertEqual(launch.arguments[:2], ("-m", "posetag.cli.capture_face"))
         self.assertEqual(launch.expected_manifest.name, "manifest.csv")
 
-    def test_readiness_reports_missing_selection_video_and_realsense(self) -> None:
+    def test_readiness_allows_queue_mode_and_reports_video_and_realsense(self) -> None:
         with TemporaryDirectory() as tmpdir:
             project_root = Path(tmpdir) / "project"
             _write_valid_calibration(project_root / "calib" / "calib_color.yaml")
             _write_board_and_registry(project_root, ("sideA",))
 
-            missing_selection = inspect_capture_face_readiness(
+            queue_mode = inspect_capture_face_readiness(
                 CaptureFaceConfig(project_root=project_root)
             )
             missing_video = inspect_capture_face_readiness(
@@ -85,14 +85,41 @@ class WorkflowCaptureFaceTests(unittest.TestCase):
                 realsense_available=False,
             )
 
-        self.assertFalse(missing_selection.ready)
-        self.assertTrue(
-            any("Choose a registered object" in error for error in missing_selection.errors)
-        )
+        self.assertTrue(queue_mode.ready, queue_mode.errors)
+        self.assertEqual(queue_mode.selected_faces, ("connection_plate_white_sideA",))
+        self.assertNotIn("--object_name", queue_mode.command_preview)
         self.assertFalse(missing_video.ready)
         self.assertTrue(any("--video path is required" in error for error in missing_video.errors))
         self.assertFalse(missing_realsense.ready)
         self.assertTrue(any("pyrealsense2 is not available" in error for error in missing_realsense.errors))
+
+    def test_queue_auto_capture_command_is_explicit(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            project_root = Path(tmpdir) / "project"
+            _write_valid_calibration(project_root / "calib" / "calib_color.yaml")
+            _write_board_and_registry(project_root, ("sideA", "sideB"))
+            config = CaptureFaceConfig(
+                project_root=project_root,
+                capture_all=True,
+                auto_capture=True,
+                auto_capture_frames=3,
+                auto_capture_cooldown=0.25,
+                exit_when_complete=True,
+            )
+
+            readiness = inspect_capture_face_readiness(config)
+            command = build_capture_face_command(config)
+
+        self.assertTrue(readiness.ready, readiness.errors)
+        self.assertEqual(
+            readiness.selected_faces,
+            ("connection_plate_white_sideA", "connection_plate_white_sideB"),
+        )
+        self.assertIn("--capture_all", command)
+        self.assertIn("--auto_capture", command)
+        self.assertIn("--auto_capture_frames 3", command)
+        self.assertIn("--auto_capture_cooldown 0.25", command)
+        self.assertIn("--exit_when_complete", command)
 
     def test_output_status_requires_valid_coverage_for_each_registered_face(self) -> None:
         with TemporaryDirectory() as tmpdir:
@@ -116,6 +143,14 @@ class WorkflowCaptureFaceTests(unittest.TestCase):
         )
         self.assertEqual(partial.covered_faces, ("connection_plate_white_sideA",))
         self.assertEqual(partial.missing_faces, ("connection_plate_white_sideB",))
+        self.assertEqual(
+            partial.checked_paths,
+            (
+                project_root.resolve() / "boards" / "tag_registry.yaml",
+                project_root.resolve() / "shots" / "manifest.csv",
+                project_root.resolve() / "shots",
+            ),
+        )
         self.assertFalse(partial.complete)
         self.assertTrue(complete.complete)
         self.assertEqual(complete.valid_shot_count, 2)

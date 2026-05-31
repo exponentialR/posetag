@@ -52,10 +52,13 @@ DEFAULT_FPS = 30
 DEFAULT_MIN_EXPECTED = 1
 DEFAULT_PANEL_WIDTH = 420
 DEFAULT_RECENT_WIDTH = 320
+DEFAULT_AUTO_CAPTURE_FRAMES = 8
+DEFAULT_AUTO_CAPTURE_COOLDOWN = 1.0
 CAPTURE_FACE_GUIDANCE = (
-    "Run Capture Face starts the existing posetag-capture-face workflow. Use "
-    "the OpenCV preview to select an object/face, press ENTER to save, and "
-    "press q or ESC to quit cleanly without writing a new shot."
+    "Run Capture Face starts the existing posetag-capture-face workflow. The "
+    "OpenCV preview shows the registered face queue, can auto-save stable "
+    "valid shots, and still accepts ENTER for a manual save. Press q or ESC "
+    "to quit cleanly."
 )
 CAPTURE_FACE_PROCESS_NOT_STARTED = "not_started"
 CAPTURE_FACE_PROCESS_RUNNING = "running"
@@ -91,6 +94,11 @@ class CaptureFaceConfig:
     meta_dir: Optional[Union[Path, str]] = None
     panel_width: int = DEFAULT_PANEL_WIDTH
     recent_width: int = DEFAULT_RECENT_WIDTH
+    capture_all: bool = False
+    auto_capture: bool = False
+    auto_capture_frames: int = DEFAULT_AUTO_CAPTURE_FRAMES
+    auto_capture_cooldown: float = DEFAULT_AUTO_CAPTURE_COOLDOWN
+    exit_when_complete: bool = False
     log_file: Optional[Union[Path, str]] = None
 
 
@@ -195,6 +203,11 @@ class _ValidatedCaptureFaceInputs:
     layout: str
     panel_width: int
     recent_width: int
+    capture_all: bool
+    auto_capture: bool
+    auto_capture_frames: int
+    auto_capture_cooldown: float
+    exit_when_complete: bool
 
 
 def default_calibration_path(project_root: Union[Path, str]) -> Path:
@@ -328,14 +341,12 @@ def inspect_capture_face_outputs(
             invalid_shot_count += 1
             warnings.append(f"Manifest row {row_index} is missing path_meta.")
             continue
-        checked_paths.append(metadata_path)
-        valid, row_warnings, key, shot_paths = _inspect_metadata_row(
+        valid, row_warnings, key, _shot_paths = _inspect_metadata_row(
             metadata_path,
             root=root,
             face_keys=face_keys,
             row_index=row_index,
         )
-        checked_paths.extend(shot_paths)
         if not valid or key is None:
             invalid_shot_count += 1
             warnings.extend(row_warnings)
@@ -426,12 +437,19 @@ def inspect_capture_face_readiness(
 
     if validated is not None:
         try:
-            selection = select_initial_faces(validated.object_name, face_records)
-            selected_faces = (
-                tuple(_face_label(face) for face in selection.faces)
-                if selection is not None
-                else ()
-            )
+            if validated.capture_all or not validated.object_name:
+                selected_faces = (
+                    outputs.missing_faces
+                    if outputs.missing_faces
+                    else tuple(_face_label(face) for face in face_records)
+                )
+            else:
+                selection = select_initial_faces(validated.object_name, face_records)
+                selected_faces = (
+                    tuple(_face_label(face) for face in selection.faces)
+                    if selection is not None
+                    else ()
+                )
         except CaptureFaceError as exc:
             errors.append(str(exc))
         try:
@@ -536,10 +554,25 @@ def build_capture_face_arguments(config: CaptureFaceConfig) -> tuple[str, ...]:
         assert validated.video_path is not None
         parts.extend(["--video", str(validated.video_path)])
 
+    if validated.object_name:
+        parts.extend(["--object_name", validated.object_name])
+    if validated.capture_all:
+        parts.append("--capture_all")
+    if validated.auto_capture:
+        parts.extend(
+            [
+                "--auto_capture",
+                "--auto_capture_frames",
+                str(validated.auto_capture_frames),
+                "--auto_capture_cooldown",
+                _format_float(validated.auto_capture_cooldown),
+            ]
+        )
+    if validated.exit_when_complete:
+        parts.append("--exit_when_complete")
+
     parts.extend(
         [
-            "--object_name",
-            validated.object_name,
             "--calib",
             str(calibration_path),
             "--registry",
@@ -598,7 +631,8 @@ def capture_face_process_running(
         label="running",
         message=(
             "Face-shot capture is running in the existing OpenCV workflow. "
-            "Press ENTER in the preview to save a shot and q or ESC to quit."
+            "Use the on-screen queue to choose faces, wait for auto-save when "
+            "enabled, or press ENTER to save manually; q or ESC quits."
         ),
         running=True,
         expected_manifest=Path(expected_manifest).expanduser(),
@@ -710,9 +744,7 @@ def realsense_dependency_available() -> bool:
 def _validated_inputs(config: CaptureFaceConfig) -> _ValidatedCaptureFaceInputs:
     errors: list[str] = []
     object_name = str(config.object_name).strip()
-    if not object_name:
-        errors.append("Choose a registered object or face before capture.")
-    elif Path(object_name).name != object_name or "\\" in object_name:
+    if object_name and (Path(object_name).name != object_name or "\\" in object_name):
         errors.append("Object or face selection must be a registered name, not a path.")
 
     family = str(config.family).strip()
@@ -732,6 +764,16 @@ def _validated_inputs(config: CaptureFaceConfig) -> _ValidatedCaptureFaceInputs:
     min_expected = _parse_int(config.min_expected, "Minimum expected tags", errors)
     panel_width = _parse_int(config.panel_width, "Info panel width", errors)
     recent_width = _parse_int(config.recent_width, "Recent-shot panel width", errors)
+    auto_capture_frames = _parse_int(
+        config.auto_capture_frames,
+        "Auto-capture stable-frame count",
+        errors,
+    )
+    auto_capture_cooldown = _parse_float(
+        config.auto_capture_cooldown,
+        "Auto-capture cooldown",
+        errors,
+    )
     layout = str(config.layout).strip()
     if layout not in LAYOUT_CHOICES:
         errors.append(
@@ -746,9 +788,12 @@ def _validated_inputs(config: CaptureFaceConfig) -> _ValidatedCaptureFaceInputs:
         ("Capture height", height),
         ("Capture FPS", fps),
         ("Minimum expected tags", min_expected),
+        ("Auto-capture stable-frame count", auto_capture_frames),
     ):
         if value is not None and value <= 0:
             errors.append(f"{label} must be positive.")
+    if auto_capture_cooldown is not None and auto_capture_cooldown < 0:
+        errors.append("Auto-capture cooldown must be zero or greater.")
     for label, value in (
         ("Info panel width", panel_width),
         ("Recent-shot panel width", recent_width),
@@ -766,6 +811,8 @@ def _validated_inputs(config: CaptureFaceConfig) -> _ValidatedCaptureFaceInputs:
     assert min_expected is not None
     assert panel_width is not None
     assert recent_width is not None
+    assert auto_capture_frames is not None
+    assert auto_capture_cooldown is not None
     return _ValidatedCaptureFaceInputs(
         object_name=object_name,
         family=family,
@@ -779,6 +826,11 @@ def _validated_inputs(config: CaptureFaceConfig) -> _ValidatedCaptureFaceInputs:
         layout=layout,
         panel_width=panel_width,
         recent_width=recent_width,
+        capture_all=bool(config.capture_all),
+        auto_capture=bool(config.auto_capture),
+        auto_capture_frames=auto_capture_frames,
+        auto_capture_cooldown=auto_capture_cooldown,
+        exit_when_complete=bool(config.exit_when_complete),
     )
 
 
@@ -955,6 +1007,10 @@ def _capture_size_arguments(validated: _ValidatedCaptureFaceInputs) -> list[str]
     ]
 
 
+def _format_float(value: float) -> str:
+    return f"{value:g}"
+
+
 def _parse_int(value: object, label: str, errors: list[str]) -> Optional[int]:
     if isinstance(value, bool):
         errors.append(f"{label} must be an integer.")
@@ -965,6 +1021,17 @@ def _parse_int(value: object, label: str, errors: list[str]) -> Optional[int]:
         errors.append(f"{label} must be an integer.")
         return None
     return parsed
+
+
+def _parse_float(value: object, label: str, errors: list[str]) -> Optional[float]:
+    if isinstance(value, bool):
+        errors.append(f"{label} must be a number.")
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        errors.append(f"{label} must be a number.")
+        return None
 
 
 def _parse_int_or_none(value: object) -> Optional[int]:

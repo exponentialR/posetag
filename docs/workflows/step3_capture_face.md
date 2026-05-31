@@ -92,6 +92,14 @@ posetag-capture-face --project_root my_project \
   --object_name connection_plate_white_sideA
 ```
 
+Queue all registered faces with stable-tag auto-capture:
+
+```bash
+posetag-capture-face --project_root my_project \
+  --source opencv --cam 0 \
+  --capture_all --auto_capture --exit_when_complete
+```
+
 The default source remains `realsense` for compatibility with the legacy script.
 For a normal USB webcam, pass `--source opencv --cam 0` explicitly.
 
@@ -107,11 +115,13 @@ The Stage 5 panel:
 
 - reads registered object bases and full face names from
   `boards/tag_registry.yaml`
-- validates the calibration YAML, registry, selected object/face, source,
+- shows the registered face capture queue with captured/missing status
+- validates the calibration YAML, registry, selected object/face or queue, source,
   video path, and output paths before launch
 - supports webcam/OpenCV, RealSense, and video sources
 - previews the exact command and keeps a copy-command fallback
 - runs `posetag-capture-face` with the current Python interpreter
+- launches queue mode with stable-tag auto-capture enabled by default
 - streams stdout/stderr into the dashboard log
 - refreshes project status when `shots/manifest.csv` appears or changes
 
@@ -132,15 +142,25 @@ When a base object is supplied, PoseTag keeps auto-side mode enabled and selects
 the best registered face by overlap between expected and detected tag IDs. When
 a full face is supplied, PoseTag uses that face directly.
 
-If `--object_name` is omitted, the OpenCV viewer starts in an object picker
-using the registered bases from `boards/tag_registry.yaml`.
+If `--object_name` is omitted, the OpenCV viewer starts from the registered
+face queue. Use `--capture_all` to queue every registered face explicitly.
+
+The optional auto-capture controls are:
+
+- `--auto_capture`: save automatically when the selected face is valid and
+  stable.
+- `--auto_capture_frames`: number of consecutive valid frames required before
+  auto-save.
+- `--auto_capture_cooldown`: minimum seconds between auto-saves.
+- `--exit_when_complete`: exit cleanly after every queued face has been saved.
 
 ## Viewer Controls
 
 - `ENTER`: save the current frame.
 - `ENTER` twice within 3 seconds: force-save when expected tags are missing.
-- `o`: open the object picker.
-- Up/down or `W` / `S` / `K` / `J`: move in the picker.
+- arrow keys: move through the visible face queue.
+- `o`: open the face queue picker.
+- Up/down or `W` / `S` / `K` / `J`: move in the queue picker.
 - `a`: toggle auto-side mode.
 - `Left` / `Right`, `f` / `n`, or `[` / `]`: cycle faces and switch to
   manual face selection.

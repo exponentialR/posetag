@@ -213,11 +213,35 @@ def make_info_panel(h: int, w: int, state: dict, gallery_on: bool=True) -> np.nd
     y = M
     y = draw_card(y, "Info", lines, status=("OK" if ok else "NOT OK", ok)) + S
 
+    # ----- QUEUE card
+    queue_faces = state.get("faces") or []
+    captured = state.get("captured_faces") or set()
+    if queue_faces:
+        current = int(state.get("face_idx", 0))
+        max_show = min(6, len(queue_faces))
+        start = max(0, min(current - max_show // 2, len(queue_faces) - max_show))
+        end = min(len(queue_faces), start + max_show)
+        done = 0
+        for item in queue_faces:
+            name = str(item.get("object", "")).strip()
+            if name in captured:
+                done += 1
+        queue_lines = [f"{done}/{len(queue_faces)} captured"]
+        for index in range(start, end):
+            item = queue_faces[index]
+            name = str(item.get("object", "")).strip() or os.path.splitext(
+                os.path.basename(str(item.get("yaml", "")))
+            )[0]
+            marker = "[x]" if name in captured else "[ ]"
+            pointer = ">" if index == current else " "
+            queue_lines.append(f"{pointer} {marker} {name}")
+        y = draw_card(y, "Queue", queue_lines) + S
+
     # ----- INSTRUCTIONS card (ASCII-only)
     instr = [
         "- ENTER: Save; double-press to force",
-        "- Left/Right or f/n: Cycle faces",
-        "- o: Object picker; a: Auto/manual",
+        "- Arrow keys: Move through face queue",
+        "- o: Queue picker; a: Auto/manual",
         "- g: Panels; h: Help; q/Esc: Quit",
     ]
     y = draw_card(y, "Instructions", instr) + S
