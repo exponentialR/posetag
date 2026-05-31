@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import html
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Mapping, Optional, Sequence
 
 from posetag.gui.models import (
     ProjectHealthViewModel,
@@ -124,6 +124,9 @@ from posetag.workflows.capture_face import (
     SOURCE_REALSENSE as CAPTURE_SOURCE_REALSENSE,
     SOURCE_VIDEO as CAPTURE_SOURCE_VIDEO,
     CaptureFaceConfig,
+    NativeFaceCaptureObservation,
+    NativeFaceCaptureResult,
+    NativeFaceCaptureSession,
     CaptureFaceProcessState,
     CaptureFaceReadiness,
     CaptureFaceSavedShot,
@@ -395,6 +398,56 @@ def build_main_window(qt: Any, project_root: Path) -> Any:
         ).copy()
         return QtGui.QPixmap.fromImage(image)
 
+    def _face_record_name(face: Mapping[str, Any]) -> str:
+        return str(face.get("object", "")).strip() or Path(
+            str(face.get("yaml", ""))
+        ).stem
+
+    def _capture_face_saved_shot_icon(
+        shots: Sequence[CaptureFaceSavedShot],
+        size: Any,
+    ) -> Any:
+        width = max(24, int(size.width()))
+        height = max(24, int(size.height()))
+        canvas = QtGui.QPixmap(width, height)
+        canvas.fill(QtCore.Qt.GlobalColor.transparent)
+        painter = QtGui.QPainter(canvas)
+        try:
+            visible = list(shots[:4])
+            for offset, shot in enumerate(reversed(visible)):
+                path = _capture_face_shot_preview_path(shot)
+                if path is None:
+                    continue
+                source = QtGui.QPixmap(str(path))
+                if source.isNull():
+                    continue
+                dx = offset * 8
+                dy = offset * 6
+                target = QtCore.QRect(dx, dy, width - 24, height - 18)
+                scaled = source.scaled(
+                    target.size(),
+                    QtCore.Qt.AspectRatioMode.KeepAspectRatioByExpanding,
+                    QtCore.Qt.TransformationMode.SmoothTransformation,
+                )
+                painter.drawPixmap(target, scaled)
+                painter.setPen(QtGui.QColor("#ffffff"))
+                painter.drawRect(target)
+        finally:
+            painter.end()
+        return QtGui.QIcon(canvas)
+
+    def _capture_face_saved_shots_from_item(
+        item: Any,
+    ) -> tuple[CaptureFaceSavedShot, ...]:
+        payload = item.data(QtCore.Qt.ItemDataRole.UserRole)
+        if isinstance(payload, CaptureFaceSavedShot):
+            return (payload,)
+        if isinstance(payload, tuple) and all(
+            isinstance(shot, CaptureFaceSavedShot) for shot in payload
+        ):
+            return payload
+        return ()
+
     class _NativeBoardCaptureDialog(QtWidgets.QDialog):
         def __init__(self, parent: Any, config: BoardBuildingConfig) -> None:
             super().__init__(parent)
@@ -440,7 +493,7 @@ def build_main_window(qt: Any, project_root: Path) -> Any:
                 QtCore.Qt.TextInteractionFlag.TextSelectableByMouse
             )
 
-            self._capture_button = QtWidgets.QPushButton("Capture Now")
+            self._capture_button = QtWidgets.QPushButton("Save Next")
             self._capture_button.setObjectName("SecondaryActionButton")
             self._capture_button.clicked.connect(self._capture_now)
             self._save_button = QtWidgets.QPushButton("Save Board Definition")
@@ -1108,6 +1161,345 @@ def build_main_window(qt: Any, project_root: Path) -> Any:
                 f"Origin tag: {saved.origin_id}\n"
                 f"Board YAML: {_display_path(saved.board_yaml_path)}\n"
                 "Use Retake Live View to replace this board definition."
+            )
+
+        def done(self, result: int) -> None:
+            self._timer.stop()
+            if self._session is not None:
+                self._session.close()
+            super().done(result)
+
+    class _NativeFaceBatchCaptureDialog(QtWidgets.QDialog):
+        def __init__(self, parent: Any, config: CaptureFaceConfig) -> None:
+            super().__init__(parent)
+            self.setWindowTitle("Batch Guided Face-Shot Capture")
+            self.setModal(True)
+            self.resize(1120, 760)
+            self._config = config
+            self._session: Optional[NativeFaceCaptureSession] = None
+            self._last_observation: Optional[NativeFaceCaptureObservation] = None
+            self._saved_results: list[NativeFaceCaptureResult] = []
+            self._saved_shots: tuple[CaptureFaceSavedShot, ...] = ()
+            self._syncing_queue_selection = False
+
+            self._timer = QtCore.QTimer(self)
+            self._timer.setInterval(80)
+            self._timer.timeout.connect(self._poll_frame)
+
+            title = QtWidgets.QLabel("Batch guided face-shot capture")
+            title.setObjectName("CardTitle")
+            note = QtWidgets.QLabel(
+                "Keep the camera open and present each registered face. "
+                "PoseTag auto-captures missing faces when tags are stable; "
+                "select an already captured face and press Retake Now to add "
+                "a new raw and annotated reference shot."
+            )
+            note.setObjectName("MutedText")
+            note.setWordWrap(True)
+
+            self._current_item = QtWidgets.QLabel()
+            self._current_item.setObjectName("StageTitle")
+            self._progress = QtWidgets.QLabel()
+            self._progress.setObjectName("MutedText")
+            self._progress.setWordWrap(True)
+
+            self._queue = QtWidgets.QListWidget()
+            self._queue.setObjectName("BatchCaptureQueue")
+            self._queue.setMinimumWidth(270)
+            self._queue.setMaximumWidth(360)
+            self._queue.setSpacing(3)
+            self._queue.setSelectionMode(
+                QtWidgets.QAbstractItemView.SelectionMode.SingleSelection
+            )
+            self._queue.currentRowChanged.connect(self._select_queue_row)
+
+            self._preview = _ImagePreviewCanvas(
+                "Starting camera...",
+                object_name="NativeFaceBatchPreview",
+            )
+            self._preview.setMinimumSize(560, 380)
+            self._preview.setMaximumHeight(520)
+            self._guidance = QtWidgets.QLabel("Starting detector...")
+            self._guidance.setObjectName("GuidanceText")
+            self._guidance.setWordWrap(True)
+            self._ids = QtWidgets.QListWidget()
+            self._ids.setMinimumHeight(96)
+            self._expected = QtWidgets.QLabel("Expected tags: none")
+            self._expected.setObjectName("MutedText")
+            self._expected.setWordWrap(True)
+            self._status = QtWidgets.QLabel("No capture yet.")
+            self._status.setObjectName("OutputText")
+            self._status.setWordWrap(True)
+            self._status.setTextInteractionFlags(
+                QtCore.Qt.TextInteractionFlag.TextSelectableByMouse
+            )
+            self._auto_capture = QtWidgets.QCheckBox("Auto-capture missing faces")
+            self._auto_capture.setChecked(True)
+
+            self._saved_gallery = QtWidgets.QListWidget()
+            self._saved_gallery.setObjectName("FaceShotGallery")
+            self._saved_gallery.setViewMode(QtWidgets.QListView.ViewMode.IconMode)
+            self._saved_gallery.setResizeMode(QtWidgets.QListView.ResizeMode.Adjust)
+            self._saved_gallery.setMovement(QtWidgets.QListView.Movement.Static)
+            self._saved_gallery.setIconSize(QtCore.QSize(150, 96))
+            self._saved_gallery.setGridSize(QtCore.QSize(178, 132))
+            self._saved_gallery.setMinimumHeight(150)
+            self._saved_gallery.itemClicked.connect(self._preview_saved_shot)
+            self._saved_gallery.itemDoubleClicked.connect(self._preview_saved_shot)
+
+            self._capture_button = QtWidgets.QPushButton("Capture Now")
+            self._capture_button.setObjectName("SecondaryActionButton")
+            self._capture_button.clicked.connect(self._capture_now)
+            self._resume_button = QtWidgets.QPushButton("Resume Live View")
+            self._resume_button.setObjectName("SecondaryActionButton")
+            self._resume_button.setEnabled(False)
+            self._resume_button.clicked.connect(self._resume_live_view)
+            self._previous_button = QtWidgets.QPushButton("Previous")
+            self._previous_button.setObjectName("SecondaryActionButton")
+            self._previous_button.clicked.connect(self._previous_item)
+            finish_button = QtWidgets.QPushButton("Finish Batch")
+            finish_button.setObjectName("PrimaryActionButton")
+            finish_button.clicked.connect(self.accept)
+
+            controls = QtWidgets.QVBoxLayout()
+            controls.setSpacing(8)
+            controls.addWidget(_make_field("Guidance", self._guidance))
+            controls.addWidget(_make_field("Detected tag IDs", self._ids))
+            controls.addWidget(_make_field("Expected tag IDs", self._expected))
+            controls.addWidget(self._auto_capture)
+            controls.addWidget(_make_field("Saved shots", self._saved_gallery))
+            controls.addWidget(_make_field("Capture status", self._status))
+            controls.addStretch(1)
+
+            body = QtWidgets.QHBoxLayout()
+            body.setSpacing(14)
+            body.addWidget(_make_field("Queue", self._queue), 1)
+            body.addWidget(self._preview, 3)
+            controls_widget = QtWidgets.QWidget()
+            controls_widget.setLayout(controls)
+            controls_widget.setMinimumWidth(330)
+            body.addWidget(controls_widget, 2)
+
+            buttons = QtWidgets.QHBoxLayout()
+            buttons.addWidget(self._capture_button)
+            buttons.addWidget(self._resume_button)
+            buttons.addWidget(self._previous_button)
+            buttons.addStretch(1)
+            buttons.addWidget(finish_button)
+
+            layout = QtWidgets.QVBoxLayout(self)
+            layout.setContentsMargins(16, 14, 16, 14)
+            layout.setSpacing(10)
+            layout.addWidget(title)
+            layout.addWidget(note)
+            layout.addWidget(self._current_item)
+            layout.addWidget(self._progress)
+            layout.addLayout(body, 1)
+            layout.addLayout(buttons)
+
+            self._start_session()
+
+        def _start_session(self) -> None:
+            try:
+                self._session = NativeFaceCaptureSession(self._config)
+            except Exception as exc:
+                self._guidance.setText(f"Could not start face-shot capture: {exc}")
+                self._status.setText("Face-shot capture did not start.")
+                self._capture_button.setEnabled(False)
+                self._resume_button.setEnabled(False)
+                self._previous_button.setEnabled(False)
+                return
+            for index, face in enumerate(self._session.faces, start=1):
+                name = _face_record_name(face)
+                item = QtWidgets.QListWidgetItem(f"{index}. {name}")
+                item.setData(QtCore.Qt.ItemDataRole.UserRole, name)
+                item.setToolTip(name)
+                self._queue.addItem(item)
+            self._refresh_saved_shots()
+            self._render_current_item()
+            self._timer.start()
+            self._status.setText("Live detection is running.")
+
+        def _select_queue_row(self, row: int) -> None:
+            if self._syncing_queue_selection or self._session is None:
+                return
+            if row < 0 or row >= len(self._session.faces):
+                return
+            self._session.select_face_index(row)
+            self._last_observation = None
+            self._resume_live_view(message="Selected queued face.")
+
+        def _poll_frame(self) -> None:
+            if self._session is None:
+                return
+            try:
+                observation = self._session.read_observation()
+            except Exception as exc:
+                self._timer.stop()
+                self._guidance.setText(f"Face-shot capture failed: {exc}")
+                self._status.setText("Capture stopped before the batch finished.")
+                return
+            self._last_observation = observation
+            self._guidance.setText(observation.guidance)
+            self._update_detected_ids(observation.detected_ids)
+            self._expected.setText(
+                f"Expected tags: {_format_id_summary(observation.expected_ids)}"
+            )
+            if observation.annotated_frame_bgr is not None:
+                self._preview.show_pixmap(
+                    _pixmap_from_bgr_frame(observation.annotated_frame_bgr)
+                )
+            if observation.source_exhausted:
+                self._timer.stop()
+                self._status.setText("Video ended before the batch finished.")
+                return
+            self._render_current_item()
+            if (
+                observation.validation_ok
+                and self._auto_capture.isChecked()
+                and self._session.should_auto_capture(observation)
+            ):
+                self._save_observation(observation, automatic=True)
+
+        def _update_detected_ids(self, ids: tuple[int, ...]) -> None:
+            self._ids.clear()
+            for tag_id in ids:
+                self._ids.addItem(str(tag_id))
+
+        def _capture_now(self) -> None:
+            if self._last_observation is None:
+                self._status.setText("No live frame has been detected yet.")
+                return
+            self._save_observation(self._last_observation, automatic=False)
+
+        def _save_observation(
+            self,
+            observation: NativeFaceCaptureObservation,
+            *,
+            automatic: bool,
+        ) -> None:
+            if self._session is None:
+                return
+            face_was_captured = (
+                _face_record_name(observation.face)
+                in self._session.captured_faces
+                if observation.face is not None
+                else False
+            )
+            try:
+                result = self._session.save_observation(observation)
+            except Exception as exc:
+                self._status.setText(f"Could not save face shot: {exc}")
+                return
+            self._saved_results.append(result)
+            self._refresh_saved_shots()
+            self._render_queue()
+            prefix = (
+                "Auto-saved"
+                if automatic
+                else "Retook"
+                if face_was_captured
+                else "Saved"
+            )
+            self._status.setText(
+                f"{prefix} {result.object_full}.\n"
+                f"Raw: {_display_path(result.raw_path)}\n"
+                f"Annotated: {_display_path(result.annotated_path)}"
+            )
+            next_index = self._session.next_uncaptured_index(
+                start=self._session.face_idx + 1
+            )
+            if (automatic or not face_was_captured) and next_index is not None:
+                self._session.select_face_index(next_index)
+                self._last_observation = None
+            self._render_current_item()
+
+        def _resume_live_view(self, message: str = "Live detection resumed.") -> None:
+            self._resume_button.setEnabled(False)
+            self._capture_button.setEnabled(self._session is not None)
+            self._status.setText(message)
+            self._timer.start()
+            self._render_current_item()
+
+        def _previous_item(self) -> None:
+            if self._session is None:
+                return
+            self._session.select_face_index(self._session.face_idx - 1)
+            self._resume_live_view(message="Moved to previous face.")
+
+        def _render_current_item(self) -> None:
+            if self._session is None:
+                return
+            face = self._session.current_face
+            name = _face_record_name(face)
+            captured = name in self._session.captured_faces
+            self._syncing_queue_selection = True
+            self._queue.setCurrentRow(self._session.face_idx)
+            self._syncing_queue_selection = False
+            self._current_item.setText(f"Current face: {name}")
+            self._progress.setText(
+                f"{self._session.face_idx + 1} / {len(self._session.faces)} queued | "
+                f"{len(self._session.captured_faces)} captured | "
+                f"{len(self._saved_results)} saved this session"
+            )
+            self._capture_button.setText("Retake Now" if captured else "Save Next")
+            self._previous_button.setEnabled(self._session.face_idx > 0)
+
+        def _render_queue(self) -> None:
+            if self._session is None:
+                return
+            for row, face in enumerate(self._session.faces):
+                item = self._queue.item(row)
+                if item is None:
+                    continue
+                name = _face_record_name(face)
+                captured = name in self._session.captured_faces
+                marker = "[x]" if captured else "[ ]"
+                item.setText(f"{row + 1}. {marker} {name}")
+                item.setForeground(
+                    QtGui.QBrush(
+                        QtGui.QColor("#087a3d" if captured else "#8a5b00")
+                    )
+                )
+
+        def _refresh_saved_shots(self) -> None:
+            if self._session is None:
+                return
+            outputs = inspect_capture_face_readiness(self._config).output_status
+            self._saved_shots = tuple(reversed(outputs.saved_shots))
+            self._saved_gallery.clear()
+            for _face_name, shots in _group_capture_face_saved_shots(
+                self._saved_shots
+            ):
+                item = QtWidgets.QListWidgetItem(
+                    _capture_face_saved_shot_group_label(shots)
+                )
+                item.setData(QtCore.Qt.ItemDataRole.UserRole, shots)
+                item.setToolTip(_format_capture_face_saved_shot_group_details(shots))
+                item.setIcon(
+                    _capture_face_saved_shot_icon(
+                        shots,
+                        self._saved_gallery.iconSize(),
+                    )
+                )
+                self._saved_gallery.addItem(item)
+            self._render_queue()
+
+        def _preview_saved_shot(self, item: Any) -> None:
+            shots = _capture_face_saved_shots_from_item(item)
+            if not shots:
+                return
+            shot = shots[0]
+            preview_path = _capture_face_shot_preview_path(shot)
+            if preview_path is not None:
+                self._preview.show_preview(preview_path)
+            self._resume_button.setEnabled(True)
+            self._capture_button.setEnabled(False)
+            self._timer.stop()
+            self._status.setText(
+                "Previewing saved face-shot stack.\n"
+                + _format_capture_face_saved_shot_group_details(shots)
+                + "\n\nUse Resume Live View to continue capture."
             )
 
         def done(self, result: int) -> None:
@@ -3184,21 +3576,21 @@ def build_main_window(qt: Any, project_root: Path) -> Any:
             self._capture_face_run_button = QtWidgets.QPushButton("Start Batch")
             self._capture_face_run_button.setObjectName("PrimaryActionButton")
             self._capture_face_run_button.clicked.connect(
-                lambda: self._run_capture_face("batch")
+                lambda: self._open_native_capture_face("batch")
             )
             self._capture_face_selected_button = QtWidgets.QPushButton(
                 "Capture Selected"
             )
             self._capture_face_selected_button.setObjectName("SecondaryActionButton")
             self._capture_face_selected_button.clicked.connect(
-                lambda: self._run_capture_face("selected")
+                lambda: self._open_native_capture_face("selected")
             )
             self._capture_face_current_button = QtWidgets.QPushButton(
                 "Capture Current"
             )
             self._capture_face_current_button.setObjectName("SecondaryActionButton")
             self._capture_face_current_button.clicked.connect(
-                lambda: self._run_capture_face("current")
+                lambda: self._open_native_capture_face("current")
             )
             capture_action_row = QtWidgets.QHBoxLayout()
             capture_action_row.addWidget(self._capture_face_run_button)
@@ -4731,33 +5123,28 @@ def build_main_window(qt: Any, project_root: Path) -> Any:
             self._capture_face_gallery.blockSignals(True)
             try:
                 self._capture_face_gallery.clear()
-                for row, shot in enumerate(shots):
+                for row, (_face_name, group) in enumerate(
+                    _group_capture_face_saved_shots(shots)
+                ):
                     item = QtWidgets.QListWidgetItem(
-                        _capture_face_saved_shot_label(shot)
+                        _capture_face_saved_shot_group_label(group)
                     )
-                    item.setData(QtCore.Qt.ItemDataRole.UserRole, shot)
-                    item.setToolTip(_format_capture_face_saved_shot_details(shot))
-                    if shot.coverage_ok:
+                    item.setData(QtCore.Qt.ItemDataRole.UserRole, group)
+                    item.setToolTip(_format_capture_face_saved_shot_group_details(group))
+                    if any(shot.coverage_ok for shot in group):
                         item.setForeground(QtGui.QBrush(QtGui.QColor("#087a3d")))
                     else:
                         item.setForeground(QtGui.QBrush(QtGui.QColor("#8a5b00")))
-                    icon_path = _capture_face_shot_preview_path(shot)
-                    if icon_path is not None and icon_path.exists():
-                        pixmap = QtGui.QPixmap(str(icon_path))
-                        if not pixmap.isNull():
-                            item.setIcon(
-                                QtGui.QIcon(
-                                    pixmap.scaled(
-                                        self._capture_face_gallery.iconSize(),
-                                        QtCore.Qt.AspectRatioMode.KeepAspectRatio,
-                                        QtCore.Qt.TransformationMode.SmoothTransformation,
-                                    )
-                                )
-                            )
+                    item.setIcon(
+                        _capture_face_saved_shot_icon(
+                            group,
+                            self._capture_face_gallery.iconSize(),
+                        )
+                    )
                     self._capture_face_gallery.addItem(item)
                     if (
                         selected_meta is not None
-                        and shot.metadata_path == selected_meta
+                        and any(shot.metadata_path == selected_meta for shot in group)
                     ):
                         selected_row = row
                 if self._capture_face_gallery.count() > 0:
@@ -4772,9 +5159,9 @@ def build_main_window(qt: Any, project_root: Path) -> Any:
             item = self._capture_face_gallery.currentItem()
             if item is None:
                 return None
-            shot = item.data(QtCore.Qt.ItemDataRole.UserRole)
-            if isinstance(shot, CaptureFaceSavedShot):
-                return shot.metadata_path
+            shots = _capture_face_saved_shots_from_item(item)
+            if shots:
+                return shots[0].metadata_path
             return None
 
         def _select_capture_face_gallery_item(self) -> None:
@@ -4789,13 +5176,14 @@ def build_main_window(qt: Any, project_root: Path) -> Any:
                     "Saved face-shot previews will appear after capture."
                 )
                 return
-            shot = item.data(QtCore.Qt.ItemDataRole.UserRole)
-            if not isinstance(shot, CaptureFaceSavedShot):
+            shots = _capture_face_saved_shots_from_item(item)
+            if not shots:
                 self._capture_face_gallery_preview.clear_preview(
                     "Preview unavailable."
                 )
                 self._capture_face_gallery_details.setText("")
                 return
+            shot = shots[0]
             preview_path = _capture_face_shot_preview_path(shot)
             preview_loaded = (
                 preview_path is not None
@@ -4806,7 +5194,7 @@ def build_main_window(qt: Any, project_root: Path) -> Any:
                     "Preview image was not found."
                 )
             self._capture_face_gallery_details.setText(
-                _format_capture_face_saved_shot_details(shot)
+                _format_capture_face_saved_shot_group_details(shots)
             )
 
         def _update_capture_face_action_buttons(
@@ -5149,6 +5537,35 @@ def build_main_window(qt: Any, project_root: Path) -> Any:
             if process is None:
                 return False
             return process.state() != QtCore.QProcess.ProcessState.NotRunning
+
+        def _open_native_capture_face(self, mode: str = "batch") -> None:
+            if self._capture_face_process_is_running():
+                message = "Stop the CLI face-shot process before guided capture."
+                self.statusBar().showMessage(message, 4000)
+                return
+            if mode == "selected" and not self._selected_capture_face_queue_faces():
+                message = "Select one or more registered faces in the queue first."
+                self.statusBar().showMessage(message, 4000)
+                return
+
+            config = self._capture_face_config(mode)
+            readiness = inspect_capture_face_readiness(config)
+            if not readiness.ready:
+                message = "Resolve face-shot readiness messages before guided capture."
+                self._copy_feedback.setText(message)
+                self.statusBar().showMessage(message, 5000)
+                self._update_capture_face_flow()
+                return
+
+            dialog = _NativeFaceBatchCaptureDialog(self, config)
+            result = dialog.exec()
+            if result == QtWidgets.QDialog.DialogCode.Accepted:
+                message = "Face-shot capture window closed."
+                self._append_capture_face_log(f"[gui] {message}")
+                self.statusBar().showMessage(message, 5000)
+                self._refresh()
+                return
+            self._update_capture_face_flow()
 
         def _run_capture_face(self, mode: str = "batch") -> None:
             if self._capture_face_process_is_running():
@@ -6071,6 +6488,31 @@ def _capture_face_saved_shot_label(shot: CaptureFaceSavedShot) -> str:
     return f"{shot.object_full}\n{timestamp}\n{status}"
 
 
+def _group_capture_face_saved_shots(
+    shots: Sequence[CaptureFaceSavedShot],
+) -> tuple[tuple[str, tuple[CaptureFaceSavedShot, ...]], ...]:
+    grouped: dict[str, list[CaptureFaceSavedShot]] = {}
+    for shot in shots:
+        grouped.setdefault(shot.object_full or "(unknown face)", []).append(shot)
+    return tuple((face_name, tuple(group)) for face_name, group in grouped.items())
+
+
+def _capture_face_saved_shot_group_label(
+    shots: Sequence[CaptureFaceSavedShot],
+) -> str:
+    if not shots:
+        return "No saved shots"
+    latest = shots[0]
+    count = len(shots)
+    status = "ok" if any(shot.coverage_ok for shot in shots) else "check"
+    timestamp = latest.timestamp or f"row {latest.row_index}"
+    return (
+        f"{latest.object_full or '(unknown face)'}\n"
+        f"{count} shot{'s' if count != 1 else ''}\n"
+        f"latest {timestamp} | {status}"
+    )
+
+
 def _capture_face_shot_preview_path(shot: CaptureFaceSavedShot) -> Optional[Path]:
     if shot.annotated_path.exists():
         return shot.annotated_path
@@ -6099,6 +6541,38 @@ def _format_capture_face_saved_shot_details(
         lines.extend(["", "Warnings", *_format_items(shot.warnings[:4])])
         if len(shot.warnings) > 4:
             lines.append(f"- ... {len(shot.warnings) - 4} more")
+    return "\n".join(lines)
+
+
+def _format_capture_face_saved_shot_group_details(
+    shots: Sequence[CaptureFaceSavedShot],
+) -> str:
+    if not shots:
+        return "No saved face shots."
+    if len(shots) == 1:
+        return _format_capture_face_saved_shot_details(shots[0])
+
+    latest = shots[0]
+    lines = [
+        latest.object_full or "(unknown face)",
+        "",
+        f"Saved shots: {len(shots)}",
+        f"Valid coverage shots: {sum(1 for shot in shots if shot.coverage_ok)}",
+        "",
+        "Newest shot",
+        _format_capture_face_saved_shot_details(latest),
+    ]
+    previous = shots[1:6]
+    if previous:
+        lines.extend(["", "Previous shots"])
+        lines.extend(
+            f"- {shot.timestamp or f'row {shot.row_index}'} | "
+            f"Raw: {_display_path(shot.raw_path)} | "
+            f"Annotated: {_display_path(shot.annotated_path)}"
+            for shot in previous
+        )
+    if len(shots) > len(previous) + 1:
+        lines.append(f"- ... {len(shots) - len(previous) - 1} more")
     return "\n".join(lines)
 
 
@@ -6587,10 +7061,10 @@ def _capture_face_command_card_note(
             "capture again only if you need replacement reference images."
         )
     return (
-        "Run Capture Face starts the existing posetag-capture-face workflow, "
-        "and Copy Command keeps the terminal fallback. The OpenCV preview shows "
-        "the registered face queue, auto-saves stable valid shots when launched "
-        "from the GUI, and still writes the same raw image, annotated image, "
+        "Start Batch opens the native guided face-shot capture window for the "
+        "registered face queue; Capture Selected and Capture Current narrow "
+        "that same flow. Copy Command keeps the posetag-capture-face/OpenCV "
+        "CLI fallback. Both paths write the same raw image, annotated image, "
         "metadata JSON, and manifest row."
     )
 
@@ -6604,7 +7078,7 @@ def _capture_face_command_ready_message(
         return "No runnable face-shot capture command is available yet."
     if stage_complete:
         return "Face-shot coverage exists. Copy only if you need to rerun capture."
-    return "Ready to launch or copy a face-shot capture command."
+    return "Ready to open guided capture or copy a face-shot capture command."
 
 
 def _project_root_hint(root: Path) -> str:
@@ -6613,7 +7087,7 @@ def _project_root_hint(root: Path) -> str:
             "Project folder found. Status checks are read-only except guided "
             "Stage 1 board generation, Stage 2 calibration launch, and Stage "
             "3 object tag generation. Stage 4 can launch the existing "
-            "board-building workflow, and Stage 5 can launch face-shot "
+            "board-building workflow, and Stage 5 can open guided face-shot "
             "capture."
         )
     if root.exists():

@@ -143,16 +143,15 @@ create board YAML or tag-registry entries until a real capture is saved. It can
 also launch the existing `posetag-make-board` workflow as a fallback, stream
 process output, and provide a prompt-response box for the selected tag IDs and
 origin tag while keeping the OpenCV `ENTER`/`ESC` controls unchanged. In Stage
-5 it can guide and launch the existing `posetag-capture-face` workflow with a
-registered face capture queue, webcam/RealSense/video source settings,
-calibration and registry paths, output layout, expected manifest path, process
-state, and logs. Users can start the full missing-face batch, capture a
-selected subset, or capture one current face. The OpenCV capture window can
-auto-save stable valid face shots from that queue, and the visible queue can be
-selected with mouse clicks, trackpad/mouse-wheel scrolling, or arrow keys while
-keeping `ENTER` as the manual save fallback. The Stage 5 dashboard also shows a
-manifest-backed saved-shot gallery with clickable thumbnails and per-shot
-paths/details. Stage
+5 it can open a native guided face-shot capture window with a registered face
+queue, webcam/RealSense/video source settings, calibration and registry paths,
+output layout, expected manifest path, stable-tag auto-capture for missing
+faces, and retake controls for already captured faces. Users can start the full
+missing-face batch, capture a selected subset, or capture one current face.
+The Stage 5 dashboard and capture window show manifest-backed saved-shot
+galleries with stacked thumbnails; clicking a stack previews the latest saved
+shot and raw/annotated/metadata paths. Copy Command keeps the
+`posetag-capture-face` OpenCV CLI fallback. Stage
 5 status is coverage-based: it is complete only when
 every registered board face has at least one valid saved raw image, annotated
 image, metadata JSON, and `shots/manifest.csv` row. The
@@ -546,6 +545,10 @@ Detailed workflow notes: [`docs/workflows/step3_capture_face.md`](docs/workflows
 
 **Quick start**
 
+In the GUI, open Stage 5 and use **Start Batch** for the guided face-shot queue;
+use **Capture Selected** or **Capture Current** for a smaller run. The command
+below is the reproducible CLI fallback.
+
 ```bash
 posetag-capture-face --project_root my_project \
   --source opencv --cam 0 \
@@ -573,6 +576,8 @@ regular USB webcam or laptop camera.
 
 - Outputs live under your active project:
   `<root>/shots/<object_base>/side<Side>/..._{raw,ann}.png` and `..._meta.json`
+- The GUI and CLI both write raw images, annotated images, metadata JSON, and
+  `shots/manifest.csv` rows.
 - `--manifest` appends rows to `<root>/shots/manifest.csv`
 - `--calib` and `--registry` default to
   `<root>/calib/calib_color.yaml` and `<root>/boards/tag_registry.yaml`

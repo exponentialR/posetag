@@ -7,6 +7,7 @@ import sys
 import tomllib
 import unittest
 from contextlib import redirect_stderr
+from dataclasses import replace
 from io import StringIO
 from pathlib import Path
 from types import SimpleNamespace
@@ -23,6 +24,7 @@ from posetag.gui.main_window import (
     _capture_face_command_card_note,
     _capture_face_command_ready_message,
     _capture_face_run_button_label,
+    _capture_face_saved_shot_group_label,
     _capture_face_saved_shot_label,
     _command_button_label,
     _command_card_note,
@@ -41,12 +43,14 @@ from posetag.gui.main_window import (
     _format_capture_face_outputs,
     _format_capture_face_process_state,
     _format_capture_face_readiness,
+    _format_capture_face_saved_shot_group_details,
     _format_capture_face_saved_shot_details,
     _format_charuco_outputs,
     _format_health_counts,
     _format_object_tag_expected_output,
     _format_object_tag_outputs,
     _format_object_tag_readiness,
+    _group_capture_face_saved_shots,
     _health_status_style,
     _project_root_hint,
     _stage_list_label,
@@ -686,6 +690,20 @@ class WorkflowGuiTests(unittest.TestCase):
         self.assertIn("valid coverage shot", details)
         self.assertIn("Expected tags: 52, 53", details)
         self.assertIn("Metadata:", details)
+        older_shot = replace(
+            saved_shot,
+            row_index=1,
+            timestamp="20260531_115900",
+            metadata_path=Path("/tmp/project/shots/older_meta.json"),
+        )
+        grouped = _group_capture_face_saved_shots((saved_shot, older_shot))
+        group_label = _capture_face_saved_shot_group_label(grouped[0][1])
+        group_details = _format_capture_face_saved_shot_group_details(grouped[0][1])
+        self.assertEqual(len(grouped), 1)
+        self.assertIn("2 shots", group_label)
+        self.assertIn("latest 20260531_120000", group_label)
+        self.assertIn("Saved shots: 2", group_details)
+        self.assertIn("Previous shots", group_details)
 
     def test_capture_face_command_note_keeps_existing_workflow_boundary(self) -> None:
         outputs = CaptureFaceOutputStatus(
@@ -729,16 +747,20 @@ class WorkflowGuiTests(unittest.TestCase):
         note = _capture_face_command_card_note(readiness, active)
         complete_note = _capture_face_command_card_note(readiness, complete)
 
-        self.assertIn("Run Capture Face", note)
+        self.assertIn("Start Batch", note)
+        self.assertIn("Capture Selected", note)
+        self.assertIn("Capture Current", note)
         self.assertIn("posetag-capture-face", note)
-        self.assertIn("OpenCV preview", note)
         self.assertIn("registered face queue", note)
-        self.assertIn("auto-saves", note)
+        self.assertIn("native guided", note)
+        self.assertIn("CLI fallback", note)
+        self.assertIn("raw image", note)
+        self.assertIn("annotated image", note)
         self.assertIn("manifest row", note)
         self.assertIn("every registered face", complete_note)
         self.assertEqual(
             _capture_face_command_ready_message(readiness),
-            "Ready to launch or copy a face-shot capture command.",
+            "Ready to open guided capture or copy a face-shot capture command.",
         )
 
     def test_capture_face_process_state_text_and_run_button_labels(self) -> None:

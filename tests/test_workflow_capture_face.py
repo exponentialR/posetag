@@ -4,6 +4,7 @@ import json
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest.mock import patch
 
 import numpy as np
 import yaml
@@ -22,6 +23,7 @@ from posetag.workflows.capture_face import (
     SOURCE_REALSENSE,
     SOURCE_VIDEO,
     CaptureFaceConfig,
+    NativeFaceCaptureSession,
     build_capture_face_command,
     build_capture_face_launch,
     capture_face_process_not_started,
@@ -234,6 +236,55 @@ class WorkflowCaptureFaceTests(unittest.TestCase):
         self.assertFalse(missing.success)
         self.assertTrue(success.success)
 
+    def test_native_face_capture_session_saves_raw_and_allows_retake(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            project_root = Path(tmpdir) / "project"
+            _write_valid_calibration(project_root / "calib" / "calib_color.yaml")
+            _write_board_and_registry(project_root, ("sideA",))
+            frame = np.full((60, 80, 3), 90, dtype=np.uint8)
+            source = _FakeFrameSource([frame.copy(), frame.copy()])
+            session = NativeFaceCaptureSession(
+                CaptureFaceConfig(
+                    project_root=project_root,
+                    capture_all=True,
+                    auto_capture=True,
+                    auto_capture_frames=1,
+                ),
+                detector=_NativeFaceDetector((52, 53)),
+                frame_source=source,
+            )
+
+            with patch(
+                "posetag.workflows.capture_face.capture_timestamp",
+                side_effect=("20260531_120000", "20260531_120001"),
+            ):
+                observation = session.read_observation()
+                self.assertTrue(observation.validation_ok)
+                self.assertTrue(session.should_auto_capture(observation))
+                first = session.save_observation(observation)
+
+                session.select_face_index(0)
+                retake_observation = session.read_observation()
+                self.assertTrue(retake_observation.validation_ok)
+                self.assertFalse(session.should_auto_capture(retake_observation))
+                retake = session.save_observation(retake_observation)
+            session.close()
+            status = inspect_capture_face_outputs(project_root)
+            first_raw_exists = first.raw_path.exists()
+            first_ann_exists = first.annotated_path.exists()
+            retake_raw_exists = retake.raw_path.exists()
+            retake_ann_exists = retake.annotated_path.exists()
+
+        self.assertTrue(source.closed)
+        self.assertTrue(first_raw_exists)
+        self.assertTrue(first_ann_exists)
+        self.assertTrue(retake_raw_exists)
+        self.assertTrue(retake_ann_exists)
+        self.assertNotEqual(first.metadata_path, retake.metadata_path)
+        self.assertEqual(status.valid_shot_count, 2)
+        self.assertEqual(len(status.saved_shots), 2)
+        self.assertTrue(all(shot.coverage_ok for shot in status.saved_shots))
+
 
 def _write_valid_calibration(path: Path) -> None:
     camera_matrix = np.array(
@@ -333,6 +384,45 @@ def _write_capture(
 def _read_board_tags(board_path: Path) -> list[dict[str, object]]:
     data = yaml.safe_load(board_path.read_text(encoding="utf-8"))
     return list(data["tags"])
+
+
+class _NativeFaceDetector:
+    def __init__(self, tag_ids: tuple[int, ...]) -> None:
+        self._tag_ids = tag_ids
+
+    def detect(self, *args, **kwargs):
+        return [_NativeFaceDetection(tag_id) for tag_id in self._tag_ids]
+
+
+class _NativeFaceDetection:
+    def __init__(self, tag_id: int) -> None:
+        self.tag_id = tag_id
+        offset = float(tag_id - 50) * 2.0
+        self.corners = np.array(
+            [
+                [5.0 + offset, 5.0],
+                [18.0 + offset, 5.0],
+                [18.0 + offset, 18.0],
+                [5.0 + offset, 18.0],
+            ],
+            dtype=float,
+        )
+
+
+class _FakeFrameSource:
+    source = "opencv"
+
+    def __init__(self, frames: list[np.ndarray]) -> None:
+        self._frames = frames
+        self.closed = False
+
+    def read(self):
+        if not self._frames:
+            return None
+        return self._frames.pop(0)
+
+    def stop(self) -> None:
+        self.closed = True
 
 
 if __name__ == "__main__":

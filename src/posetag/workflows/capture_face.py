@@ -21,6 +21,11 @@ from typing import Any, Mapping, Optional, Union
 from posetag.pipelines.capture_face import (
     CaptureFaceError,
     CaptureFacePaths,
+    build_capture_metadata,
+    build_shot_paths,
+    capture_timestamp,
+    create_apriltag_detector,
+    create_capture_output_dirs,
     load_capture_calibration,
     load_capture_registry,
     load_registered_faces,
@@ -31,6 +36,13 @@ from posetag.pipelines.capture_face import (
     unique_bases,
     validate_capture_metadata_schema,
     validate_capture_source_args,
+    write_capture_outputs,
+)
+from posetag.pipelines.make_board import (
+    FrameSource,
+    annotate_detections,
+    detect_frame_tags,
+    open_frame_source,
 )
 
 
@@ -55,10 +67,10 @@ DEFAULT_RECENT_WIDTH = 320
 DEFAULT_AUTO_CAPTURE_FRAMES = 8
 DEFAULT_AUTO_CAPTURE_COOLDOWN = 1.0
 CAPTURE_FACE_GUIDANCE = (
-    "Run Capture Face starts the existing posetag-capture-face workflow. The "
-    "OpenCV preview shows the registered face queue, can auto-save stable "
-    "valid shots, and still accepts ENTER for a manual save. Press q or ESC "
-    "to quit cleanly."
+    "Start Batch opens a native guided face-shot capture window with the "
+    "registered face queue, stable-tag auto-capture for missing faces, saved "
+    "shot previews, and manual retake controls. Copy Command keeps the "
+    "posetag-capture-face/OpenCV CLI fallback."
 )
 CAPTURE_FACE_PROCESS_NOT_STARTED = "not_started"
 CAPTURE_FACE_PROCESS_RUNNING = "running"
@@ -212,6 +224,38 @@ class CaptureFaceProcessState:
 
 
 @dataclass(frozen=True)
+class NativeFaceCaptureObservation:
+    """One live native face-shot capture observation."""
+
+    frame_bgr: Any
+    annotated_frame_bgr: Any
+    detections: tuple[Any, ...]
+    detected_ids: tuple[int, ...]
+    expected_ids: tuple[int, ...]
+    overlap_ids: tuple[int, ...]
+    face: Optional[Mapping[str, Any]]
+    guidance: str
+    validation_ok: bool
+    stable_frames: int
+    source_exhausted: bool = False
+
+
+@dataclass(frozen=True)
+class NativeFaceCaptureResult:
+    """Output paths from saving one native face-shot capture."""
+
+    object_full: str
+    raw_path: Path
+    annotated_path: Path
+    metadata_path: Path
+    manifest_path: Path
+    validation_ok: bool
+    detected_ids: tuple[int, ...]
+    expected_ids: tuple[int, ...]
+    timestamp: str
+
+
+@dataclass(frozen=True)
 class _ValidatedCaptureFaceInputs:
     object_name: str
     family: str
@@ -231,6 +275,273 @@ class _ValidatedCaptureFaceInputs:
     auto_capture_frames: int
     auto_capture_cooldown: float
     exit_when_complete: bool
+
+
+class NativeFaceCaptureSession:
+    """GUI-independent runtime for native guided face-shot capture."""
+
+    def __init__(
+        self,
+        config: CaptureFaceConfig,
+        *,
+        detector: Optional[Any] = None,
+        frame_source: Optional[FrameSource] = None,
+        calibration: Optional[Any] = None,
+        stable_frames_required: Optional[int] = None,
+    ) -> None:
+        self.config = config
+        self.validated = _validated_inputs(config)
+        self.paths = expected_capture_paths(config)
+        self.calibration = calibration or load_capture_calibration(
+            expected_calibration_path(config)
+        )
+        registry = load_capture_registry(self.paths.registry_path)
+        self.registered_faces = load_registered_faces(
+            registry,
+            project_root=self.paths.project_root,
+            registry_path=self.paths.registry_path,
+        )
+        outputs = inspect_capture_face_outputs(
+            self.paths.project_root,
+            registry_path=self.paths.registry_path,
+            manifest_path=self.paths.manifest_path,
+            out_dir=self.paths.out_dir,
+        )
+        self.faces = _selected_native_faces(
+            self.validated,
+            self.registered_faces,
+            outputs,
+        )
+        if not self.faces:
+            raise CaptureFaceWorkflowError(
+                "No registered face shots are available for native capture."
+            )
+        create_capture_output_dirs(self.paths, layout=self.validated.layout)
+        self.detector = detector or create_apriltag_detector(self.validated.family)
+        self.frame_source = frame_source or open_frame_source(
+            source=self.validated.source,
+            camera_index=self.validated.camera_index,
+            video_path=self.validated.video_path,
+            width=self.validated.width,
+            height=self.validated.height,
+            fps=self.validated.fps,
+        )
+        self.stable_frames_required = max(
+            1,
+            int(
+                stable_frames_required
+                if stable_frames_required is not None
+                else self.validated.auto_capture_frames
+            ),
+        )
+        self.captured_faces = set(outputs.covered_faces)
+        self.face_idx = 0
+        first_missing = self.next_uncaptured_index(start=0)
+        if first_missing is not None:
+            self.face_idx = first_missing
+        self._stable_key: tuple[str, tuple[int, ...]] = ("", ())
+        self._stable_frames = 0
+        self._last_observation: Optional[NativeFaceCaptureObservation] = None
+
+    @property
+    def current_face(self) -> Mapping[str, Any]:
+        return self.faces[self.face_idx]
+
+    def select_face_index(self, index: int) -> None:
+        self.face_idx = max(0, min(int(index), len(self.faces) - 1))
+        self._stable_key = ("", ())
+        self._stable_frames = 0
+
+    def next_uncaptured_index(self, *, start: int) -> Optional[int]:
+        if not self.faces:
+            return None
+        count = len(self.faces)
+        for offset in range(count):
+            index = (int(start) + offset) % count
+            if _face_label(self.faces[index]) not in self.captured_faces:
+                return index
+        return None
+
+    def read_observation(self) -> NativeFaceCaptureObservation:
+        frame = self.frame_source.read()
+        if frame is None:
+            exhausted = self.validated.source == SOURCE_VIDEO
+            observation = NativeFaceCaptureObservation(
+                frame_bgr=None,
+                annotated_frame_bgr=None,
+                detections=(),
+                detected_ids=(),
+                expected_ids=(),
+                overlap_ids=(),
+                face=self.current_face if self.faces else None,
+                guidance=(
+                    "Video ended before another face shot was captured."
+                    if exhausted
+                    else "Waiting for a camera frame."
+                ),
+                validation_ok=False,
+                stable_frames=0,
+                source_exhausted=exhausted,
+            )
+            self._last_observation = observation
+            return observation
+
+        detections = detect_frame_tags(
+            frame,
+            self.detector,
+            estimate_pose=False,
+        )
+        detected_ids = tuple(
+            sorted({int(getattr(detection, "tag_id")) for detection in detections})
+        )
+        face = self.current_face
+        expected_ids = tuple(sorted(int(tag_id) for tag_id in face.get("tag_ids", ())))
+        overlap_ids = tuple(sorted(set(detected_ids).intersection(expected_ids)))
+        validation_ok = len(overlap_ids) >= max(1, self.validated.min_expected)
+        stable_key = (_face_label(face), overlap_ids)
+        if validation_ok and stable_key == self._stable_key:
+            self._stable_frames += 1
+        elif validation_ok:
+            self._stable_key = stable_key
+            self._stable_frames = 1
+        else:
+            self._stable_key = (_face_label(face), ())
+            self._stable_frames = 0
+
+        guidance = self._guidance_for_observation(
+            face,
+            validation_ok=validation_ok,
+            overlap_ids=overlap_ids,
+        )
+        annotated = annotate_detections(
+            frame,
+            detections,
+            guidance_lines=(
+                guidance,
+                f"Face: {_face_label(face)}",
+                f"Detected IDs: {_format_id_tuple(detected_ids)}",
+                f"Expected seen: {_format_id_tuple(overlap_ids)}",
+            ),
+        )
+        observation = NativeFaceCaptureObservation(
+            frame_bgr=frame,
+            annotated_frame_bgr=annotated,
+            detections=tuple(detections),
+            detected_ids=detected_ids,
+            expected_ids=expected_ids,
+            overlap_ids=overlap_ids,
+            face=face,
+            guidance=guidance,
+            validation_ok=validation_ok,
+            stable_frames=self._stable_frames,
+        )
+        self._last_observation = observation
+        return observation
+
+    def should_auto_capture(self, observation: NativeFaceCaptureObservation) -> bool:
+        if not observation.validation_ok or observation.face is None:
+            return False
+        face_name = _face_label(observation.face)
+        return (
+            face_name not in self.captured_faces
+            and observation.stable_frames >= self.stable_frames_required
+        )
+
+    def save_observation(
+        self,
+        observation: Optional[NativeFaceCaptureObservation] = None,
+        *,
+        force: bool = False,
+    ) -> NativeFaceCaptureResult:
+        selected = observation or self._last_observation
+        if selected is None or selected.frame_bgr is None:
+            raise CaptureFaceWorkflowError("No face-shot frame is available to save.")
+        if selected.face is None:
+            raise CaptureFaceWorkflowError("No registered face is selected.")
+        if not force and not selected.validation_ok:
+            raise CaptureFaceWorkflowError(
+                "Expected face tags are not visible yet. Move the object until "
+                "the selected face is ready, or use the CLI force-save fallback."
+            )
+
+        import cv2
+
+        timestamp = capture_timestamp()
+        object_full = _face_label(selected.face)
+        shot_paths = build_shot_paths(
+            layout=self.validated.layout,
+            out_dir=self.paths.out_dir,
+            object_full=object_full,
+            timestamp=timestamp,
+            raw_dir=self.paths.raw_dir,
+            ann_dir=self.paths.ann_dir,
+            meta_dir=self.paths.meta_dir,
+        )
+        metadata = build_capture_metadata(
+            face=selected.face,
+            shot_paths=shot_paths,
+            detected_tag_ids=selected.detected_ids,
+            validation_ok=selected.validation_ok,
+            auto_face=False,
+            frame_shape=selected.frame_bgr.shape,
+            camera_params=self.calibration.camera_params,
+            timestamp=timestamp,
+        )
+        annotated = (
+            selected.annotated_frame_bgr
+            if selected.annotated_frame_bgr is not None
+            else selected.frame_bgr
+        )
+        write_capture_outputs(
+            raw_frame=selected.frame_bgr,
+            annotated_frame=annotated,
+            metadata=metadata,
+            shot_paths=shot_paths,
+            manifest_path=self.paths.manifest_path,
+            image_writer=cv2.imwrite,
+        )
+        self.captured_faces.add(object_full)
+        return NativeFaceCaptureResult(
+            object_full=object_full,
+            raw_path=shot_paths.raw_path,
+            annotated_path=shot_paths.ann_path,
+            metadata_path=shot_paths.meta_path,
+            manifest_path=self.paths.manifest_path,
+            validation_ok=selected.validation_ok,
+            detected_ids=selected.detected_ids,
+            expected_ids=selected.expected_ids,
+            timestamp=timestamp,
+        )
+
+    def close(self) -> None:
+        self.frame_source.stop()
+
+    def _guidance_for_observation(
+        self,
+        face: Mapping[str, Any],
+        *,
+        validation_ok: bool,
+        overlap_ids: tuple[int, ...],
+    ) -> str:
+        face_name = _face_label(face)
+        if not validation_ok:
+            return (
+                f"Need at least {self.validated.min_expected} expected tag"
+                f"{'s' if self.validated.min_expected != 1 else ''} for "
+                f"{face_name}. Move the object until the selected face tags "
+                "are visible."
+            )
+        if face_name in self.captured_faces:
+            return (
+                f"{face_name} already has a valid shot. Press Retake Now to "
+                "save a new retake, or select another face."
+            )
+        if self._stable_frames >= self.stable_frames_required:
+            return "Stable selected face detected. Saving is ready."
+        return (
+            "Hold still while PoseTag verifies the selected face "
+            f"({self._stable_frames}/{self.stable_frames_required})."
+        )
 
 
 def default_calibration_path(project_root: Union[Path, str]) -> Path:
@@ -883,6 +1194,34 @@ def _validated_inputs(config: CaptureFaceConfig) -> _ValidatedCaptureFaceInputs:
         auto_capture_cooldown=auto_capture_cooldown,
         exit_when_complete=bool(config.exit_when_complete),
     )
+
+
+def _selected_native_faces(
+    validated: _ValidatedCaptureFaceInputs,
+    face_records: Sequence[Mapping[str, Any]],
+    outputs: CaptureFaceOutputStatus,
+) -> tuple[dict[str, Any], ...]:
+    by_label = {_face_label(face): dict(face) for face in face_records}
+    if validated.queue_faces:
+        return tuple(by_label[face] for face in validated.queue_faces if face in by_label)
+    if validated.object_name:
+        selection = select_initial_faces(validated.object_name, face_records)
+        return selection.faces if selection is not None else ()
+
+    missing = [by_label[face] for face in outputs.missing_faces if face in by_label]
+    selected_labels = {_face_label(face) for face in missing}
+    captured_or_extra = [
+        dict(face)
+        for face in face_records
+        if _face_label(face) not in selected_labels
+    ]
+    return tuple([*missing, *captured_or_extra])
+
+
+def _format_id_tuple(ids: Sequence[int]) -> str:
+    if not ids:
+        return "none"
+    return ", ".join(str(tag_id) for tag_id in ids)
 
 
 def _inspect_metadata_row(
