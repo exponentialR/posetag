@@ -104,6 +104,26 @@ class CaptureFaceConfig:
 
 
 @dataclass(frozen=True)
+class CaptureFaceSavedShot:
+    """Manifest-backed saved face-shot artifact for dashboard review."""
+
+    row_index: int
+    object_full: str
+    object_base: str
+    side: str
+    timestamp: str
+    raw_path: Path
+    annotated_path: Path
+    metadata_path: Path
+    face_yaml: Path
+    validation_ok: bool
+    coverage_ok: bool
+    expected_tag_ids: tuple[int, ...]
+    detected_tag_ids: tuple[int, ...]
+    warnings: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
 class CaptureFaceOutputStatus:
     """Expected Stage 5 paths and current face-shot coverage state."""
 
@@ -119,6 +139,7 @@ class CaptureFaceOutputStatus:
     manifest_exists: bool
     errors: tuple[str, ...]
     warnings: tuple[str, ...]
+    saved_shots: tuple[CaptureFaceSavedShot, ...] = ()
 
     @property
     def registered_face_count(self) -> int:
@@ -302,6 +323,7 @@ def inspect_capture_face_outputs(
     covered_keys: set[tuple[str, str]] = set()
     valid_shot_count = 0
     invalid_shot_count = 0
+    saved_shots: list[CaptureFaceSavedShot] = []
 
     if not paths.manifest_path.exists():
         return CaptureFaceOutputStatus(
@@ -343,12 +365,14 @@ def inspect_capture_face_outputs(
             invalid_shot_count += 1
             warnings.append(f"Manifest row {row_index} is missing path_meta.")
             continue
-        valid, row_warnings, key, _shot_paths = _inspect_metadata_row(
+        valid, row_warnings, key, _shot_paths, shot = _inspect_metadata_row(
             metadata_path,
             root=root,
             face_keys=face_keys,
             row_index=row_index,
         )
+        if shot is not None:
+            saved_shots.append(shot)
         if not valid or key is None:
             invalid_shot_count += 1
             warnings.extend(row_warnings)
@@ -375,6 +399,7 @@ def inspect_capture_face_outputs(
         manifest_exists=True,
         errors=tuple(errors),
         warnings=tuple(dict.fromkeys(warnings)),
+        saved_shots=tuple(saved_shots),
     )
 
 
@@ -866,7 +891,13 @@ def _inspect_metadata_row(
     root: Path,
     face_keys: Mapping[tuple[str, str], str],
     row_index: int,
-) -> tuple[bool, list[str], Optional[tuple[str, str]], tuple[Path, ...]]:
+) -> tuple[
+    bool,
+    list[str],
+    Optional[tuple[str, str]],
+    tuple[Path, ...],
+    Optional[CaptureFaceSavedShot],
+]:
     warnings: list[str] = []
     checked_paths: list[Path] = []
     if not metadata_path.exists():
@@ -875,6 +906,7 @@ def _inspect_metadata_row(
             [f"Manifest row {row_index} metadata JSON was not found: {metadata_path}"],
             None,
             (),
+            None,
         )
 
     try:
@@ -885,6 +917,7 @@ def _inspect_metadata_row(
             [f"Manifest row {row_index} metadata JSON is malformed: {metadata_path}: {exc}"],
             None,
             (),
+            None,
         )
     except OSError as exc:
         return (
@@ -892,6 +925,7 @@ def _inspect_metadata_row(
             [f"Could not read manifest row {row_index} metadata JSON: {metadata_path}: {exc}"],
             None,
             (),
+            None,
         )
 
     if not isinstance(data, Mapping):
@@ -900,6 +934,7 @@ def _inspect_metadata_row(
             [f"Manifest row {row_index} metadata JSON must contain a mapping: {metadata_path}"],
             None,
             (),
+            None,
         )
 
     schema_errors = validate_capture_metadata_schema(data)
@@ -909,6 +944,7 @@ def _inspect_metadata_row(
             [f"Manifest row {row_index}: {message}" for message in schema_errors],
             None,
             (),
+            None,
         )
 
     image = data.get("image", {})
@@ -927,28 +963,55 @@ def _inspect_metadata_row(
     face_yaml = _resolve_output_path(root, str(data.get("face_yaml", "")))
     if face_yaml is None:
         warnings.append(f"Manifest row {row_index} is missing face_yaml.")
-        return False, warnings, None, tuple(checked_paths)
+        return False, warnings, None, tuple(checked_paths), None
     checked_paths.append(face_yaml)
     object_full = str(data.get("object_full", "")).strip()
     key = _normal_key(object_full, face_yaml)
+    expected = _sorted_int_tuple(data.get("expected_tag_ids", []))
+    detected = _sorted_int_tuple(data.get("detected_tag_ids", []))
+    object_base = str(data.get("object_base", "")).strip()
+    side = str(data.get("side", "")).strip()
+    if not object_base or not side:
+        parsed_base, parsed_side = parse_base_and_side(object_full)
+        object_base = object_base or parsed_base
+        side = side or (parsed_side or "")
+
+    coverage_ok = (
+        key in face_keys
+        and bool(data.get("validation_ok"))
+        and raw_path is not None
+        and ann_path is not None
+        and raw_path.exists()
+        and ann_path.exists()
+    )
+    shot = None
+    if raw_path is not None and ann_path is not None:
+        shot = CaptureFaceSavedShot(
+            row_index=row_index,
+            object_full=object_full,
+            object_base=object_base,
+            side=side,
+            timestamp=str(data.get("timestamp", "")).strip(),
+            raw_path=raw_path,
+            annotated_path=ann_path,
+            metadata_path=metadata_path,
+            face_yaml=face_yaml,
+            validation_ok=bool(data.get("validation_ok")),
+            coverage_ok=coverage_ok,
+            expected_tag_ids=expected,
+            detected_tag_ids=detected,
+            warnings=tuple(warnings),
+        )
+
     if key not in face_keys:
         warnings.append(
             f"Manifest row {row_index} references an unregistered face: "
             f"{object_full} ({face_yaml})."
         )
-        return False, warnings, None, tuple(checked_paths)
+        return False, warnings, None, tuple(checked_paths), _with_shot_warnings(shot, warnings)
 
-    expected = [
-        item
-        for item in (
-            _parse_int_or_none(raw_item)
-            for raw_item in data.get("expected_tag_ids", [])
-        )
-        if item is not None
-    ]
-    expected.sort()
     registered = _registered_ids_for_warning(face_yaml)
-    if registered and expected and sorted(registered) != expected:
+    if registered and expected and sorted(registered) != list(expected):
         warnings.append(
             f"Manifest row {row_index} expected tag IDs do not match "
             f"{face_yaml}."
@@ -959,10 +1022,45 @@ def _inspect_metadata_row(
             f"Manifest row {row_index} did not validate expected face tags and "
             "does not count toward coverage."
         )
-        return False, warnings, key, tuple(checked_paths)
+        return False, warnings, key, tuple(checked_paths), _with_shot_warnings(shot, warnings)
     if any(not path.exists() for path in checked_paths[:2]):
-        return False, warnings, key, tuple(checked_paths)
-    return True, warnings, key, tuple(checked_paths)
+        return False, warnings, key, tuple(checked_paths), _with_shot_warnings(shot, warnings)
+    return True, warnings, key, tuple(checked_paths), _with_shot_warnings(shot, warnings)
+
+
+def _with_shot_warnings(
+    shot: Optional[CaptureFaceSavedShot],
+    warnings: list[str],
+) -> Optional[CaptureFaceSavedShot]:
+    if shot is None:
+        return None
+    return CaptureFaceSavedShot(
+        row_index=shot.row_index,
+        object_full=shot.object_full,
+        object_base=shot.object_base,
+        side=shot.side,
+        timestamp=shot.timestamp,
+        raw_path=shot.raw_path,
+        annotated_path=shot.annotated_path,
+        metadata_path=shot.metadata_path,
+        face_yaml=shot.face_yaml,
+        validation_ok=shot.validation_ok,
+        coverage_ok=shot.coverage_ok,
+        expected_tag_ids=shot.expected_tag_ids,
+        detected_tag_ids=shot.detected_tag_ids,
+        warnings=tuple(warnings),
+    )
+
+
+def _sorted_int_tuple(values: object) -> tuple[int, ...]:
+    if not isinstance(values, (list, tuple)):
+        return ()
+    parsed = [
+        item
+        for item in (_parse_int_or_none(raw_item) for raw_item in values)
+        if item is not None
+    ]
+    return tuple(sorted(parsed))
 
 
 def _read_manifest_rows(path: Path) -> list[dict[str, str]]:

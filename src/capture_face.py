@@ -314,6 +314,46 @@ def load_existing_captured_faces(manifest_path: Path) -> Set[str]:
     return captured
 
 
+def load_recent_saved_images(
+    manifest_path: Path,
+    *,
+    project_root: Optional[Path] = None,
+    limit: int = 12,
+) -> List[np.ndarray]:
+    """Return recent annotated/raw images already listed in the manifest."""
+
+    if not manifest_path.exists() or limit <= 0:
+        return []
+    try:
+        with manifest_path.open("r", newline="", encoding="utf-8") as handle:
+            rows = list(csv.DictReader(handle))
+    except OSError:
+        return []
+
+    root = project_root or manifest_path.parent
+    images_reversed: List[np.ndarray] = []
+    for row in reversed(rows):
+        for key in ("path_ann", "path_raw"):
+            image_path = _resolve_manifest_image_path(root, row.get(key, ""))
+            if image_path is None or not image_path.exists():
+                continue
+            image = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
+            if image is not None:
+                images_reversed.append(image)
+                break
+        if len(images_reversed) >= limit:
+            break
+    return list(reversed(images_reversed))
+
+
+def _resolve_manifest_image_path(root: Path, value: str) -> Optional[Path]:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    path = Path(text).expanduser()
+    return path if path.is_absolute() else root / path
+
+
 def first_uncaptured_index(
     faces: Sequence[Mapping[str, object]],
     captured_faces: Set[str],
@@ -708,12 +748,17 @@ def main(argv=None):
 
     # ---------- UI state ----------
     captured_faces = load_existing_captured_faces(paths.manifest_path)
+    existing_thumbs = load_recent_saved_images(
+        paths.manifest_path,
+        project_root=paths.project_root,
+    )
     state = {
         "object_base": None, "faces": [], "face_idx": 0, "auto_side": False,
-        "detected_ids": set(), "validation_ok": True, "thumbs": [],
+        "detected_ids": set(), "validation_ok": True, "thumbs": existing_thumbs,
         "save_warn": False, "save_warn_t0": 0.0,
         "captured_faces": captured_faces, "auto_candidate": None,
         "auto_streak": 0, "last_auto_save_t": 0.0,
+        "last_saved_ann": existing_thumbs[-1] if existing_thumbs else None,
     }
 
     if queued_faces:
@@ -907,7 +952,13 @@ def main(argv=None):
                     panel_info = cv2.addWeighted(panel_info, 0.1, overlay, 0.9, 0)
                     info_layout = {}
 
-            panel_recent = make_recent_panel(args.height, args.recent_w, state.get("last_saved_ann"), gallery_on)
+            panel_recent = make_recent_panel(
+                args.height,
+                args.recent_w,
+                state.get("last_saved_ann"),
+                gallery_on,
+                thumbs=state.get("thumbs", []),
+            )
             combo = cv2.hconcat([vis, panel_info, panel_recent])
             mouse_state["layout"] = {
                 "frame_w": int(vis.shape[1]),

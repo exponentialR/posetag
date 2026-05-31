@@ -126,6 +126,8 @@ The Stage 5 panel:
 - reads registered object bases and full face names from
   `boards/tag_registry.yaml`
 - shows the registered face capture queue with captured/missing status
+- shows a saved-shot gallery from `shots/manifest.csv`, with clickable
+  thumbnails and per-shot paths/details
 - offers batch capture, selected-face capture, and current-face capture actions
 - validates the calibration YAML, registry, selected object/face or queue, source,
   video path, and output paths before launch
@@ -135,6 +137,10 @@ The Stage 5 panel:
 - launches queue mode with stable-tag auto-capture enabled by default
 - streams stdout/stderr into the dashboard log
 - refreshes project status when `shots/manifest.csv` appears or changes
+
+The OpenCV capture window also loads recent manifest images at startup, so an
+already captured project shows saved-shot previews instead of an empty
+"waiting for first save" panel.
 
 Stage 5 status is coverage-based. It is complete only when every registered
 board face has at least one valid saved shot with existing raw image,

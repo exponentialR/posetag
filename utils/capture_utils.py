@@ -79,12 +79,21 @@ def _wrap_lines(lines, max_w, scale=0.60, thick=1, font=cv2.FONT_HERSHEY_SIMPLEX
             out.append(cur)
     return out
 
-def make_recent_panel(h: int, w: int, last_img: np.ndarray, show: bool) -> np.ndarray:
+def make_recent_panel(
+    h: int,
+    w: int,
+    last_img: np.ndarray,
+    show: bool,
+    thumbs: Optional[List[np.ndarray]] = None,
+) -> np.ndarray:
     bg = (245, 249, 251)
     card = (255, 255, 255)
     border = (212, 226, 234)
     text = (36, 49, 61)
     muted = (98, 113, 126)
+    thumbnails = [thumb for thumb in (thumbs or []) if thumb is not None]
+    if last_img is None and thumbnails:
+        last_img = thumbnails[-1]
     panel = np.full((h, w, 3), bg, np.uint8)
     margin = 14
     cv2.rectangle(panel, (margin, margin), (w - margin, h - margin), card, -1)
@@ -123,11 +132,12 @@ def make_recent_panel(h: int, w: int, last_img: np.ndarray, show: bool) -> np.nd
             y += 20
         return panel
 
-    # fit-preserving resize with 12px margins
+    # fit-preserving resize with room for a compact thumbnail strip
     INNER = 22
     header_h = 48
     tgt_w = max(1, w - 2*margin - 2*INNER)
-    tgt_h = max(1, h - 2*margin - header_h - INNER)
+    gallery_h = min(150, max(88, h // 3)) if len(thumbnails) > 1 else 0
+    tgt_h = max(1, h - 2*margin - header_h - INNER - gallery_h)
     scale = min(tgt_w / last_img.shape[1], tgt_h / last_img.shape[0])
     new_w = max(1, int(last_img.shape[1] * scale))
     new_h = max(1, int(last_img.shape[0] * scale))
@@ -136,6 +146,36 @@ def make_recent_panel(h: int, w: int, last_img: np.ndarray, show: bool) -> np.nd
     x0 = margin + INNER + (tgt_w - new_w) // 2
     y0 = margin + header_h + (tgt_h - new_h) // 2
     panel[y0:y0+new_h, x0:x0+new_w] = img
+
+    if len(thumbnails) > 1:
+        grid_top = h - margin - gallery_h + 4
+        cv2.putText(panel, "RECENT SAVES", (margin + 14, grid_top + 16),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.42, muted, 1, cv2.LINE_AA)
+        cols = 2
+        gap = 6
+        thumb_w = max(1, (w - 2*margin - 28 - gap) // cols)
+        thumb_h = max(1, (gallery_h - 28 - gap) // 2)
+        x_start = margin + 14
+        y_start = grid_top + 26
+        for index, thumb in enumerate(thumbnails[-4:][::-1]):
+            row = index // cols
+            col = index % cols
+            x_cell = x_start + col * (thumb_w + gap)
+            y_cell = y_start + row * (thumb_h + gap)
+            if y_cell + thumb_h > h - margin:
+                break
+            scale = min(thumb_w / thumb.shape[1], thumb_h / thumb.shape[0])
+            tw = max(1, int(thumb.shape[1] * scale))
+            th = max(1, int(thumb.shape[0] * scale))
+            thumb_res = cv2.resize(thumb, (tw, th))
+            cv2.rectangle(
+                panel,
+                (x_cell, y_cell),
+                (x_cell + thumb_w, y_cell + thumb_h),
+                (236, 243, 247),
+                -1,
+            )
+            panel[y_cell:y_cell+th, x_cell:x_cell+tw] = thumb_res
 
     return panel
 

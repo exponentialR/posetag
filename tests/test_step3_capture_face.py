@@ -212,7 +212,13 @@ class CaptureFaceStep3Tests(unittest.TestCase):
         )
         info_layout: dict[str, object] = {}
         info = make_info_panel(360, 420, state, interaction=info_layout)
-        recent = make_recent_panel(240, 320, None, True)
+        recent = make_recent_panel(
+            240,
+            320,
+            None,
+            True,
+            thumbs=[np.full((40, 60, 3), 120, dtype=np.uint8)],
+        )
         overlay = legacy_capture_face.draw_capture_overlay(
             np.zeros((240, 320, 3), dtype=np.uint8),
             face=state["face"],
@@ -741,6 +747,12 @@ class CaptureFaceStep3Tests(unittest.TestCase):
                 rows = list(csv.DictReader(handle))
             self.assertEqual(len(rows), 1)
             self.assertEqual(rows[0]["path_meta"], str(meta_path))
+            recent_images = legacy_capture_face.load_recent_saved_images(
+                manifest_path,
+                project_root=resolved_project,
+            )
+            self.assertEqual(len(recent_images), 1)
+            self.assertEqual(recent_images[0].shape[:2], (40, 60))
 
     def test_synthetic_auto_capture_queue_writes_and_exits_when_complete(self) -> None:
         with TemporaryDirectory() as tmpdir:

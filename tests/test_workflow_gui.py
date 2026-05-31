@@ -23,6 +23,7 @@ from posetag.gui.main_window import (
     _capture_face_command_card_note,
     _capture_face_command_ready_message,
     _capture_face_run_button_label,
+    _capture_face_saved_shot_label,
     _command_button_label,
     _command_card_note,
     _command_card_title,
@@ -40,6 +41,7 @@ from posetag.gui.main_window import (
     _format_capture_face_outputs,
     _format_capture_face_process_state,
     _format_capture_face_readiness,
+    _format_capture_face_saved_shot_details,
     _format_charuco_outputs,
     _format_health_counts,
     _format_object_tag_expected_output,
@@ -74,6 +76,7 @@ from posetag.workflows.capture_face import (
     CaptureFaceOutputStatus,
     CaptureFaceProcessState,
     CaptureFaceReadiness,
+    CaptureFaceSavedShot,
     capture_face_process_not_started,
     capture_face_process_running,
 )
@@ -606,6 +609,21 @@ class WorkflowGuiTests(unittest.TestCase):
         self.assertIn("selected tag IDs", _format_board_building_process_state(running))
 
     def test_capture_face_readiness_summary_reports_coverage_outputs(self) -> None:
+        saved_shot = CaptureFaceSavedShot(
+            row_index=2,
+            object_full="connection_plate_white_sideA",
+            object_base="connection_plate_white",
+            side="sideA",
+            timestamp="20260531_120000",
+            raw_path=Path("/tmp/project/shots/connection_plate_white/sideA/raw.png"),
+            annotated_path=Path("/tmp/project/shots/connection_plate_white/sideA/ann.png"),
+            metadata_path=Path("/tmp/project/shots/connection_plate_white/sideA/meta.json"),
+            face_yaml=Path("/tmp/project/boards/connection_plate_white_sideA.yaml"),
+            validation_ok=True,
+            coverage_ok=True,
+            expected_tag_ids=(52, 53),
+            detected_tag_ids=(52, 53),
+        )
         outputs = CaptureFaceOutputStatus(
             registry_path=Path("/tmp/project/boards/tag_registry.yaml"),
             manifest_path=Path("/tmp/project/shots/manifest.csv"),
@@ -625,6 +643,7 @@ class WorkflowGuiTests(unittest.TestCase):
             manifest_exists=True,
             errors=(),
             warnings=("One manifest row is missing a raw image.",),
+            saved_shots=(saved_shot,),
         )
         paths = CaptureFacePaths(
             project_root=Path("/tmp/project"),
@@ -661,6 +680,12 @@ class WorkflowGuiTests(unittest.TestCase):
         self.assertIn("1/2 registered faces", output)
         self.assertIn("connection_plate_white_sideB", output)
         self.assertIn("Invalid rows", output)
+        self.assertIn("Saved shots", output)
+        self.assertIn("connection_plate_white_sideA", _capture_face_saved_shot_label(saved_shot))
+        details = _format_capture_face_saved_shot_details(saved_shot)
+        self.assertIn("valid coverage shot", details)
+        self.assertIn("Expected tags: 52, 53", details)
+        self.assertIn("Metadata:", details)
 
     def test_capture_face_command_note_keeps_existing_workflow_boundary(self) -> None:
         outputs = CaptureFaceOutputStatus(

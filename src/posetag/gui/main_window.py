@@ -126,6 +126,7 @@ from posetag.workflows.capture_face import (
     CaptureFaceConfig,
     CaptureFaceProcessState,
     CaptureFaceReadiness,
+    CaptureFaceSavedShot,
     build_capture_face_launch,
     capture_face_process_failed,
     capture_face_process_not_started,
@@ -3076,6 +3077,54 @@ def build_main_window(qt: Any, project_root: Path) -> Any:
             self._capture_face_outputs.setTextInteractionFlags(
                 QtCore.Qt.TextInteractionFlag.TextSelectableByMouse
             )
+            self._capture_face_gallery = QtWidgets.QListWidget()
+            self._capture_face_gallery.setObjectName("FaceShotGallery")
+            self._capture_face_gallery.setViewMode(
+                QtWidgets.QListView.ViewMode.IconMode
+            )
+            self._capture_face_gallery.setResizeMode(
+                QtWidgets.QListView.ResizeMode.Adjust
+            )
+            self._capture_face_gallery.setMovement(
+                QtWidgets.QListView.Movement.Static
+            )
+            self._capture_face_gallery.setSelectionMode(
+                QtWidgets.QAbstractItemView.SelectionMode.SingleSelection
+            )
+            self._capture_face_gallery.setIconSize(QtCore.QSize(128, 88))
+            self._capture_face_gallery.setGridSize(QtCore.QSize(176, 128))
+            self._capture_face_gallery.setMinimumHeight(156)
+            self._capture_face_gallery.setMaximumHeight(240)
+            self._capture_face_gallery.setSpacing(8)
+            self._capture_face_gallery.itemSelectionChanged.connect(
+                self._select_capture_face_gallery_item
+            )
+            self._capture_face_gallery_preview = _ImagePreviewCanvas(
+                "Select a saved face shot.",
+                object_name="FaceShotPreview",
+            )
+            self._capture_face_gallery_preview.setMinimumSize(260, 170)
+            self._capture_face_gallery_preview.setMaximumHeight(240)
+            self._capture_face_gallery_details = QtWidgets.QLabel(
+                "Saved face-shot previews will appear after capture."
+            )
+            self._capture_face_gallery_details.setObjectName("OutputText")
+            self._capture_face_gallery_details.setWordWrap(True)
+            self._capture_face_gallery_details.setTextInteractionFlags(
+                QtCore.Qt.TextInteractionFlag.TextSelectableByMouse
+            )
+            capture_gallery_side = QtWidgets.QVBoxLayout()
+            capture_gallery_side.setContentsMargins(0, 0, 0, 0)
+            capture_gallery_side.setSpacing(8)
+            capture_gallery_side.addWidget(self._capture_face_gallery_preview, 1)
+            capture_gallery_side.addWidget(self._capture_face_gallery_details)
+            capture_gallery_layout = QtWidgets.QHBoxLayout()
+            capture_gallery_layout.setContentsMargins(0, 0, 0, 0)
+            capture_gallery_layout.setSpacing(10)
+            capture_gallery_layout.addWidget(self._capture_face_gallery, 2)
+            capture_gallery_layout.addLayout(capture_gallery_side, 1)
+            capture_gallery_widget = QtWidgets.QWidget()
+            capture_gallery_widget.setLayout(capture_gallery_layout)
             self._capture_face_process_state_label = QtWidgets.QLabel()
             self._capture_face_process_state_label.setObjectName("OutputText")
             self._capture_face_process_state_label.setWordWrap(True)
@@ -3106,15 +3155,22 @@ def build_main_window(qt: Any, project_root: Path) -> Any:
                 1,
             )
             capture_summary_grid.addWidget(
-                _make_field("Process state", self._capture_face_process_state_label),
+                _make_field("Saved face-shot gallery", capture_gallery_widget),
                 1,
                 0,
                 1,
                 2,
             )
             capture_summary_grid.addWidget(
-                _make_field("Process log", self._capture_face_log),
+                _make_field("Process state", self._capture_face_process_state_label),
                 2,
+                0,
+                1,
+                2,
+            )
+            capture_summary_grid.addWidget(
+                _make_field("Process log", self._capture_face_log),
+                3,
                 0,
                 1,
                 2,
@@ -4567,6 +4623,7 @@ def build_main_window(qt: Any, project_root: Path) -> Any:
             self._capture_face_outputs.setText(
                 _format_capture_face_outputs(readiness)
             )
+            self._update_capture_face_gallery(readiness)
             if (
                 self._capture_face_process_state.state
                 == CAPTURE_FACE_PROCESS_NOT_STARTED
@@ -4661,6 +4718,96 @@ def build_main_window(qt: Any, project_root: Path) -> Any:
                     self._capture_face_queue.addItem(item)
             finally:
                 self._capture_face_queue.blockSignals(False)
+
+        def _update_capture_face_gallery(
+            self,
+            readiness: CaptureFaceReadiness,
+        ) -> None:
+            if not hasattr(self, "_capture_face_gallery"):
+                return
+            selected_meta = self._selected_capture_face_gallery_metadata_path()
+            shots = tuple(reversed(readiness.output_status.saved_shots))
+            selected_row = 0
+            self._capture_face_gallery.blockSignals(True)
+            try:
+                self._capture_face_gallery.clear()
+                for row, shot in enumerate(shots):
+                    item = QtWidgets.QListWidgetItem(
+                        _capture_face_saved_shot_label(shot)
+                    )
+                    item.setData(QtCore.Qt.ItemDataRole.UserRole, shot)
+                    item.setToolTip(_format_capture_face_saved_shot_details(shot))
+                    if shot.coverage_ok:
+                        item.setForeground(QtGui.QBrush(QtGui.QColor("#087a3d")))
+                    else:
+                        item.setForeground(QtGui.QBrush(QtGui.QColor("#8a5b00")))
+                    icon_path = _capture_face_shot_preview_path(shot)
+                    if icon_path is not None and icon_path.exists():
+                        pixmap = QtGui.QPixmap(str(icon_path))
+                        if not pixmap.isNull():
+                            item.setIcon(
+                                QtGui.QIcon(
+                                    pixmap.scaled(
+                                        self._capture_face_gallery.iconSize(),
+                                        QtCore.Qt.AspectRatioMode.KeepAspectRatio,
+                                        QtCore.Qt.TransformationMode.SmoothTransformation,
+                                    )
+                                )
+                            )
+                    self._capture_face_gallery.addItem(item)
+                    if (
+                        selected_meta is not None
+                        and shot.metadata_path == selected_meta
+                    ):
+                        selected_row = row
+                if self._capture_face_gallery.count() > 0:
+                    self._capture_face_gallery.setCurrentRow(selected_row)
+            finally:
+                self._capture_face_gallery.blockSignals(False)
+            self._select_capture_face_gallery_item()
+
+        def _selected_capture_face_gallery_metadata_path(self) -> Optional[Path]:
+            if not hasattr(self, "_capture_face_gallery"):
+                return None
+            item = self._capture_face_gallery.currentItem()
+            if item is None:
+                return None
+            shot = item.data(QtCore.Qt.ItemDataRole.UserRole)
+            if isinstance(shot, CaptureFaceSavedShot):
+                return shot.metadata_path
+            return None
+
+        def _select_capture_face_gallery_item(self) -> None:
+            if not hasattr(self, "_capture_face_gallery"):
+                return
+            item = self._capture_face_gallery.currentItem()
+            if item is None:
+                self._capture_face_gallery_preview.clear_preview(
+                    "No saved face shots yet."
+                )
+                self._capture_face_gallery_details.setText(
+                    "Saved face-shot previews will appear after capture."
+                )
+                return
+            shot = item.data(QtCore.Qt.ItemDataRole.UserRole)
+            if not isinstance(shot, CaptureFaceSavedShot):
+                self._capture_face_gallery_preview.clear_preview(
+                    "Preview unavailable."
+                )
+                self._capture_face_gallery_details.setText("")
+                return
+            preview_path = _capture_face_shot_preview_path(shot)
+            preview_loaded = (
+                preview_path is not None
+                and self._capture_face_gallery_preview.show_preview(preview_path)
+            )
+            if not preview_loaded:
+                self._capture_face_gallery_preview.clear_preview(
+                    "Preview image was not found."
+                )
+            self._capture_face_gallery_details.setText(
+                _format_capture_face_saved_shot_details(shot)
+            )
 
         def _update_capture_face_action_buttons(
             self,
@@ -5913,6 +6060,45 @@ def _format_capture_face_outputs(readiness: CaptureFaceReadiness) -> str:
             lines.append(f"- ... {len(outputs.missing_faces) - 8} more")
     if outputs.invalid_shot_count:
         lines.extend(["", "Invalid rows", str(outputs.invalid_shot_count)])
+    if outputs.saved_shots:
+        lines.extend(["", "Saved shots", str(len(outputs.saved_shots))])
+    return "\n".join(lines)
+
+
+def _capture_face_saved_shot_label(shot: CaptureFaceSavedShot) -> str:
+    status = "ok" if shot.coverage_ok else "check"
+    timestamp = shot.timestamp or f"row {shot.row_index}"
+    return f"{shot.object_full}\n{timestamp}\n{status}"
+
+
+def _capture_face_shot_preview_path(shot: CaptureFaceSavedShot) -> Optional[Path]:
+    if shot.annotated_path.exists():
+        return shot.annotated_path
+    if shot.raw_path.exists():
+        return shot.raw_path
+    return None
+
+
+def _format_capture_face_saved_shot_details(
+    shot: CaptureFaceSavedShot,
+) -> str:
+    lines = [
+        shot.object_full or "(unknown face)",
+        "",
+        f"Status: {'valid coverage shot' if shot.coverage_ok else 'needs attention'}",
+        f"Timestamp: {shot.timestamp or '(missing)'}",
+        f"Side: {shot.side or '?'}",
+        f"Expected tags: {_format_id_summary(shot.expected_tag_ids)}",
+        f"Detected tags: {_format_id_summary(shot.detected_tag_ids)}",
+        "",
+        f"Annotated: {_display_path(shot.annotated_path)}",
+        f"Raw: {_display_path(shot.raw_path)}",
+        f"Metadata: {_display_path(shot.metadata_path)}",
+    ]
+    if shot.warnings:
+        lines.extend(["", "Warnings", *_format_items(shot.warnings[:4])])
+        if len(shot.warnings) > 4:
+            lines.append(f"- ... {len(shot.warnings) - 4} more")
     return "\n".join(lines)
 
 
@@ -6715,6 +6901,27 @@ QListWidget#BatchCaptureQueue::item:hover {
 }
 QListWidget#BatchCaptureQueue::item:selected,
 QListWidget#BatchCaptureQueue::item:selected:!active {
+    background: #d9efff;
+    color: #08253d;
+    border: 2px solid #0b6f8f;
+}
+QListWidget#FaceShotGallery {
+    background: #ffffff;
+    border: 1px solid #b8ccda;
+    border-radius: 7px;
+    padding: 6px;
+}
+QListWidget#FaceShotGallery::item {
+    padding: 6px;
+    border: 1px solid transparent;
+    border-radius: 6px;
+}
+QListWidget#FaceShotGallery::item:hover {
+    background: #eff7fb;
+    border: 1px solid #bad7e7;
+}
+QListWidget#FaceShotGallery::item:selected,
+QListWidget#FaceShotGallery::item:selected:!active {
     background: #d9efff;
     color: #08253d;
     border: 2px solid #0b6f8f;

@@ -176,6 +176,15 @@ class WorkflowCaptureFaceTests(unittest.TestCase):
         self.assertTrue(complete.complete)
         self.assertEqual(complete.valid_shot_count, 2)
         self.assertEqual(complete.missing_faces, ())
+        self.assertEqual(len(complete.saved_shots), 2)
+        self.assertEqual(
+            complete.saved_shots[0].object_full,
+            "connection_plate_white_sideA",
+        )
+        self.assertTrue(complete.saved_shots[0].coverage_ok)
+        self.assertEqual(complete.saved_shots[0].side, "A")
+        self.assertEqual(complete.saved_shots[0].expected_tag_ids, (52, 53))
+        self.assertTrue(complete.saved_shots[0].annotated_path.name.endswith("_ann.png"))
 
     def test_broken_metadata_does_not_count_toward_coverage(self) -> None:
         with TemporaryDirectory() as tmpdir:
@@ -198,6 +207,8 @@ class WorkflowCaptureFaceTests(unittest.TestCase):
         self.assertEqual(status.valid_shot_count, 0)
         self.assertEqual(status.invalid_shot_count, 1)
         self.assertEqual(status.missing_faces, ("connection_plate_white_sideA",))
+        self.assertEqual(len(status.saved_shots), 1)
+        self.assertFalse(status.saved_shots[0].coverage_ok)
         self.assertTrue(any("raw image was not found" in warning for warning in status.warnings))
 
     def test_process_state_summarizes_manifest_update(self) -> None:

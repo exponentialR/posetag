@@ -150,7 +150,9 @@ state, and logs. Users can start the full missing-face batch, capture a
 selected subset, or capture one current face. The OpenCV capture window can
 auto-save stable valid face shots from that queue, and the visible queue can be
 selected with mouse clicks, trackpad/mouse-wheel scrolling, or arrow keys while
-keeping `ENTER` as the manual save fallback. Stage
+keeping `ENTER` as the manual save fallback. The Stage 5 dashboard also shows a
+manifest-backed saved-shot gallery with clickable thumbnails and per-shot
+paths/details. Stage
 5 status is coverage-based: it is complete only when
 every registered board face has at least one valid saved raw image, annotated
 image, metadata JSON, and `shots/manifest.csv` row. The
@@ -628,8 +630,10 @@ action for one-off captures. The OpenCV capture window remains the capture UI,
 but GUI launches default to stable-tag auto-capture; `ENTER` still saves
 manually, and queue rows can be selected with mouse clicks, scroll/trackpad
 gestures, or arrow keys. The dashboard streams process output, keeps a
-copyable command fallback, and refreshes coverage when `shots/manifest.csv` is
-written or updated.
+copyable command fallback, shows saved face-shot thumbnails from the manifest,
+and refreshes coverage when `shots/manifest.csv` is written or updated.
+When reopening capture on an existing project, the OpenCV saved-preview panel
+loads recent manifest images instead of starting empty.
 
 **Alternative layouts**
 
