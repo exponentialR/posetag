@@ -100,6 +100,16 @@ posetag-capture-face --project_root my_project \
   --capture_all --auto_capture --exit_when_complete
 ```
 
+Queue a selected subset of registered faces:
+
+```bash
+posetag-capture-face --project_root my_project \
+  --source opencv --cam 0 \
+  --queue_face connection_plate_white_sideA \
+  --queue_face connection_plate_white_sideB \
+  --auto_capture --exit_when_complete
+```
+
 The default source remains `realsense` for compatibility with the legacy script.
 For a normal USB webcam, pass `--source opencv --cam 0` explicitly.
 
@@ -116,6 +126,7 @@ The Stage 5 panel:
 - reads registered object bases and full face names from
   `boards/tag_registry.yaml`
 - shows the registered face capture queue with captured/missing status
+- offers batch capture, selected-face capture, and current-face capture actions
 - validates the calibration YAML, registry, selected object/face or queue, source,
   video path, and output paths before launch
 - supports webcam/OpenCV, RealSense, and video sources
@@ -144,6 +155,7 @@ a full face is supplied, PoseTag uses that face directly.
 
 If `--object_name` is omitted, the OpenCV viewer starts from the registered
 face queue. Use `--capture_all` to queue every registered face explicitly.
+Use repeated `--queue_face` arguments to capture a selected subset.
 
 The optional auto-capture controls are:
 

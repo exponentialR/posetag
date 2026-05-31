@@ -456,6 +456,11 @@ class CaptureFaceStep3Tests(unittest.TestCase):
             self.assertTrue(selection.auto_side)
             self.assertEqual(selection.faces[0]["yaml"], str(board_path))
             self.assertEqual(selection.faces[0]["tag_ids"], (52, 53))
+            queued = legacy_capture_face.select_queued_faces(
+                ["connection_plate_white_sideA"],
+                faces,
+            )
+            self.assertEqual(queued[0]["object"], "connection_plate_white_sideA")
 
     def test_stale_registry_missing_board_tag_fails_clearly(self) -> None:
         with TemporaryDirectory() as tmpdir:

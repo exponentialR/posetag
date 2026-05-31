@@ -121,6 +121,27 @@ class WorkflowCaptureFaceTests(unittest.TestCase):
         self.assertIn("--auto_capture_cooldown 0.25", command)
         self.assertIn("--exit_when_complete", command)
 
+    def test_selected_face_queue_command_is_explicit(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            project_root = Path(tmpdir) / "project"
+            _write_valid_calibration(project_root / "calib" / "calib_color.yaml")
+            _write_board_and_registry(project_root, ("sideA", "sideB"))
+            config = CaptureFaceConfig(
+                project_root=project_root,
+                queue_faces=("connection_plate_white_sideB",),
+                auto_capture=True,
+                exit_when_complete=True,
+            )
+
+            readiness = inspect_capture_face_readiness(config)
+            command = build_capture_face_command(config)
+
+        self.assertTrue(readiness.ready, readiness.errors)
+        self.assertEqual(readiness.selected_faces, ("connection_plate_white_sideB",))
+        self.assertIn("--queue_face connection_plate_white_sideB", command)
+        self.assertNotIn("--capture_all", command)
+        self.assertNotIn("--object_name", command)
+
     def test_output_status_requires_valid_coverage_for_each_registered_face(self) -> None:
         with TemporaryDirectory() as tmpdir:
             project_root = Path(tmpdir) / "project"

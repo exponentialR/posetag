@@ -2767,8 +2767,11 @@ def build_main_window(qt: Any, project_root: Path) -> Any:
             self._capture_face_queue.setObjectName("BatchCaptureQueue")
             self._capture_face_queue.setMinimumHeight(120)
             self._capture_face_queue.setMaximumHeight(190)
-            self._capture_face_queue.itemClicked.connect(
-                self._capture_face_queue_item_clicked
+            self._capture_face_queue.setSelectionMode(
+                QtWidgets.QAbstractItemView.SelectionMode.ExtendedSelection
+            )
+            self._capture_face_queue.itemSelectionChanged.connect(
+                self._update_capture_face_action_buttons
             )
 
             self._capture_face_source = QtWidgets.QComboBox()
@@ -3122,11 +3125,29 @@ def build_main_window(qt: Any, project_root: Path) -> Any:
             capture_refresh_button = QtWidgets.QPushButton("Refresh Status")
             capture_refresh_button.setObjectName("SecondaryActionButton")
             capture_refresh_button.clicked.connect(self._refresh)
-            self._capture_face_run_button = QtWidgets.QPushButton("Run Capture Face")
+            self._capture_face_run_button = QtWidgets.QPushButton("Start Batch")
             self._capture_face_run_button.setObjectName("PrimaryActionButton")
-            self._capture_face_run_button.clicked.connect(self._run_capture_face)
+            self._capture_face_run_button.clicked.connect(
+                lambda: self._run_capture_face("batch")
+            )
+            self._capture_face_selected_button = QtWidgets.QPushButton(
+                "Capture Selected"
+            )
+            self._capture_face_selected_button.setObjectName("SecondaryActionButton")
+            self._capture_face_selected_button.clicked.connect(
+                lambda: self._run_capture_face("selected")
+            )
+            self._capture_face_current_button = QtWidgets.QPushButton(
+                "Capture Current"
+            )
+            self._capture_face_current_button.setObjectName("SecondaryActionButton")
+            self._capture_face_current_button.clicked.connect(
+                lambda: self._run_capture_face("current")
+            )
             capture_action_row = QtWidgets.QHBoxLayout()
             capture_action_row.addWidget(self._capture_face_run_button)
+            capture_action_row.addWidget(self._capture_face_selected_button)
+            capture_action_row.addWidget(self._capture_face_current_button)
             capture_action_row.addWidget(capture_refresh_button)
             capture_action_row.addStretch(1)
 
@@ -4556,11 +4577,9 @@ def build_main_window(qt: Any, project_root: Path) -> Any:
                     )
                 )
             process_running = self._capture_face_process_is_running()
-            self._capture_face_run_button.setEnabled(
-                readiness.ready and not process_running
-            )
-            self._capture_face_run_button.setText(
-                _capture_face_run_button_label(self._capture_face_process_state)
+            self._update_capture_face_action_buttons(
+                readiness.ready,
+                process_running,
             )
 
             model = self._model_by_stage_id(self._selected_stage_id)
@@ -4643,10 +4662,61 @@ def build_main_window(qt: Any, project_root: Path) -> Any:
             finally:
                 self._capture_face_queue.blockSignals(False)
 
-        def _capture_face_queue_item_clicked(self, item: Any) -> None:
+        def _update_capture_face_action_buttons(
+            self,
+            ready: Optional[bool] = None,
+            process_running: Optional[bool] = None,
+        ) -> None:
+            if not hasattr(self, "_capture_face_run_button"):
+                return
+            if ready is None:
+                ready = bool(
+                    getattr(self, "_latest_capture_face_readiness_ready", False)
+                )
+            else:
+                self._latest_capture_face_readiness_ready = bool(ready)
+            if process_running is None:
+                process_running = self._capture_face_process_is_running()
+            enabled = bool(ready) and not process_running
+            selected_faces = self._selected_capture_face_queue_faces()
+            current_face = self._current_capture_face_queue_face()
+            object_text = self._capture_face_object.currentText().strip()
+            current_available = bool(
+                current_face
+                or (object_text and object_text != CAPTURE_FACE_QUEUE_LABEL)
+            )
+
+            self._capture_face_run_button.setEnabled(enabled)
+            self._capture_face_run_button.setText(
+                _capture_face_run_button_label(self._capture_face_process_state)
+            )
+            if hasattr(self, "_capture_face_selected_button"):
+                self._capture_face_selected_button.setEnabled(
+                    enabled and bool(selected_faces)
+                )
+            if hasattr(self, "_capture_face_current_button"):
+                self._capture_face_current_button.setEnabled(
+                    enabled and current_available
+                )
+
+        def _selected_capture_face_queue_faces(self) -> tuple[str, ...]:
+            if not hasattr(self, "_capture_face_queue"):
+                return ()
+            faces: list[str] = []
+            for item in self._capture_face_queue.selectedItems():
+                face = item.data(QtCore.Qt.ItemDataRole.UserRole)
+                if face:
+                    faces.append(str(face))
+            return tuple(dict.fromkeys(faces))
+
+        def _current_capture_face_queue_face(self) -> str:
+            if not hasattr(self, "_capture_face_queue"):
+                return ""
+            item = self._capture_face_queue.currentItem()
+            if item is None:
+                return ""
             face = item.data(QtCore.Qt.ItemDataRole.UserRole)
-            if face:
-                self._capture_face_object.setCurrentText(str(face))
+            return str(face) if face else ""
 
         def _copy_calibration_command(self) -> None:
             command = self._calibration_command_preview.text()
@@ -4933,13 +5003,18 @@ def build_main_window(qt: Any, project_root: Path) -> Any:
                 return False
             return process.state() != QtCore.QProcess.ProcessState.NotRunning
 
-        def _run_capture_face(self) -> None:
+        def _run_capture_face(self, mode: str = "batch") -> None:
             if self._capture_face_process_is_running():
                 message = "Face-shot capture is already running."
                 self.statusBar().showMessage(message, 3000)
                 return
 
-            config = self._capture_face_config()
+            if mode == "selected" and not self._selected_capture_face_queue_faces():
+                message = "Select one or more registered faces in the queue first."
+                self.statusBar().showMessage(message, 4000)
+                return
+
+            config = self._capture_face_config(mode)
             readiness = inspect_capture_face_readiness(config)
             if not readiness.ready:
                 message = "Resolve face-shot readiness messages before running."
@@ -5106,6 +5181,7 @@ def build_main_window(qt: Any, project_root: Path) -> Any:
                 self._capture_face_run_button.setText(
                     _capture_face_run_button_label(state)
                 )
+                self._update_capture_face_action_buttons()
 
         def _capture_face_process_is_running(self) -> bool:
             process = self._capture_face_process
@@ -5436,7 +5512,7 @@ def build_main_window(qt: Any, project_root: Path) -> Any:
                 allow_nonplanar=bool(self._board_allow_nonplanar.isChecked()),
             )
 
-        def _capture_face_config(self) -> CaptureFaceConfig:
+        def _capture_face_config(self, mode: str = "batch") -> CaptureFaceConfig:
             calib_text = self._capture_face_calibration_path.text().strip()
             registry_text = self._capture_face_registry_path.text().strip()
             video_text = self._capture_face_video_path.text().strip()
@@ -5446,11 +5522,23 @@ def build_main_window(qt: Any, project_root: Path) -> Any:
             ann_dir_text = self._capture_face_ann_dir.text().strip()
             meta_dir_text = self._capture_face_meta_dir.text().strip()
             object_text = self._capture_face_object.currentText().strip()
-            capture_all = object_text in ("", CAPTURE_FACE_QUEUE_LABEL)
-            object_name = "" if capture_all else object_text
+            queue_faces: tuple[str, ...] = ()
+            capture_all = False
+            object_name = ""
+            if mode == "selected":
+                queue_faces = self._selected_capture_face_queue_faces()
+            elif mode == "current":
+                object_name = self._current_capture_face_queue_face()
+                if not object_name and object_text != CAPTURE_FACE_QUEUE_LABEL:
+                    object_name = object_text
+                if not object_name:
+                    capture_all = True
+            else:
+                capture_all = True
             return CaptureFaceConfig(
                 project_root=self._current_project_root(),
                 object_name=object_name,
+                queue_faces=queue_faces,
                 family=self._capture_face_family.text(),
                 calibration_path=Path(calib_text).expanduser()
                 if calib_text
@@ -5479,7 +5567,7 @@ def build_main_window(qt: Any, project_root: Path) -> Any:
                 auto_capture=True,
                 auto_capture_frames=DEFAULT_CAPTURE_AUTO_FRAMES,
                 auto_capture_cooldown=DEFAULT_CAPTURE_AUTO_COOLDOWN,
-                exit_when_complete=capture_all,
+                exit_when_complete=capture_all or bool(queue_faces),
             )
 
         def _object_tag_id_mode_value(self) -> str:
@@ -6095,8 +6183,8 @@ def _capture_face_run_button_label(state: CaptureFaceProcessState) -> str:
     if state.running:
         return "Capture Running..."
     if state.success:
-        return "Run Capture Again"
-    return "Run Capture Face"
+        return "Start Batch Again"
+    return "Start Batch"
 
 
 def _qt_enum_name(value: Any) -> str:

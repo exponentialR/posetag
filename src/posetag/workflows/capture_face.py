@@ -94,6 +94,7 @@ class CaptureFaceConfig:
     meta_dir: Optional[Union[Path, str]] = None
     panel_width: int = DEFAULT_PANEL_WIDTH
     recent_width: int = DEFAULT_RECENT_WIDTH
+    queue_faces: tuple[str, ...] = ()
     capture_all: bool = False
     auto_capture: bool = False
     auto_capture_frames: int = DEFAULT_AUTO_CAPTURE_FRAMES
@@ -203,6 +204,7 @@ class _ValidatedCaptureFaceInputs:
     layout: str
     panel_width: int
     recent_width: int
+    queue_faces: tuple[str, ...]
     capture_all: bool
     auto_capture: bool
     auto_capture_frames: int
@@ -437,7 +439,17 @@ def inspect_capture_face_readiness(
 
     if validated is not None:
         try:
-            if validated.capture_all or not validated.object_name:
+            if validated.queue_faces:
+                selected: list[str] = []
+                registered = set(registered_faces)
+                for face_name in validated.queue_faces:
+                    if face_name not in registered:
+                        raise CaptureFaceError(
+                            f"No registered face found for queued selection {face_name!r}."
+                        )
+                    selected.append(face_name)
+                selected_faces = tuple(selected)
+            elif validated.capture_all or not validated.object_name:
                 selected_faces = (
                     outputs.missing_faces
                     if outputs.missing_faces
@@ -556,6 +568,8 @@ def build_capture_face_arguments(config: CaptureFaceConfig) -> tuple[str, ...]:
 
     if validated.object_name:
         parts.extend(["--object_name", validated.object_name])
+    for face_name in validated.queue_faces:
+        parts.extend(["--queue_face", face_name])
     if validated.capture_all:
         parts.append("--capture_all")
     if validated.auto_capture:
@@ -746,6 +760,17 @@ def _validated_inputs(config: CaptureFaceConfig) -> _ValidatedCaptureFaceInputs:
     object_name = str(config.object_name).strip()
     if object_name and (Path(object_name).name != object_name or "\\" in object_name):
         errors.append("Object or face selection must be a registered name, not a path.")
+    queue_faces = tuple(
+        dict.fromkeys(str(face).strip() for face in config.queue_faces if str(face).strip())
+    )
+    for face in queue_faces:
+        if Path(face).name != face or "\\" in face:
+            errors.append("Queued face selections must be registered names, not paths.")
+    if queue_faces and (object_name or config.capture_all):
+        errors.append(
+            "Queued face selections cannot be combined with an object selection "
+            "or all-faces capture."
+        )
 
     family = str(config.family).strip()
     if not family:
@@ -826,6 +851,7 @@ def _validated_inputs(config: CaptureFaceConfig) -> _ValidatedCaptureFaceInputs:
         layout=layout,
         panel_width=panel_width,
         recent_width=recent_width,
+        queue_faces=queue_faces,
         capture_all=bool(config.capture_all),
         auto_capture=bool(config.auto_capture),
         auto_capture_frames=auto_capture_frames,

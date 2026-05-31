@@ -146,8 +146,10 @@ origin tag while keeping the OpenCV `ENTER`/`ESC` controls unchanged. In Stage
 5 it can guide and launch the existing `posetag-capture-face` workflow with a
 registered face capture queue, webcam/RealSense/video source settings,
 calibration and registry paths, output layout, expected manifest path, process
-state, and logs. The OpenCV capture window can auto-save stable valid face
-shots from that queue while keeping `ENTER` as the manual save fallback. Stage
+state, and logs. Users can start the full missing-face batch, capture a
+selected subset, or capture one current face. The OpenCV capture window can
+auto-save stable valid face shots from that queue while keeping `ENTER` as the
+manual save fallback. Stage
 5 status is coverage-based: it is complete only when
 every registered board face has at least one valid saved raw image, annotated
 image, metadata JSON, and `shots/manifest.csv` row. The
@@ -619,11 +621,13 @@ The optional `posetag-gui` dashboard exposes this workflow as guided Stage 5
 after Stage 4 board definitions are valid. It shows the registered face queue
 from `boards/tag_registry.yaml`, validates calibration, registry, source,
 video, and output settings, and can launch `posetag-capture-face` in the
-current Python environment with a `Run Capture Face` button. The OpenCV
-capture window remains the capture UI, but GUI launches default to queue mode
-with stable-tag auto-capture; `ENTER` still saves manually. The dashboard
-streams process output, keeps a copyable command fallback, and refreshes
-coverage when `shots/manifest.csv` is written or updated.
+current Python environment. Like Stage 4, it has a batch action for all
+missing faces, a selected-subset action from the queue, and a current-face
+action for one-off captures. The OpenCV capture window remains the capture UI,
+but GUI launches default to stable-tag auto-capture; `ENTER` still saves
+manually. The dashboard streams process output, keeps a copyable command
+fallback, and refreshes coverage when `shots/manifest.csv` is written or
+updated.
 
 **Alternative layouts**
 

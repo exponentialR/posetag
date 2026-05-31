@@ -729,14 +729,14 @@ class WorkflowGuiTests(unittest.TestCase):
             exit_code=0,
         )
 
-        self.assertEqual(_capture_face_run_button_label(idle), "Run Capture Face")
+        self.assertEqual(_capture_face_run_button_label(idle), "Start Batch")
         self.assertEqual(
             _capture_face_run_button_label(running),
             "Capture Running...",
         )
         self.assertEqual(
             _capture_face_run_button_label(success),
-            "Run Capture Again",
+            "Start Batch Again",
         )
         self.assertIn("not started", _format_capture_face_process_state(idle))
         self.assertIn("Expected manifest:", _format_capture_face_process_state(idle))

@@ -387,6 +387,37 @@ def update_auto_capture_state(
     )
 
 
+def select_queued_faces(
+    requested_faces: Sequence[str],
+    registered_faces: Sequence[Mapping[str, object]],
+) -> List[Dict]:
+    """Resolve repeated full-face queue selections against registered faces."""
+
+    requested = [str(face).strip() for face in requested_faces if str(face).strip()]
+    if not requested:
+        return []
+
+    by_name = {
+        str(face.get("object", "")).strip(): dict(face)
+        for face in registered_faces
+        if str(face.get("object", "")).strip()
+    }
+    selected: List[Dict] = []
+    missing: List[str] = []
+    for name in dict.fromkeys(requested):
+        face = by_name.get(name)
+        if face is None:
+            missing.append(name)
+        else:
+            selected.append(face)
+    if missing:
+        names = ", ".join(repr(name) for name in missing)
+        raise CaptureFaceError(
+            f"No registered face found for queued selection {names}."
+        )
+    return selected
+
+
 def draw_capture_overlay(
     frame: np.ndarray,
     *,
@@ -503,6 +534,8 @@ def main(argv=None):
                     help="Where to save shots (default: <project_root>/shots).")
     ap.add_argument("--object_name", default=None,
                     help="Either full (e.g. connection_plate_white_sideA) or base (e.g. connection_plate_white).")
+    ap.add_argument("--queue_face", action="append", default=[],
+                    help="full registered face to include in the capture queue; may be repeated")
     ap.add_argument("--capture_all", action="store_true",
                     help="queue all registered faces from the tag registry")
     ap.add_argument("--auto_capture", action="store_true",
@@ -543,6 +576,8 @@ def main(argv=None):
         raise SystemExit("--auto_capture_frames must be positive")
     if args.auto_capture_cooldown < 0:
         raise SystemExit("--auto_capture_cooldown must be zero or greater")
+    if args.queue_face and (args.object_name or args.capture_all):
+        raise SystemExit("--queue_face cannot be combined with --object_name or --capture_all")
 
     # ---------- validate project inputs before opening hardware or writing outputs ----------
     try:
@@ -567,7 +602,12 @@ def main(argv=None):
             project_root=paths.project_root,
             registry_path=paths.registry_path,
         )
-        initial_selection = select_initial_faces(args.object_name, registered_faces)
+        queued_faces = select_queued_faces(args.queue_face, registered_faces)
+        initial_selection = (
+            None
+            if queued_faces
+            else select_initial_faces(args.object_name, registered_faces)
+        )
         Detector = load_apriltag_detector_class()
         det = create_apriltag_detector(args.family, detector_class=Detector)
     except CaptureFaceError as exc:
@@ -603,7 +643,11 @@ def main(argv=None):
         "auto_streak": 0, "last_auto_save_t": 0.0,
     }
 
-    if args.capture_all or initial_selection is None:
+    if queued_faces:
+        state["faces"] = list(queued_faces)
+        first_missing = first_uncaptured_index(state["faces"], captured_faces)
+        select_face_index(state, first_missing if first_missing is not None else 0)
+    elif args.capture_all or initial_selection is None:
         state["faces"] = list(registered_faces)
         first_missing = first_uncaptured_index(state["faces"], captured_faces)
         select_face_index(state, first_missing if first_missing is not None else 0)
@@ -618,7 +662,7 @@ def main(argv=None):
             auto_side=initial_selection.auto_side,
         )
 
-    mode = "preview" if state["faces"] and (args.capture_all or initial_selection) else "pick_face"
+    mode = "preview" if state["faces"] and (queued_faces or args.capture_all or initial_selection) else "pick_face"
     pick_sel = int(state.get("face_idx", 0))
     gallery_on, show_help = bool(args.gallery), False
     WINDOW_NAME = "Capture Face"

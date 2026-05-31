@@ -89,8 +89,8 @@ def make_recent_panel(h: int, w: int, last_img: np.ndarray, show: bool) -> np.nd
     margin = 14
     cv2.rectangle(panel, (margin, margin), (w - margin, h - margin), card, -1)
     cv2.rectangle(panel, (margin, margin), (w - margin, h - margin), border, 1)
-    cv2.putText(panel, "Last saved", (margin + 14, margin + 30),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.72, text, 2, cv2.LINE_AA)
+    cv2.putText(panel, "SAVED PREVIEW", (margin + 14, margin + 28),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.48, text, 1, cv2.LINE_AA)
 
     if not show:
         cv2.putText(panel, "Panel hidden. Press g to show it.",
@@ -99,21 +99,33 @@ def make_recent_panel(h: int, w: int, last_img: np.ndarray, show: bool) -> np.nd
         return panel
 
     if last_img is None:
-        lines = [
-            "No face shot saved yet.",
-            "Press ENTER when the selected face is framed.",
-            "The saved annotated image will appear here.",
-        ]
-        y = margin + 66
-        for line in _wrap_lines(lines, max(1, w - 2 * margin - 28), 0.52, 1):
+        preview_top = margin + 48
+        preview_bottom = min(h - margin - 54, preview_top + max(80, h // 3))
+        cv2.rectangle(
+            panel,
+            (margin + 14, preview_top),
+            (w - margin - 14, preview_bottom),
+            (236, 243, 247),
+            -1,
+        )
+        cv2.rectangle(
+            panel,
+            (margin + 14, preview_top),
+            (w - margin - 14, preview_bottom),
+            border,
+            1,
+        )
+        lines = ["Waiting for first save", "Auto-save or ENTER writes here"]
+        y = preview_bottom + 28
+        for line in _wrap_lines(lines, max(1, w - 2 * margin - 28), 0.44, 1):
             cv2.putText(panel, line, (margin + 14, y),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.52, muted, 1, cv2.LINE_AA)
-            y += 24
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.44, muted, 1, cv2.LINE_AA)
+            y += 20
         return panel
 
     # fit-preserving resize with 12px margins
     INNER = 22
-    header_h = 52
+    header_h = 48
     tgt_w = max(1, w - 2*margin - 2*INNER)
     tgt_h = max(1, h - 2*margin - header_h - INNER)
     scale = min(tgt_w / last_img.shape[1], tgt_h / last_img.shape[0])
@@ -141,26 +153,26 @@ def make_info_panel(h: int, w: int, state: dict, gallery_on: bool=True) -> np.nd
     panel = np.full((h, w, 3), BG, np.uint8)
     M, S = 14, 12  # margin, spacing
     INNER = 12
-    SCALE = 0.60
+    SCALE = 0.44
     THICK = 1
-    TITLE_SCALE = 0.8
+    TITLE_SCALE = 0.48
 
     def draw_card(y, title, body_lines, h_fixed=None, status=None):
         inner_w = w - 2*M - 2*INNER
         wrapped = _wrap_lines(body_lines, inner_w, SCALE, THICK)
-        body_h = 22 * len(wrapped)
-        H = h_fixed if h_fixed is not None else (50 + body_h + INNER)
+        body_h = 18 * len(wrapped)
+        H = h_fixed if h_fixed is not None else (38 + body_h + INNER)
         x0, y0, x1, y1 = M, y, w - M, min(h - M, y + H)
         # card
         cv2.rectangle(panel, (x0, y0), (x1, y1), CARD_BG, -1)
         cv2.rectangle(panel, (x0, y0), (x1, y1), BORDER, 1)
         # title
-        cv2.putText(panel, title, (x0 + INNER, y0 + 28),
-                    cv2.FONT_HERSHEY_SIMPLEX, TITLE_SCALE, TITLE, 2, cv2.LINE_AA)
+        cv2.putText(panel, title.upper(), (x0 + INNER, y0 + 24),
+                    cv2.FONT_HERSHEY_SIMPLEX, TITLE_SCALE, TITLE, 1, cv2.LINE_AA)
         # status chip
         if status is not None:
             txt, good = status
-            (tw, th), _ = cv2.getTextSize(txt, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 2)
+            (tw, th), _ = cv2.getTextSize(txt, cv2.FONT_HERSHEY_SIMPLEX, 0.42, 1)
             pad = 6
             rx1 = x1 - INNER
             rx0 = rx1 - tw - 2*pad
@@ -168,14 +180,14 @@ def make_info_panel(h: int, w: int, state: dict, gallery_on: bool=True) -> np.nd
             ry1 = ry0 + th + 2*pad
             cv2.rectangle(panel, (rx0, ry0), (rx1, ry1), OK_BG if good else BAD_BG, -1)
             cv2.putText(panel, txt, (rx0 + pad, ry1 - pad - 2),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255,255,255), 1, cv2.LINE_AA)
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.42, (255,255,255), 1, cv2.LINE_AA)
         # body
-        yy = y0 + 50
+        yy = y0 + 40
         for s in wrapped:
             if yy + 18 >= y1 - INNER: break  # truncate if needed
             cv2.putText(panel, s, (x0 + INNER, yy),
                         cv2.FONT_HERSHEY_SIMPLEX, SCALE, TEXT, THICK, cv2.LINE_AA)
-            yy += 22
+            yy += 18
         return y1
 
     # ----- gather state
@@ -208,10 +220,10 @@ def make_info_panel(h: int, w: int, state: dict, gallery_on: bool=True) -> np.nd
         f"Seen IDs: {det_ids}",
     ]
     if face:
-        lines += [f"Expected IDs: {exp_ids}", f"Overlap: {overlap}"]
+        lines += [f"Expected: {exp_ids}", f"Overlap: {overlap}"]
 
     y = M
-    y = draw_card(y, "Info", lines, status=("OK" if ok else "NOT OK", ok)) + S
+    y = draw_card(y, "Capture status", lines, status=("OK" if ok else "NOT OK", ok)) + S
 
     # ----- QUEUE card
     queue_faces = state.get("faces") or []
@@ -235,7 +247,7 @@ def make_info_panel(h: int, w: int, state: dict, gallery_on: bool=True) -> np.nd
             marker = "[x]" if name in captured else "[ ]"
             pointer = ">" if index == current else " "
             queue_lines.append(f"{pointer} {marker} {name}")
-        y = draw_card(y, "Queue", queue_lines) + S
+        y = draw_card(y, "Face queue", queue_lines) + S
 
     # ----- INSTRUCTIONS card (ASCII-only)
     instr = [
@@ -244,7 +256,7 @@ def make_info_panel(h: int, w: int, state: dict, gallery_on: bool=True) -> np.nd
         "- o: Queue picker; a: Auto/manual",
         "- g: Panels; h: Help; q/Esc: Quit",
     ]
-    y = draw_card(y, "Instructions", instr) + S
+    y = draw_card(y, "Controls", instr) + S
 
     # ----- GALLERY card (single column, truncates safely)
     if gallery_on:
@@ -252,13 +264,13 @@ def make_info_panel(h: int, w: int, state: dict, gallery_on: bool=True) -> np.nd
         if thumbs:
             x0, y0, x1 = M, y, w - M
             inner_w = x1 - x0 - 2*INNER
-            y_cursor = y0 + 50
+            y_cursor = y0 + 42
             # header
-            y1 = min(h - M, y0 + 50 + 8)  # temp
+            y1 = min(h - M, y0 + 42 + 8)  # temp
             cv2.rectangle(panel, (x0, y0), (x1, h - M), CARD_BG, -1)
             cv2.rectangle(panel, (x0, y0), (x1, h - M), BORDER, 1)
-            cv2.putText(panel, "Recent shots", (x0 + INNER, y0 + 28),
-                        cv2.FONT_HERSHEY_SIMPLEX, TITLE_SCALE, TITLE, 2, cv2.LINE_AA)
+            cv2.putText(panel, "RECENT SHOTS", (x0 + INNER, y0 + 24),
+                        cv2.FONT_HERSHEY_SIMPLEX, TITLE_SCALE, TITLE, 1, cv2.LINE_AA)
             # thumbnails (most recent first)
             for th in thumbs[::-1]:
                 if th is None: continue
