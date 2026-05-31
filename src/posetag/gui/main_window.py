@@ -448,6 +448,39 @@ def build_main_window(qt: Any, project_root: Path) -> Any:
             return payload
         return ()
 
+    def _capture_face_saved_shot_from_item(
+        item: Any,
+    ) -> Optional[CaptureFaceSavedShot]:
+        payload = item.data(QtCore.Qt.ItemDataRole.UserRole)
+        if isinstance(payload, CaptureFaceSavedShot):
+            return payload
+        return None
+
+    def _make_capture_face_saved_shot_item(
+        shot: CaptureFaceSavedShot,
+        icon_size: Any,
+    ) -> Any:
+        item = QtWidgets.QListWidgetItem(shot.timestamp or f"row {shot.row_index}")
+        item.setData(QtCore.Qt.ItemDataRole.UserRole, shot)
+        item.setToolTip(_format_capture_face_saved_shot_details(shot))
+        preview_path = _capture_face_shot_preview_path(shot)
+        if preview_path is not None:
+            pixmap = QtGui.QPixmap(str(preview_path))
+            if not pixmap.isNull():
+                item.setIcon(
+                    QtGui.QIcon(
+                        pixmap.scaled(
+                            icon_size,
+                            QtCore.Qt.AspectRatioMode.KeepAspectRatio,
+                            QtCore.Qt.TransformationMode.SmoothTransformation,
+                        )
+                    )
+                )
+        item.setForeground(
+            QtGui.QBrush(QtGui.QColor("#087a3d" if shot.coverage_ok else "#8a5b00"))
+        )
+        return item
+
     class _NativeBoardCaptureDialog(QtWidgets.QDialog):
         def __init__(self, parent: Any, config: BoardBuildingConfig) -> None:
             super().__init__(parent)
@@ -1247,7 +1280,24 @@ def build_main_window(qt: Any, project_root: Path) -> Any:
             self._saved_gallery.itemClicked.connect(self._preview_saved_shot)
             self._saved_gallery.itemDoubleClicked.connect(self._preview_saved_shot)
 
-            self._capture_button = QtWidgets.QPushButton("Capture Now")
+            self._saved_stack_gallery = QtWidgets.QListWidget()
+            self._saved_stack_gallery.setObjectName("FaceShotGallery")
+            self._saved_stack_gallery.setViewMode(QtWidgets.QListView.ViewMode.IconMode)
+            self._saved_stack_gallery.setResizeMode(
+                QtWidgets.QListView.ResizeMode.Adjust
+            )
+            self._saved_stack_gallery.setMovement(QtWidgets.QListView.Movement.Static)
+            self._saved_stack_gallery.setIconSize(QtCore.QSize(104, 72))
+            self._saved_stack_gallery.setGridSize(QtCore.QSize(132, 104))
+            self._saved_stack_gallery.setMaximumHeight(118)
+            self._saved_stack_gallery.itemClicked.connect(self._preview_stack_shot)
+            self._saved_stack_field = _make_field(
+                "Shots in selected stack",
+                self._saved_stack_gallery,
+            )
+            self._saved_stack_field.setVisible(False)
+
+            self._capture_button = QtWidgets.QPushButton("Save Next")
             self._capture_button.setObjectName("SecondaryActionButton")
             self._capture_button.clicked.connect(self._capture_now)
             self._resume_button = QtWidgets.QPushButton("Resume Live View")
@@ -1268,6 +1318,7 @@ def build_main_window(qt: Any, project_root: Path) -> Any:
             controls.addWidget(_make_field("Expected tag IDs", self._expected))
             controls.addWidget(self._auto_capture)
             controls.addWidget(_make_field("Saved shots", self._saved_gallery))
+            controls.addWidget(self._saved_stack_field)
             controls.addWidget(_make_field("Capture status", self._status))
             controls.addStretch(1)
 
@@ -1468,17 +1519,15 @@ def build_main_window(qt: Any, project_root: Path) -> Any:
             outputs = inspect_capture_face_readiness(self._config).output_status
             self._saved_shots = tuple(reversed(outputs.saved_shots))
             self._saved_gallery.clear()
-            for _face_name, shots in _group_capture_face_saved_shots(
-                self._saved_shots
-            ):
+            if self._saved_shots:
                 item = QtWidgets.QListWidgetItem(
-                    _capture_face_saved_shot_group_label(shots)
+                    _capture_face_saved_shot_collection_label(self._saved_shots)
                 )
-                item.setData(QtCore.Qt.ItemDataRole.UserRole, shots)
-                item.setToolTip(_format_capture_face_saved_shot_group_details(shots))
+                item.setData(QtCore.Qt.ItemDataRole.UserRole, self._saved_shots)
+                item.setToolTip("Click to inspect this saved-shot stack.")
                 item.setIcon(
                     _capture_face_saved_shot_icon(
-                        shots,
+                        self._saved_shots,
                         self._saved_gallery.iconSize(),
                     )
                 )
@@ -1489,7 +1538,31 @@ def build_main_window(qt: Any, project_root: Path) -> Any:
             shots = _capture_face_saved_shots_from_item(item)
             if not shots:
                 return
-            shot = shots[0]
+            self._populate_saved_stack(shots)
+            self._preview_saved_stack_shot(shots[0])
+            self._saved_stack_field.setVisible(True)
+
+        def _populate_saved_stack(
+            self,
+            shots: tuple[CaptureFaceSavedShot, ...],
+        ) -> None:
+            self._saved_stack_gallery.clear()
+            for shot in shots:
+                self._saved_stack_gallery.addItem(
+                    _make_capture_face_saved_shot_item(
+                        shot,
+                        self._saved_stack_gallery.iconSize(),
+                    )
+                )
+            if self._saved_stack_gallery.count() > 0:
+                self._saved_stack_gallery.setCurrentRow(0)
+
+        def _preview_stack_shot(self, item: Any) -> None:
+            shot = _capture_face_saved_shot_from_item(item)
+            if shot is not None:
+                self._preview_saved_stack_shot(shot)
+
+        def _preview_saved_stack_shot(self, shot: CaptureFaceSavedShot) -> None:
             preview_path = _capture_face_shot_preview_path(shot)
             if preview_path is not None:
                 self._preview.show_preview(preview_path)
@@ -1497,8 +1570,8 @@ def build_main_window(qt: Any, project_root: Path) -> Any:
             self._capture_button.setEnabled(False)
             self._timer.stop()
             self._status.setText(
-                "Previewing saved face-shot stack.\n"
-                + _format_capture_face_saved_shot_group_details(shots)
+                "Previewing saved face shot.\n"
+                + _format_capture_face_saved_shot_details(shot)
                 + "\n\nUse Resume Live View to continue capture."
             )
 
@@ -3488,6 +3561,9 @@ def build_main_window(qt: Any, project_root: Path) -> Any:
             self._capture_face_gallery.setMinimumHeight(156)
             self._capture_face_gallery.setMaximumHeight(240)
             self._capture_face_gallery.setSpacing(8)
+            self._capture_face_gallery.itemClicked.connect(
+                self._select_capture_face_gallery_item
+            )
             self._capture_face_gallery.itemSelectionChanged.connect(
                 self._select_capture_face_gallery_item
             )
@@ -3505,16 +3581,38 @@ def build_main_window(qt: Any, project_root: Path) -> Any:
             self._capture_face_gallery_details.setTextInteractionFlags(
                 QtCore.Qt.TextInteractionFlag.TextSelectableByMouse
             )
-            capture_gallery_side = QtWidgets.QVBoxLayout()
+            self._capture_face_stack_gallery = QtWidgets.QListWidget()
+            self._capture_face_stack_gallery.setObjectName("FaceShotGallery")
+            self._capture_face_stack_gallery.setViewMode(
+                QtWidgets.QListView.ViewMode.IconMode
+            )
+            self._capture_face_stack_gallery.setResizeMode(
+                QtWidgets.QListView.ResizeMode.Adjust
+            )
+            self._capture_face_stack_gallery.setMovement(
+                QtWidgets.QListView.Movement.Static
+            )
+            self._capture_face_stack_gallery.setIconSize(QtCore.QSize(104, 72))
+            self._capture_face_stack_gallery.setGridSize(QtCore.QSize(132, 104))
+            self._capture_face_stack_gallery.setMaximumHeight(118)
+            self._capture_face_stack_gallery.itemClicked.connect(
+                self._select_capture_face_stack_item
+            )
+            self._capture_face_gallery_side = QtWidgets.QWidget()
+            capture_gallery_side = QtWidgets.QVBoxLayout(
+                self._capture_face_gallery_side
+            )
             capture_gallery_side.setContentsMargins(0, 0, 0, 0)
             capture_gallery_side.setSpacing(8)
+            capture_gallery_side.addWidget(self._capture_face_stack_gallery)
             capture_gallery_side.addWidget(self._capture_face_gallery_preview, 1)
             capture_gallery_side.addWidget(self._capture_face_gallery_details)
+            self._capture_face_gallery_side.setVisible(False)
             capture_gallery_layout = QtWidgets.QHBoxLayout()
             capture_gallery_layout.setContentsMargins(0, 0, 0, 0)
             capture_gallery_layout.setSpacing(10)
             capture_gallery_layout.addWidget(self._capture_face_gallery, 2)
-            capture_gallery_layout.addLayout(capture_gallery_side, 1)
+            capture_gallery_layout.addWidget(self._capture_face_gallery_side, 1)
             capture_gallery_widget = QtWidgets.QWidget()
             capture_gallery_widget.setLayout(capture_gallery_layout)
             self._capture_face_process_state_label = QtWidgets.QLabel()
@@ -3653,6 +3751,13 @@ def build_main_window(qt: Any, project_root: Path) -> Any:
                 QtCore.Qt.TextFormat.RichText
             )
             self._health_counts_label.setWordWrap(True)
+            self._health_counts_label.setOpenExternalLinks(False)
+            self._health_counts_label.setTextInteractionFlags(
+                QtCore.Qt.TextInteractionFlag.LinksAccessibleByMouse
+            )
+            self._health_counts_label.linkActivated.connect(
+                self._activate_health_count
+            )
 
             self._health_issues_label = QtWidgets.QLabel()
             self._health_issues_label.setObjectName("HealthSectionBody")
@@ -4708,6 +4813,27 @@ def build_main_window(qt: Any, project_root: Path) -> Any:
             )
             self._render_side_panel_calibration_result()
 
+        def _activate_health_count(self, href: str) -> None:
+            prefix = "stage-status:"
+            if not href.startswith(prefix):
+                return
+            status = href[len(prefix) :]
+            matches = [model for model in self._models if model.status == status]
+            if not matches:
+                return
+            stage_ids = [model.stage_id for model in matches]
+            try:
+                current_index = stage_ids.index(self._selected_stage_id)
+            except ValueError:
+                target = matches[0]
+            else:
+                target = matches[(current_index + 1) % len(matches)]
+            self._select_stage(target.stage_id)
+            self.statusBar().showMessage(
+                f"Showing {target.status_label}: Stage {target.stage_id} {target.name}",
+                3500,
+            )
+
         def _render_side_panel_calibration_result(self) -> None:
             show_calibration = self._selected_stage_id == 2
             self._side_panel_title.setText(
@@ -5119,39 +5245,43 @@ def build_main_window(qt: Any, project_root: Path) -> Any:
                 return
             selected_meta = self._selected_capture_face_gallery_metadata_path()
             shots = tuple(reversed(readiness.output_status.saved_shots))
-            selected_row = 0
+            selected_row: Optional[int] = None
             self._capture_face_gallery.blockSignals(True)
             try:
                 self._capture_face_gallery.clear()
-                for row, (_face_name, group) in enumerate(
-                    _group_capture_face_saved_shots(shots)
-                ):
+                if shots:
                     item = QtWidgets.QListWidgetItem(
-                        _capture_face_saved_shot_group_label(group)
+                        _capture_face_saved_shot_collection_label(shots)
                     )
-                    item.setData(QtCore.Qt.ItemDataRole.UserRole, group)
-                    item.setToolTip(_format_capture_face_saved_shot_group_details(group))
-                    if any(shot.coverage_ok for shot in group):
+                    item.setData(QtCore.Qt.ItemDataRole.UserRole, shots)
+                    item.setToolTip("Click to inspect this saved-shot stack.")
+                    if any(shot.coverage_ok for shot in shots):
                         item.setForeground(QtGui.QBrush(QtGui.QColor("#087a3d")))
                     else:
                         item.setForeground(QtGui.QBrush(QtGui.QColor("#8a5b00")))
                     item.setIcon(
                         _capture_face_saved_shot_icon(
-                            group,
+                            shots,
                             self._capture_face_gallery.iconSize(),
                         )
                     )
                     self._capture_face_gallery.addItem(item)
                     if (
                         selected_meta is not None
-                        and any(shot.metadata_path == selected_meta for shot in group)
+                        and any(shot.metadata_path == selected_meta for shot in shots)
                     ):
-                        selected_row = row
-                if self._capture_face_gallery.count() > 0:
+                        selected_row = 0
+                if selected_row is not None:
                     self._capture_face_gallery.setCurrentRow(selected_row)
+                else:
+                    self._capture_face_gallery.clearSelection()
+                    self._capture_face_gallery.setCurrentRow(-1)
             finally:
                 self._capture_face_gallery.blockSignals(False)
-            self._select_capture_face_gallery_item()
+            if selected_row is None:
+                self._collapse_capture_face_gallery()
+            else:
+                self._select_capture_face_gallery_item()
 
         def _selected_capture_face_gallery_metadata_path(self) -> Optional[Path]:
             if not hasattr(self, "_capture_face_gallery"):
@@ -5169,21 +5299,57 @@ def build_main_window(qt: Any, project_root: Path) -> Any:
                 return
             item = self._capture_face_gallery.currentItem()
             if item is None:
-                self._capture_face_gallery_preview.clear_preview(
-                    "No saved face shots yet."
-                )
-                self._capture_face_gallery_details.setText(
-                    "Saved face-shot previews will appear after capture."
-                )
+                self._collapse_capture_face_gallery()
                 return
             shots = _capture_face_saved_shots_from_item(item)
             if not shots:
-                self._capture_face_gallery_preview.clear_preview(
-                    "Preview unavailable."
-                )
-                self._capture_face_gallery_details.setText("")
+                self._collapse_capture_face_gallery("Preview unavailable.")
                 return
-            shot = shots[0]
+            self._capture_face_gallery_side.setVisible(True)
+            self._populate_capture_face_stack_gallery(shots)
+            self._preview_capture_face_stack_shot(shots[0])
+
+        def _collapse_capture_face_gallery(
+            self,
+            message: str = "Click a saved-shot stack to inspect its images.",
+        ) -> None:
+            if not hasattr(self, "_capture_face_gallery_side"):
+                return
+            self._capture_face_stack_gallery.clear()
+            self._capture_face_gallery_preview.clear_preview(message)
+            self._capture_face_gallery_details.setText(
+                "Saved shots stay collapsed until you select a stack."
+            )
+            self._capture_face_gallery_side.setVisible(False)
+
+        def _populate_capture_face_stack_gallery(
+            self,
+            shots: tuple[CaptureFaceSavedShot, ...],
+        ) -> None:
+            self._capture_face_stack_gallery.blockSignals(True)
+            try:
+                self._capture_face_stack_gallery.clear()
+                for shot in shots:
+                    self._capture_face_stack_gallery.addItem(
+                        _make_capture_face_saved_shot_item(
+                            shot,
+                            self._capture_face_stack_gallery.iconSize(),
+                        )
+                    )
+                if self._capture_face_stack_gallery.count() > 0:
+                    self._capture_face_stack_gallery.setCurrentRow(0)
+            finally:
+                self._capture_face_stack_gallery.blockSignals(False)
+
+        def _select_capture_face_stack_item(self, item: Any) -> None:
+            shot = _capture_face_saved_shot_from_item(item)
+            if shot is not None:
+                self._preview_capture_face_stack_shot(shot)
+
+        def _preview_capture_face_stack_shot(
+            self,
+            shot: CaptureFaceSavedShot,
+        ) -> None:
             preview_path = _capture_face_shot_preview_path(shot)
             preview_loaded = (
                 preview_path is not None
@@ -5194,7 +5360,7 @@ def build_main_window(qt: Any, project_root: Path) -> Any:
                     "Preview image was not found."
                 )
             self._capture_face_gallery_details.setText(
-                _format_capture_face_saved_shot_group_details(shots)
+                _format_capture_face_saved_shot_details(shot)
             )
 
         def _update_capture_face_action_buttons(
@@ -6513,6 +6679,21 @@ def _capture_face_saved_shot_group_label(
     )
 
 
+def _capture_face_saved_shot_collection_label(
+    shots: Sequence[CaptureFaceSavedShot],
+) -> str:
+    if not shots:
+        return "No saved face shots"
+    face_count = len({shot.object_full for shot in shots if shot.object_full})
+    valid_count = sum(1 for shot in shots if shot.coverage_ok)
+    return (
+        "Saved face shots\n"
+        f"{len(shots)} shot{'s' if len(shots) != 1 else ''}"
+        f" | {face_count} face{'s' if face_count != 1 else ''}\n"
+        f"{valid_count} valid"
+    )
+
+
 def _capture_face_shot_preview_path(shot: CaptureFaceSavedShot) -> Optional[Path]:
     if shot.annotated_path.exists():
         return shot.annotated_path
@@ -6875,19 +7056,31 @@ def _format_items(items: tuple[str, ...]) -> list[str]:
 
 
 def _format_health_counts(health: ProjectHealthViewModel) -> str:
-    rows = "".join(
-        "<tr>"
-        f"<td>{count.label}</td>"
-        f"<td align='right'><b>{count.count}</b></td>"
-        "</tr>"
-        for count in health.counts
-    )
+    rows = "".join(_format_health_count_row(count) for count in health.counts)
     return (
         "<span style='font-size:11px; font-weight:700; "
         "color:#5a6b7c;'>AT A GLANCE</span>"
         "<table width='100%' cellspacing='0' cellpadding='2'>"
         f"{rows}"
         "</table>"
+    )
+
+
+def _format_health_count_row(count: Any) -> str:
+    label = html.escape(str(count.label))
+    status = html.escape(str(count.status), quote=True)
+    count_text = html.escape(str(count.count))
+    if count.count:
+        label_cell = f"<a href='stage-status:{status}'>{label}</a>"
+        count_cell = f"<a href='stage-status:{status}'><b>{count_text}</b></a>"
+    else:
+        label_cell = label
+        count_cell = f"<b>{count_text}</b>"
+    return (
+        "<tr>"
+        f"<td>{label_cell}</td>"
+        f"<td align='right'>{count_cell}</td>"
+        "</tr>"
     )
 
 

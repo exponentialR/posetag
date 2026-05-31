@@ -148,9 +148,10 @@ queue, webcam/RealSense/video source settings, calibration and registry paths,
 output layout, expected manifest path, stable-tag auto-capture for missing
 faces, and retake controls for already captured faces. Users can start the full
 missing-face batch, capture a selected subset, or capture one current face.
-The Stage 5 dashboard and capture window show manifest-backed saved-shot
-galleries with stacked thumbnails; clicking a stack previews the latest saved
-shot and raw/annotated/metadata paths. Copy Command keeps the
+The Stage 5 dashboard and capture window keep manifest-backed saved shots
+collapsed into a compact thumbnail stack; clicking the stack opens its
+individual shots, previews the selected shot, and shows raw/annotated/metadata
+paths. Copy Command keeps the
 `posetag-capture-face` OpenCV CLI fallback. Stage
 5 status is coverage-based: it is complete only when
 every registered board face has at least one valid saved raw image, annotated

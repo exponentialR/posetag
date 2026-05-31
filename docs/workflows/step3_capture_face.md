@@ -131,9 +131,10 @@ The Stage 5 panel:
   or the current face
 - supports mouse/trackpad scrolling and clicks on the queue; selecting an
   already captured face enables Retake Now
-- shows a saved-shot gallery from `shots/manifest.csv`, grouped as stacked
-  thumbnails by face; clicking or double-clicking a stack previews the latest
-  saved shot and its raw/annotated/metadata paths
+- shows a saved-shot gallery from `shots/manifest.csv`, collapsed into a
+  compact thumbnail stack; clicking or double-clicking the stack opens its
+  individual shots, previews the selected saved shot, and shows its
+  raw/annotated/metadata paths
 - offers batch capture, selected-face capture, and current-face capture actions
 - validates the calibration YAML, registry, selected object/face or queue, source,
   video path, and output paths before launch

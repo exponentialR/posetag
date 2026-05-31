@@ -24,6 +24,7 @@ from posetag.gui.main_window import (
     _capture_face_command_card_note,
     _capture_face_command_ready_message,
     _capture_face_run_button_label,
+    _capture_face_saved_shot_collection_label,
     _capture_face_saved_shot_group_label,
     _capture_face_saved_shot_label,
     _command_button_label,
@@ -698,10 +699,16 @@ class WorkflowGuiTests(unittest.TestCase):
         )
         grouped = _group_capture_face_saved_shots((saved_shot, older_shot))
         group_label = _capture_face_saved_shot_group_label(grouped[0][1])
+        collection_label = _capture_face_saved_shot_collection_label(
+            (saved_shot, older_shot)
+        )
         group_details = _format_capture_face_saved_shot_group_details(grouped[0][1])
         self.assertEqual(len(grouped), 1)
         self.assertIn("2 shots", group_label)
         self.assertIn("latest 20260531_120000", group_label)
+        self.assertIn("Saved face shots", collection_label)
+        self.assertIn("2 shots", collection_label)
+        self.assertIn("1 face", collection_label)
         self.assertIn("Saved shots: 2", group_details)
         self.assertIn("Previous shots", group_details)
 
@@ -842,10 +849,13 @@ class WorkflowGuiTests(unittest.TestCase):
         counts = _format_health_counts(health)
         self.assertIn("AT A GLANCE", counts)
         self.assertIn("<table", counts)
-        self.assertIn("<td>Missing</td>", counts)
+        self.assertIn("href='stage-status:missing'", counts)
+        self.assertIn(">Missing</a>", counts)
         self.assertIn("<b>2</b>", counts)
-        self.assertIn("<td>Not applicable</td>", counts)
+        self.assertIn("href='stage-status:not_applicable'", counts)
+        self.assertIn(">Not applicable</a>", counts)
         self.assertIn("<b>7</b>", counts)
+        self.assertIn("<td>Complete</td>", counts)
 
         status_style = _health_status_style(
             foreground=health.status_color,
