@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import subprocess
 import sys
 import unittest
@@ -12,6 +13,11 @@ import yaml
 from posetag.pipelines.charuco_calibration import (
     build_calibration_yaml,
     write_calibration_yaml,
+)
+from posetag.pipelines.capture_face import (
+    append_capture_manifest,
+    build_capture_metadata,
+    build_shot_paths,
 )
 from posetag.pipelines.make_board import build_board_yaml, write_board_yaml
 from posetag.workflows.status import WorkflowStatus, inspect_project
@@ -67,6 +73,77 @@ def _write_valid_board_and_registry(project_root: Path) -> tuple[Path, Path]:
     registry_path.parent.mkdir(parents=True, exist_ok=True)
     registry_path.write_text(yaml.safe_dump(registry), encoding="utf-8")
     return board_path, registry_path
+
+
+def _write_two_face_board_and_registry(project_root: Path) -> tuple[dict[str, Path], Path]:
+    board_paths: dict[str, Path] = {}
+    tags: dict[str, dict[str, str]] = {}
+    next_id = 52
+    for side in ("sideA", "sideB"):
+        object_name = f"connection_plate_white_{side}"
+        board_path = project_root / "boards" / f"{object_name}.yaml"
+        board = build_board_yaml(
+            object_name=object_name,
+            family="tag36h11",
+            tag_size_mm=80.0,
+            origin_id=next_id,
+            entries=[
+                {"id": next_id, "cx": 0.0, "cy": 0.0, "yaw_deg": 0.0},
+                {"id": next_id + 1, "cx": 0.1, "cy": -0.2, "yaw_deg": 180.0},
+            ],
+        )
+        write_board_yaml(board_path, board)
+        tags[str(next_id)] = {"object": object_name, "yaml": str(board_path)}
+        tags[str(next_id + 1)] = {"object": object_name, "yaml": str(board_path)}
+        board_paths[side] = board_path
+        next_id += 2
+
+    registry_path = project_root / "boards" / "tag_registry.yaml"
+    registry_path.write_text(
+        yaml.safe_dump(
+            {
+                "version": 1,
+                "updated": "2026-05-30T12:00:00Z",
+                "tags": tags,
+            }
+        ),
+        encoding="utf-8",
+    )
+    return board_paths, registry_path
+
+
+def _write_face_capture(
+    project_root: Path,
+    board_path: Path,
+    *,
+    timestamp: str,
+    write_raw: bool = True,
+) -> None:
+    data = yaml.safe_load(board_path.read_text(encoding="utf-8"))
+    object_full = str(data["object"])
+    tag_ids = [int(tag["id"]) for tag in data["tags"]]
+    shot_paths = build_shot_paths(
+        layout="by_object_side",
+        out_dir=project_root / "shots",
+        object_full=object_full,
+        timestamp=timestamp,
+    )
+    metadata = build_capture_metadata(
+        face={"yaml": str(board_path), "object": object_full, "tag_ids": tag_ids},
+        shot_paths=shot_paths,
+        detected_tag_ids=tag_ids,
+        validation_ok=True,
+        auto_face=True,
+        frame_shape=(480, 640, 3),
+        camera_params=(600.0, 610.0, 320.0, 240.0),
+        timestamp=timestamp,
+    )
+    shot_paths.raw_path.parent.mkdir(parents=True, exist_ok=True)
+    if write_raw:
+        shot_paths.raw_path.write_bytes(b"raw")
+    shot_paths.ann_path.write_bytes(b"ann")
+    shot_paths.meta_path.write_text(json.dumps(metadata), encoding="utf-8")
+    append_capture_manifest(project_root / "shots" / "manifest.csv", metadata)
 
 
 class WorkflowStatusTests(unittest.TestCase):
@@ -294,6 +371,73 @@ class WorkflowStatusTests(unittest.TestCase):
             self.assertEqual(stage.status, WorkflowStatus.NEEDS_ATTENTION)
             self.assertTrue(any("different_object" in error for error in stage.errors))
             self.assertTrue(any(str(board_path) in error for error in stage.errors))
+
+    def test_board_definitions_without_face_shots_marks_stage5_missing(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            project_root = Path(tmpdir) / "project"
+            _write_valid_board_and_registry(project_root)
+
+            stage5 = _stage_by_id(project_root, 5)
+            stage6 = _stage_by_id(project_root, 6)
+
+            self.assertEqual(stage5.status, WorkflowStatus.MISSING)
+            self.assertIn("No face-shot manifest", stage5.message)
+            self.assertEqual(stage6.status, WorkflowStatus.NOT_APPLICABLE)
+
+    def test_partial_face_shot_coverage_needs_attention(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            project_root = Path(tmpdir) / "project"
+            board_paths, _registry_path = _write_two_face_board_and_registry(project_root)
+            _write_face_capture(
+                project_root,
+                board_paths["sideA"],
+                timestamp="20260530_120000",
+            )
+
+            stage = _stage_by_id(project_root, 5)
+
+            self.assertEqual(stage.status, WorkflowStatus.NEEDS_ATTENTION)
+            self.assertIn("1/2 registered faces", stage.message)
+            self.assertIn("connection_plate_white_sideB", stage.message)
+
+    def test_valid_face_shots_for_all_registered_faces_mark_stage5_complete(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            project_root = Path(tmpdir) / "project"
+            board_paths, _registry_path = _write_two_face_board_and_registry(project_root)
+            _write_face_capture(
+                project_root,
+                board_paths["sideA"],
+                timestamp="20260530_120000",
+            )
+            _write_face_capture(
+                project_root,
+                board_paths["sideB"],
+                timestamp="20260530_120100",
+            )
+
+            stage5 = _stage_by_id(project_root, 5)
+            stage6 = _stage_by_id(project_root, 6)
+
+            self.assertEqual(stage5.status, WorkflowStatus.COMPLETE)
+            self.assertIn("valid face-shot coverage for 2 registered faces", stage5.message)
+            self.assertEqual(stage6.status, WorkflowStatus.MISSING)
+
+    def test_broken_face_shot_output_needs_attention(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            project_root = Path(tmpdir) / "project"
+            board_path, _registry_path = _write_valid_board_and_registry(project_root)
+            _write_face_capture(
+                project_root,
+                board_path,
+                timestamp="20260530_120000",
+                write_raw=False,
+            )
+
+            stage = _stage_by_id(project_root, 5)
+
+            self.assertEqual(stage.status, WorkflowStatus.NEEDS_ATTENTION)
+            self.assertIn("0/1 registered faces", stage.message)
+            self.assertTrue(any("raw image was not found" in warning for warning in stage.warnings))
 
     def test_workflow_helpers_import_without_gui_dependency(self) -> None:
         code = (

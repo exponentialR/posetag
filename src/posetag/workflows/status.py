@@ -21,6 +21,7 @@ from posetag.pipelines.make_board import (
     load_calibration_yaml,
     load_registry,
 )
+from posetag.workflows.capture_face import inspect_capture_face_outputs
 
 
 class WorkflowStatus(str, Enum):
@@ -111,17 +112,22 @@ def inspect_project(project_root: Union[Path, str]) -> list[StageSummary]:
         calibration_complete=camera_calibration.status == WorkflowStatus.COMPLETE,
         object_tags_complete=object_tags.status == WorkflowStatus.COMPLETE,
     )
+    face_shots = inspect_capture_face_shots(
+        root,
+        board_definitions_complete=board_definitions.status
+        == WorkflowStatus.COMPLETE,
+    )
     summaries = [
         project_setup,
         charuco_board,
         camera_calibration,
         object_tags,
         board_definitions,
+        face_shots,
     ]
     summaries.extend(
         _placeholder_summaries(
-            board_definitions_complete=board_definitions.status
-            == WorkflowStatus.COMPLETE
+            face_shots_complete=face_shots.status == WorkflowStatus.COMPLETE
         )
     )
     return summaries
@@ -490,35 +496,127 @@ def inspect_board_definitions(
     )
 
 
-def _placeholder_summaries(board_definitions_complete: bool) -> list[StageSummary]:
-    if board_definitions_complete:
-        stage5 = _stage(
-            stage_id=5,
-            status=WorkflowStatus.MISSING,
-            message="Face-shot capture status validation is not implemented yet.",
-            checked_paths=(),
-            next_action=(
-                "Run the Stage 5 capture workflow after confirming board "
-                "coverage."
-            ),
-        )
-    else:
-        stage5 = _stage(
+def inspect_capture_face_shots(
+    project_root: Union[Path, str],
+    *,
+    board_definitions_complete: bool = False,
+) -> StageSummary:
+    """Inspect Stage 5 face-shot manifest and per-face coverage."""
+
+    root = Path(project_root).expanduser()
+    outputs = inspect_capture_face_outputs(root)
+    checked_paths = _path_tuple(outputs.checked_paths)
+
+    if not board_definitions_complete:
+        return _stage(
             stage_id=5,
             status=WorkflowStatus.NOT_APPLICABLE,
             message="Face-shot capture depends on a valid tag registry and board YAML.",
-            checked_paths=(),
+            checked_paths=checked_paths,
             next_action="Complete Stage 4 before checking Stage 5.",
         )
 
+    if outputs.errors:
+        return _stage(
+            stage_id=5,
+            status=WorkflowStatus.NEEDS_ATTENTION,
+            message="Face-shot capture inputs or outputs need attention.",
+            checked_paths=checked_paths,
+            warnings=outputs.warnings,
+            errors=outputs.errors,
+            next_action=(
+                "Repair the Stage 4 registry/board YAML references or rerun "
+                "posetag-capture-face after the inputs are valid."
+            ),
+        )
+
+    if outputs.complete:
+        count = outputs.covered_face_count
+        return _stage(
+            stage_id=5,
+            status=WorkflowStatus.COMPLETE,
+            message=(
+                f"Found valid face-shot coverage for {count} registered "
+                f"face{'s' if count != 1 else ''}."
+            ),
+            checked_paths=checked_paths,
+            warnings=outputs.warnings,
+            next_action="Proceed to Stage 6 face annotation.",
+        )
+
+    if not outputs.manifest_exists:
+        count = outputs.registered_face_count
+        return _stage(
+            stage_id=5,
+            status=WorkflowStatus.MISSING,
+            message=(
+                "No face-shot manifest was found"
+                + (
+                    f" for {count} registered face{'s' if count != 1 else ''}."
+                    if count
+                    else "."
+                )
+            ),
+            checked_paths=checked_paths,
+            warnings=outputs.warnings,
+            next_action=(
+                "Run posetag-capture-face to save raw/annotated face shots, "
+                "per-shot metadata JSON, and shots/manifest.csv."
+            ),
+        )
+
+    missing = _format_missing_faces(outputs.missing_faces)
+    details = (
+        f" Missing: {missing}."
+        if missing
+        else " Review invalid rows before continuing."
+    )
+    status = (
+        WorkflowStatus.NEEDS_ATTENTION
+        if outputs.valid_shot_count or outputs.invalid_shot_count
+        else WorkflowStatus.MISSING
+    )
+    return _stage(
+        stage_id=5,
+        status=status,
+        message=(
+            f"Face-shot coverage is incomplete: {outputs.covered_face_count}/"
+            f"{outputs.registered_face_count} registered faces have a valid "
+            f"shot.{details}"
+        ),
+        checked_paths=checked_paths,
+        warnings=outputs.warnings,
+        next_action=(
+            "Capture at least one valid face shot for every registered board "
+            "face before annotation."
+        ),
+    )
+
+
+def _placeholder_summaries(face_shots_complete: bool) -> list[StageSummary]:
+    stage6_status = (
+        WorkflowStatus.MISSING
+        if face_shots_complete
+        else WorkflowStatus.NOT_APPLICABLE
+    )
+    stage6_message = (
+        "Face annotation status validation is not implemented yet."
+        if face_shots_complete
+        else "Face annotation depends on captured face shots."
+    )
+    stage6_next_action = (
+        "Run the annotation workflow after confirming face-shot coverage."
+        if face_shots_complete
+        else "Complete Stage 5 before checking Stage 6."
+    )
+
     return [
-        stage5,
         _stage(
             stage_id=6,
-            status=WorkflowStatus.NOT_APPLICABLE,
-            message="Face annotation depends on captured face shots.",
+            status=stage6_status,
+            message=stage6_message,
             checked_paths=(),
-            next_action="Complete Stage 5 before checking Stage 6.",
+            next_action=stage6_next_action,
         ),
         _stage(
             stage_id=7,
@@ -538,6 +636,15 @@ def _placeholder_summaries(board_definitions_complete: bool) -> list[StageSummar
             next_action="Complete Stage 7 before checking Stage 8.",
         ),
     ]
+
+
+def _format_missing_faces(faces: tuple[str, ...]) -> str:
+    if not faces:
+        return ""
+    if len(faces) <= 4:
+        return ", ".join(faces)
+    shown = ", ".join(faces[:4])
+    return f"{shown}, and {len(faces) - 4} more"
 
 
 def _generated_charuco_metadata_paths(project_root: Path) -> tuple[Path, ...]:

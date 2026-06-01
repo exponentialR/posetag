@@ -142,7 +142,20 @@ draft records planned object rows and capture settings only; PoseTag does not
 create board YAML or tag-registry entries until a real capture is saved. It can
 also launch the existing `posetag-make-board` workflow as a fallback, stream
 process output, and provide a prompt-response box for the selected tag IDs and
-origin tag while keeping the OpenCV `ENTER`/`ESC` controls unchanged. The
+origin tag while keeping the OpenCV `ENTER`/`ESC` controls unchanged. In Stage
+5 it can open a native guided face-shot capture window with a registered face
+queue, webcam/RealSense/video source settings, calibration and registry paths,
+output layout, expected manifest path, stable-tag auto-capture for missing
+faces, and retake controls for already captured faces. Users can start the full
+missing-face batch, capture a selected subset, or capture one current face.
+The Stage 5 dashboard and capture window keep manifest-backed saved shots
+collapsed into a compact thumbnail stack; clicking the stack opens its
+individual shots, previews the selected shot, and shows raw/annotated/metadata
+paths. Copy Command keeps the
+`posetag-capture-face` OpenCV CLI fallback. Stage
+5 status is coverage-based: it is complete only when
+every registered board face has at least one valid saved raw image, annotated
+image, metadata JSON, and `shots/manifest.csv` row. The
 calibration capture window also shows
 state-driven guidance based on detected ChArUco corners and accepted sample
 coverage, such as moving the board toward missing frame edges/corners or
@@ -533,13 +546,17 @@ Detailed workflow notes: [`docs/workflows/step3_capture_face.md`](docs/workflows
 
 **Quick start**
 
+In the GUI, open Stage 5 and use **Start Batch** for the guided face-shot queue;
+use **Capture Selected** or **Capture Current** for a smaller run. The command
+below is the reproducible CLI fallback.
+
 ```bash
 posetag-capture-face --project_root my_project \
   --source opencv --cam 0 \
   --object_name connection_plate_white
 # Optional UI sizing
-#   --panel_w 560
-#   --recent_w 480
+#   --panel_w 420
+#   --recent_w 320
 # Optional saving layout / manifest
 #   --layout {flat,by_object,by_object_side,split_type}
 #   --manifest shots/manifest.csv
@@ -560,6 +577,8 @@ regular USB webcam or laptop camera.
 
 - Outputs live under your active project:
   `<root>/shots/<object_base>/side<Side>/..._{raw,ann}.png` and `..._meta.json`
+- The GUI and CLI both write raw images, annotated images, metadata JSON, and
+  `shots/manifest.csv` rows.
 - `--manifest` appends rows to `<root>/shots/manifest.csv`
 - `--calib` and `--registry` default to
   `<root>/calib/calib_color.yaml` and `<root>/boards/tag_registry.yaml`
@@ -574,7 +593,8 @@ regular USB webcam or laptop camera.
 
 - `o` picker with arrow keys or `W/S/K/J`, `Enter` to select
 - `a` auto-side on or off
-- `f` cycle faces when auto mode is off
+- `Left` / `Right`, `f` / `n`, or `[` / `]` cycle faces and switch to manual
+  face selection
 - `ENTER` save, with double-press within 3 seconds to force a save if expected
   tags are missing
 - `g` panels, `h` help, `q` or `ESC` quit
@@ -587,7 +607,7 @@ You can pass either a base object name such as
 
 ```bash
 posetag-capture-face --layout split_type --raw_dir shots/images --ann_dir shots/ann --meta_dir shots/meta
-posetag-capture-face --panel_w 560 --recent_w 480
+posetag-capture-face --panel_w 420 --recent_w 320
 ```
 
 ```text
@@ -603,6 +623,23 @@ shots/
 tag IDs, validation status, camera intrinsics, image size, timestamp, and save
 paths. `shots/manifest.csv` appends one row per saved shot with the same core
 provenance fields.
+
+**Guided GUI Stage 5**
+
+The optional `posetag-gui` dashboard exposes this workflow as guided Stage 5
+after Stage 4 board definitions are valid. It shows the registered face queue
+from `boards/tag_registry.yaml`, validates calibration, registry, source,
+video, and output settings, and can launch `posetag-capture-face` in the
+current Python environment. Like Stage 4, it has a batch action for all
+missing faces, a selected-subset action from the queue, and a current-face
+action for one-off captures. The OpenCV capture window remains the capture UI,
+but GUI launches default to stable-tag auto-capture; `ENTER` still saves
+manually, and queue rows can be selected with mouse clicks, scroll/trackpad
+gestures, or arrow keys. The dashboard streams process output, keeps a
+copyable command fallback, shows saved face-shot thumbnails from the manifest,
+and refreshes coverage when `shots/manifest.csv` is written or updated.
+When reopening capture on an existing project, the OpenCV saved-preview panel
+loads recent manifest images instead of starting empty.
 
 **Alternative layouts**
 

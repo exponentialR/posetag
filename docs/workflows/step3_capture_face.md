@@ -92,8 +92,69 @@ posetag-capture-face --project_root my_project \
   --object_name connection_plate_white_sideA
 ```
 
+Queue all registered faces with stable-tag auto-capture:
+
+```bash
+posetag-capture-face --project_root my_project \
+  --source opencv --cam 0 \
+  --capture_all --auto_capture --exit_when_complete
+```
+
+Queue a selected subset of registered faces:
+
+```bash
+posetag-capture-face --project_root my_project \
+  --source opencv --cam 0 \
+  --queue_face connection_plate_white_sideA \
+  --queue_face connection_plate_white_sideB \
+  --auto_capture --exit_when_complete
+```
+
 The default source remains `realsense` for compatibility with the legacy script.
 For a normal USB webcam, pass `--source opencv --cam 0` explicitly.
+
+## Guided GUI Stage 5 Flow
+
+The optional `posetag-gui` dashboard presents face-shot capture as Stage 5 in
+the calibration-first workflow. The preferred GUI path opens a native
+batch-guided capture window that uses shared PoseTag workflow/pipeline helpers
+for camera or video frames, AprilTag detection, overlays, metadata writing, and
+manifest updates. The `posetag-capture-face` OpenCV CLI remains the
+reproducible terminal fallback.
+
+The Stage 5 panel:
+
+- reads registered object bases and full face names from
+  `boards/tag_registry.yaml`
+- shows the registered face capture queue with captured/missing status
+- opens a Stage-4-style batch window for all missing faces, a selected subset,
+  or the current face
+- supports mouse/trackpad scrolling and clicks on the queue; selecting an
+  already captured face enables Retake Now
+- shows a saved-shot gallery from `shots/manifest.csv`, collapsed into a
+  compact thumbnail stack; clicking or double-clicking the stack opens its
+  individual shots, previews the selected saved shot, and shows its
+  raw/annotated/metadata paths
+- offers batch capture, selected-face capture, and current-face capture actions
+- validates the calibration YAML, registry, selected object/face or queue, source,
+  video path, and output paths before launch
+- supports webcam/OpenCV, RealSense, and video sources
+- writes the same raw image, annotated image, metadata JSON, and manifest row
+  as the CLI workflow
+- previews the exact `posetag-capture-face` command and keeps a copy-command
+  fallback
+- starts native queue mode with stable-tag auto-capture enabled by default
+- refreshes project status when `shots/manifest.csv` appears or changes
+
+The CLI/OpenCV capture window also loads recent manifest images at startup, so
+an already captured project shows saved-shot previews instead of an empty
+"waiting for first save" panel when you use the terminal fallback.
+
+Stage 5 status is coverage-based. It is complete only when every registered
+board face has at least one valid saved shot with existing raw image,
+annotated image, metadata JSON, and manifest row. Partial coverage, missing
+files, malformed metadata, or shots saved with `validation_ok: false` keep the
+stage in a missing or needs-attention state.
 
 ## Object And Face Selection
 
@@ -106,17 +167,31 @@ When a base object is supplied, PoseTag keeps auto-side mode enabled and selects
 the best registered face by overlap between expected and detected tag IDs. When
 a full face is supplied, PoseTag uses that face directly.
 
-If `--object_name` is omitted, the OpenCV viewer starts in an object picker
-using the registered bases from `boards/tag_registry.yaml`.
+If `--object_name` is omitted, the OpenCV viewer starts from the registered
+face queue. Use `--capture_all` to queue every registered face explicitly.
+Use repeated `--queue_face` arguments to capture a selected subset.
+
+The optional auto-capture controls are:
+
+- `--auto_capture`: save automatically when the selected face is valid and
+  stable.
+- `--auto_capture_frames`: number of consecutive valid frames required before
+  auto-save.
+- `--auto_capture_cooldown`: minimum seconds between auto-saves.
+- `--exit_when_complete`: exit cleanly after every queued face has been saved.
 
 ## Viewer Controls
 
 - `ENTER`: save the current frame.
 - `ENTER` twice within 3 seconds: force-save when expected tags are missing.
-- `o`: open the object picker.
-- Up/down or `W` / `S` / `K` / `J`: move in the picker.
+- click a visible queue row: select that face.
+- mouse wheel or trackpad scroll: move through the face queue.
+- arrow keys: move through the face queue, including macOS/OpenCV arrow codes.
+- `o`: open the face queue picker.
+- Up/down or `W` / `S` / `K` / `J`: move in the queue picker.
 - `a`: toggle auto-side mode.
-- `f`: cycle faces when auto-side mode is off.
+- `Left` / `Right`, `f` / `n`, or `[` / `]`: cycle faces and switch to
+  manual face selection.
 - `g`: toggle gallery panels.
 - `h`: toggle help overlay.
 - `q` or `ESC`: quit cleanly without saving another shot.
