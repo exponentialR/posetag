@@ -1,5 +1,5 @@
 from __future__ import annotations
-import argparse, json, sys, math
+import argparse, glob, json, sys, math
 from pathlib import Path
 from typing import List, Optional, Tuple
 
@@ -29,7 +29,7 @@ PILL = {
     "info": ((229,238,249), (70,95,160)),
 }
 
-MESH_EXTS = {".obj", ".ply", ".stl", ".glb", ".gltf", ".off"}
+MESH_EXTS = {".obj", ".ply", ".stl"}
 
 def state_path(project_root: Path) -> Path:
     return project_root / "canonical_keypoints" / ".state.json"
@@ -63,9 +63,15 @@ def save_state(project_root: Path, **kwargs):
 def find_meshes(project_root: Path, pattern: Optional[str], single_path: Optional[str]) -> List[Path]:
     if single_path:
         p = Path(single_path)
-        return [p] if p.exists() else []
+        p = p if p.is_absolute() else project_root / p
+        return [p] if p.exists() and p.suffix.lower() in MESH_EXTS else []
     if pattern:
-        return sorted([p for p in Path().glob(pattern) if p.suffix.lower() in MESH_EXTS])
+        raw_pattern = Path(pattern)
+        if raw_pattern.is_absolute():
+            matches = (Path(p) for p in glob.glob(pattern, recursive=True))
+        else:
+            matches = project_root.glob(pattern)
+        return sorted([p for p in matches if p.suffix.lower() in MESH_EXTS])
     meshes_dir = project_root / "meshes"
     return sorted([p for p in meshes_dir.rglob("*") if p.suffix.lower() in MESH_EXTS])
 
@@ -676,4 +682,3 @@ def render_mesh_thumb(path: Path, target_h=UI_H, target_w=UI_W_LEFT) -> np.ndarr
     # Fallback: label only
     cv2.putText(bg, path.name, (12, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,255), 2, cv2.LINE_AA)
     return bg
-

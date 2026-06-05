@@ -370,10 +370,12 @@ def _ui_browse(project_root: Path, meshes: List[Path], args):
 
 # --------------------- CLI entry ---------------------
 def main():
-    project_root = resolve_project_root(None)
-    ensure_project_dirs(project_root)
-
     ap = argparse.ArgumentParser("Canonical keypoints from meshes")
+    ap.add_argument(
+        "--project_root",
+        default=None,
+        help="PoseTag project root. Defaults to the active project resolution rules.",
+    )
     ap.add_argument("--browse", action="store_true", help="Open browse UI")
     ap.add_argument("--mode", choices=["auto", "manual"], default="auto")
     ap.add_argument("--mesh", type=str, default=None, help="Process a single mesh path")
@@ -385,6 +387,9 @@ def main():
     ap.add_argument("--view", choices=["yes", "no", "prompt"], default="prompt",
                     help="Open viewer after generation")
     args = ap.parse_args()
+
+    project_root = resolve_project_root(args.project_root)
+    ensure_project_dirs(project_root)
 
     meshes = find_meshes(project_root, args.glob, args.mesh)
     if not meshes:

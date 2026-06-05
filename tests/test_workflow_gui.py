@@ -48,11 +48,15 @@ from posetag.gui.main_window import (
     _format_capture_face_saved_shot_details,
     _format_charuco_outputs,
     _format_health_counts,
+    _format_mesh_keypoint_details,
     _format_object_tag_expected_output,
     _format_object_tag_outputs,
     _format_object_tag_readiness,
     _group_capture_face_saved_shots,
     _health_status_style,
+    _mesh_keypoint_command_card_note,
+    _mesh_keypoint_command_ready_message,
+    _mesh_keypoint_list_item,
     _project_root_hint,
     _stage_list_label,
     _stage_rail_dot_style,
@@ -89,6 +93,7 @@ from posetag.workflows.object_tags import (
     ObjectTagGenerationReadiness,
     ObjectTagGenerationResult,
 )
+from posetag.workflows.mesh_keypoints import MeshKeypointObjectStatus
 from posetag.gui.models import inspect_project_view, project_health_view
 from posetag.workflows.commands import command_preview
 
@@ -173,7 +178,7 @@ class WorkflowGuiTests(unittest.TestCase):
             project_root = Path(tmpdir) / "project with spaces"
             models = inspect_project_view(project_root)
 
-        self.assertEqual(len(models), 9)
+        self.assertEqual(len(models), 10)
         self.assertEqual(models[0].stage_id, 0)
         self.assertEqual(models[0].status, "missing")
         self.assertIn("posetag project new", models[0].command_preview)
@@ -182,7 +187,9 @@ class WorkflowGuiTests(unittest.TestCase):
         self.assertIn("posetag-gen-tags", models[3].command_preview)
         self.assertIn("--project_root", models[3].command_preview)
         self.assertIn("posetag-make-board", models[4].command_preview)
-        self.assertEqual(models[8].command_preview, "")
+        self.assertIn("posetag-gen-keypoints", models[6].command_preview)
+        self.assertIn("posetag-annotate", models[7].command_preview)
+        self.assertEqual(models[9].command_preview, "")
 
     def test_project_health_view_handles_empty_project_state(self) -> None:
         with TemporaryDirectory() as tmpdir:
@@ -270,13 +277,47 @@ class WorkflowGuiTests(unittest.TestCase):
     def test_legacy_command_previews_use_selected_project_env(self) -> None:
         project_root = Path("/tmp/PoseTag project")
 
+        keypoints_preview = command_preview("generate_mesh_keypoints", project_root)
         annotate_preview = command_preview("annotate_faces", project_root)
         collect_preview = command_preview("collect_dataset", project_root)
 
+        self.assertIn("posetag-gen-keypoints", keypoints_preview)
+        self.assertIn("OBJECT.obj", keypoints_preview)
+        self.assertIn("OBJECT_NAME", keypoints_preview)
         self.assertIn("env 'POSETAG_PROJECT=/tmp/PoseTag project'", annotate_preview)
         self.assertIn("posetag-annotate --browse", annotate_preview)
         self.assertIn("env 'POSETAG_PROJECT=/tmp/PoseTag project'", collect_preview)
         self.assertIn("posetag-collect --mode live", collect_preview)
+
+    def test_mesh_keypoint_command_preview_uses_inferred_object(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            project_root = Path(tmpdir) / "project"
+            boards_dir = project_root / "boards"
+            boards_dir.mkdir(parents=True)
+            for object_name in (
+                "column_white_front",
+                "column_white_back",
+                "connection_plate_white_sideA",
+            ):
+                (boards_dir / f"{object_name}.yaml").write_text(
+                    yaml.safe_dump(
+                        {
+                            "object": object_name,
+                            "family": "tag36h11",
+                            "tag_size_m": 0.04,
+                            "origin_id": 1,
+                            "tags": [{"id": 1, "cx": 0.0, "cy": 0.0}],
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+
+            preview = command_preview("generate_mesh_keypoints", project_root)
+
+            self.assertIn("posetag-gen-keypoints", preview)
+            self.assertIn("meshes/column_white.obj", preview)
+            self.assertIn("--object_name column_white", preview)
+            self.assertNotIn("column_white_front.obj", preview)
 
     def test_command_copy_confirmation_text_is_explicit(self) -> None:
         self.assertEqual(
@@ -298,13 +339,19 @@ class WorkflowGuiTests(unittest.TestCase):
     def test_complete_stage_command_copy_reads_as_secondary_rerun(self) -> None:
         complete = SimpleNamespace(
             status="complete",
+            key="generate_charuco_board",
             command_preview="posetag-gen-charuco --project_root project",
         )
         missing = SimpleNamespace(
             status="missing",
+            key="generate_object_tags",
             command_preview="posetag-gen-tags --project_root project",
         )
-        no_command = SimpleNamespace(status="not_applicable", command_preview="")
+        no_command = SimpleNamespace(
+            status="not_applicable",
+            key="review_export",
+            command_preview="",
+        )
 
         self.assertEqual(_command_card_title(complete), "Rerun command")
         self.assertEqual(_command_button_label(complete), "Copy Rerun")
@@ -331,6 +378,61 @@ class WorkflowGuiTests(unittest.TestCase):
         self.assertEqual(
             _command_card_note(no_command),
             "No command preview is defined for this stage.",
+        )
+
+    def test_mesh_keypoint_panel_text_makes_obj_import_visible(self) -> None:
+        status = MeshKeypointObjectStatus(
+            object_name="column_white",
+            faces=("back", "front"),
+            sources=("boards/*.yaml",),
+            mesh_path=Path("/tmp/project/meshes/column_white.obj"),
+            keypoints_path=Path("/tmp/project/objects/column_white/keypoints.json"),
+            mesh_exists=False,
+            keypoints_exists=False,
+            keypoints_valid=False,
+            keypoints_errors=(),
+            command_preview=(
+                "posetag-gen-keypoints --project_root /tmp/project "
+                "--mesh /tmp/project/meshes/column_white.obj "
+                "--object_name column_white"
+            ),
+        )
+        model = SimpleNamespace(status="missing", key="generate_mesh_keypoints")
+
+        row = _mesh_keypoint_list_item(status)
+        details = _format_mesh_keypoint_details(status)
+        note = _mesh_keypoint_command_card_note((status,), model)
+        ready = _mesh_keypoint_command_ready_message((status,))
+
+        self.assertIn("column_white", row)
+        self.assertIn("mesh missing", row)
+        self.assertIn("keypoints missing", row)
+        self.assertIn("Mesh OBJ:", details)
+        self.assertIn("meshes/column_white.obj", details)
+        self.assertIn(
+            "Stage status: mesh input and keypoints JSON still need generation.",
+            details,
+        )
+        self.assertIn("Import OBJ", note)
+        self.assertIn("objects/<object>/keypoints.json", note)
+        self.assertIn("Stage 6 remains missing", note)
+        self.assertEqual(
+            ready,
+            "1 object needs OBJ mesh input; 1 object needs keypoints JSON.",
+        )
+        self.assertIn("object geometry inputs panel", _command_card_note(model))
+
+        staged_status = replace(status, mesh_exists=True)
+        staged_details = _format_mesh_keypoint_details(staged_status)
+        staged_ready = _mesh_keypoint_command_ready_message((staged_status,))
+        self.assertIn(
+            "Stage status: mesh input is staged; keypoints JSON still needs "
+            "generation.",
+            staged_details,
+        )
+        self.assertEqual(
+            staged_ready,
+            "0 objects need OBJ mesh input; 1 object needs keypoints JSON.",
         )
 
     def test_project_root_hint_does_not_create_empty_project(self) -> None:
@@ -388,6 +490,8 @@ class WorkflowGuiTests(unittest.TestCase):
         self.assertIn("QLabel#RailStageStatus", style)
         self.assertIn("QLabel#CharucoPreviewCanvas", style)
         self.assertIn("QLabel#ObjectTagPreviewCanvas", style)
+        self.assertIn("QLabel#MeshKeypointPreview", style)
+        self.assertIn("QListWidget#MeshKeypointObjectList", style)
         self.assertIn("QPlainTextEdit#CalibrationYamlView", style)
         self.assertIn("monospace", style)
         self.assertIn("font-weight: 800", style)
@@ -854,7 +958,7 @@ class WorkflowGuiTests(unittest.TestCase):
         self.assertIn("<b>2</b>", counts)
         self.assertIn("href='stage-status:not_applicable'", counts)
         self.assertIn(">Not applicable</a>", counts)
-        self.assertIn("<b>7</b>", counts)
+        self.assertIn("<b>8</b>", counts)
         self.assertIn("<td>Complete</td>", counts)
 
         status_style = _health_status_style(

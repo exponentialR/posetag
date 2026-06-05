@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import html
+import math
+import shutil
 from pathlib import Path
 from typing import Any, Mapping, Optional, Sequence
 
@@ -166,6 +168,13 @@ from posetag.workflows.object_tags import (
     default_output_dir as default_object_tag_output_dir,
     generate_object_tags,
     inspect_object_tag_generation,
+)
+from posetag.workflows.mesh_keypoints import (
+    MeshKeypointObjectStatus,
+    MeshVertexPreview,
+    inspect_keypoint_object_statuses,
+    load_obj_vertex_preview,
+    supported_mesh_extensions,
 )
 
 CAPTURE_FACE_QUEUE_LABEL = "All missing registered faces"
@@ -377,6 +386,402 @@ def build_main_window(qt: Any, project_root: Path) -> Any:
                 QtCore.Qt.TransformationMode.SmoothTransformation,
             )
             self.setPixmap(scaled)
+
+    class _MeshPreviewCanvas(_ImagePreviewCanvas):
+        def __init__(self) -> None:
+            super().__init__(
+                "Select an inferred object to preview its staged OBJ mesh.",
+                object_name="MeshKeypointPreview",
+            )
+            self.setMinimumSize(560, 420)
+            self.setMaximumHeight(540)
+            self.setSizePolicy(
+                QtWidgets.QSizePolicy.Policy.Expanding,
+                QtWidgets.QSizePolicy.Policy.Expanding,
+            )
+            self.setMouseTracking(True)
+            self.setCursor(QtCore.Qt.CursorShape.OpenHandCursor)
+            self.setToolTip(
+                "Left-drag rotates the OBJ preview. Right-drag or middle-drag "
+                "pans. Mouse wheel zooms."
+            )
+            self._preview: Optional[MeshVertexPreview] = None
+            self._rotation_x = -0.35
+            self._rotation_y = 0.55
+            self._zoom = 1.0
+            self._pan_x = 0.0
+            self._pan_y = 0.0
+            self._last_mouse_pos: Optional[tuple[float, float]] = None
+
+        def show_status(self, status: Optional[MeshKeypointObjectStatus]) -> bool:
+            if status is None:
+                self._preview = None
+                self.clear_preview(
+                    "Select an inferred object to preview its staged OBJ mesh."
+                )
+                return False
+            if not status.mesh_exists:
+                self._preview = None
+                self.clear_preview(
+                    "OBJ mesh not staged yet.\n\n"
+                    f"Expected:\n{status.mesh_path}\n\n"
+                    "Use Import OBJ or copy a mesh into the project meshes folder."
+                )
+                return False
+            try:
+                preview = load_obj_vertex_preview(status.mesh_path)
+            except Exception as exc:
+                self._preview = None
+                self.clear_preview(f"Mesh preview unavailable:\n{exc}")
+                return False
+            self._preview = preview
+            self.reset_view()
+            return True
+
+        def reset_view(self) -> None:
+            self._rotation_x = -0.35
+            self._rotation_y = 0.55
+            self._zoom = 1.0
+            self._pan_x = 0.0
+            self._pan_y = 0.0
+            self._render_current()
+
+        def mousePressEvent(self, event: Any) -> None:
+            self._last_mouse_pos = _event_xy(event)
+            if self._preview is not None:
+                self.setCursor(QtCore.Qt.CursorShape.ClosedHandCursor)
+                event.accept()
+                return
+            super().mousePressEvent(event)
+
+        def mouseReleaseEvent(self, event: Any) -> None:
+            self._last_mouse_pos = None
+            self.setCursor(QtCore.Qt.CursorShape.OpenHandCursor)
+            if self._preview is not None:
+                event.accept()
+                return
+            super().mouseReleaseEvent(event)
+
+        def mouseMoveEvent(self, event: Any) -> None:
+            if self._preview is None or self._last_mouse_pos is None:
+                super().mouseMoveEvent(event)
+                return
+            current = _event_xy(event)
+            dx = current[0] - self._last_mouse_pos[0]
+            dy = current[1] - self._last_mouse_pos[1]
+            self._last_mouse_pos = current
+            buttons = event.buttons()
+            if buttons & QtCore.Qt.MouseButton.LeftButton:
+                self._rotation_y += dx * 0.01
+                self._rotation_x += dy * 0.01
+                self._rotation_x = max(
+                    -math.pi / 2,
+                    min(math.pi / 2, self._rotation_x),
+                )
+                self._render_current()
+                event.accept()
+                return
+            elif (
+                buttons & QtCore.Qt.MouseButton.RightButton
+                or buttons & QtCore.Qt.MouseButton.MiddleButton
+            ):
+                self._pan_x += dx
+                self._pan_y += dy
+                self._render_current()
+                event.accept()
+                return
+            super().mouseMoveEvent(event)
+
+        def wheelEvent(self, event: Any) -> None:
+            if self._preview is None:
+                super().wheelEvent(event)
+                return
+            delta = event.angleDelta().y()
+            if delta:
+                factor = 1.15 if delta > 0 else 1.0 / 1.15
+                self._zoom = max(0.25, min(8.0, self._zoom * factor))
+                self._render_current()
+                event.accept()
+                return
+            super().wheelEvent(event)
+
+        def resizeEvent(self, event: Any) -> None:
+            if self._preview is not None:
+                self._render_current()
+            else:
+                super().resizeEvent(event)
+
+        def _render_current(self) -> None:
+            if self._preview is None:
+                return
+            self.show_pixmap(
+                _mesh_preview_pixmap(
+                    self._preview,
+                    rotation_x=self._rotation_x,
+                    rotation_y=self._rotation_y,
+                    zoom=self._zoom,
+                    pan_x=self._pan_x,
+                    pan_y=self._pan_y,
+                )
+            )
+
+    def _mesh_preview_pixmap(
+        preview: MeshVertexPreview,
+        *,
+        rotation_x: float,
+        rotation_y: float,
+        zoom: float,
+        pan_x: float,
+        pan_y: float,
+    ) -> Any:
+        width = 1040
+        height = 640
+        canvas = QtGui.QPixmap(width, height)
+        canvas.fill(QtGui.QColor("#f8fbfd"))
+        painter = QtGui.QPainter(canvas)
+        try:
+            painter.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing, True)
+            painter.setPen(QtGui.QColor("#102235"))
+            title_font = painter.font()
+            title_font.setBold(True)
+            title_font.setPointSize(11)
+            painter.setFont(title_font)
+            painter.drawText(
+                QtCore.QRect(16, 10, width - 32, 24),
+                QtCore.Qt.AlignmentFlag.AlignLeft,
+                preview.path.name,
+            )
+
+            meta_font = painter.font()
+            meta_font.setBold(False)
+            meta_font.setPointSize(9)
+            painter.setFont(meta_font)
+            painter.setPen(QtGui.QColor("#51667b"))
+            painter.drawText(
+                QtCore.QRect(16, 34, width - 32, 20),
+                QtCore.Qt.AlignmentFlag.AlignLeft,
+                (
+                    f"{preview.vertex_count} vertices; "
+                    f"showing {len(preview.sampled_vertices)}; "
+                    "interactive OBJ viewport"
+                ),
+            )
+
+            _draw_mesh_interactive_view(
+                painter,
+                QtCore.QRect(16, 62, width - 32, height - 82),
+                preview,
+                rotation_x=rotation_x,
+                rotation_y=rotation_y,
+                zoom=zoom,
+                pan_x=pan_x,
+                pan_y=pan_y,
+            )
+        finally:
+            painter.end()
+        return canvas
+
+    def _draw_mesh_interactive_view(
+        painter: Any,
+        rect: Any,
+        preview: MeshVertexPreview,
+        *,
+        rotation_x: float,
+        rotation_y: float,
+        zoom: float,
+        pan_x: float,
+        pan_y: float,
+    ) -> None:
+        painter.fillRect(rect, QtGui.QColor("#ffffff"))
+        painter.setPen(QtGui.QPen(QtGui.QColor("#bfd3e0"), 1))
+        painter.drawRoundedRect(rect.adjusted(0, 0, -1, -1), 6, 6)
+
+        painter.setPen(QtGui.QPen(QtGui.QColor("#d6e3ec"), 1))
+        grid_step = max(28, rect.width() // 10)
+        for x in range(rect.left() + grid_step, rect.right(), grid_step):
+            painter.drawLine(x, rect.top() + 12, x, rect.bottom() - 12)
+        for y in range(rect.top() + grid_step, rect.bottom(), grid_step):
+            painter.drawLine(rect.left() + 12, y, rect.right() - 12, y)
+
+        projected_points = [
+            _project_mesh_vertex(
+                vertex,
+                preview,
+                rect,
+                rotation_x=rotation_x,
+                rotation_y=rotation_y,
+                zoom=zoom,
+                pan_x=pan_x,
+                pan_y=pan_y,
+            )
+            for vertex in preview.sampled_vertices
+        ]
+        projected_points.sort(key=lambda item: item[2])
+
+        painter.save()
+        painter.setClipRect(rect.adjusted(1, 1, -1, -1))
+        painter.setPen(QtGui.QPen(QtGui.QColor("#7897aa"), 1))
+        painter.setBrush(QtGui.QColor("#0b6f8f"))
+        for x, y, depth in projected_points:
+            radius = max(1.5, min(3.4, 2.2 + depth * 0.35))
+            painter.drawEllipse(QtCore.QPointF(x, y), radius, radius)
+
+        corners = _preview_bounds_corners(preview)
+        projected_corners = [
+            _project_mesh_vertex(
+                corner,
+                preview,
+                rect,
+                rotation_x=rotation_x,
+                rotation_y=rotation_y,
+                zoom=zoom,
+                pan_x=pan_x,
+                pan_y=pan_y,
+            )
+            for corner in corners
+        ]
+        painter.setBrush(QtCore.Qt.BrushStyle.NoBrush)
+        painter.setPen(QtGui.QPen(QtGui.QColor("#e07a38"), 1.6))
+        for start, end in _BOX_EDGES:
+            painter.drawLine(
+                QtCore.QPointF(
+                    projected_corners[start][0],
+                    projected_corners[start][1],
+                ),
+                QtCore.QPointF(
+                    projected_corners[end][0],
+                    projected_corners[end][1],
+                ),
+            )
+        painter.restore()
+
+        _draw_preview_axes(
+            painter,
+            rect,
+            rotation_x=rotation_x,
+            rotation_y=rotation_y,
+        )
+
+    _BOX_EDGES = (
+        (0, 1),
+        (0, 2),
+        (0, 4),
+        (3, 1),
+        (3, 2),
+        (3, 7),
+        (5, 1),
+        (5, 4),
+        (5, 7),
+        (6, 2),
+        (6, 4),
+        (6, 7),
+    )
+
+    def _project_mesh_vertex(
+        vertex: tuple[float, float, float],
+        preview: MeshVertexPreview,
+        rect: Any,
+        *,
+        rotation_x: float,
+        rotation_y: float,
+        zoom: float,
+        pan_x: float,
+        pan_y: float,
+    ) -> tuple[float, float, float]:
+        x, y, z = _normalised_vertex(vertex, preview)
+        rotated = _rotate_preview_point(x, y, z, rotation_x, rotation_y)
+        depth = 3.0 + rotated[2]
+        scale = min(rect.width(), rect.height()) * 0.72 * zoom
+        if depth <= 0.25:
+            depth = 0.25
+        screen_x = rect.center().x() + pan_x + (rotated[0] / depth) * scale
+        screen_y = rect.center().y() + pan_y - (rotated[1] / depth) * scale
+        return screen_x, screen_y, rotated[2]
+
+    def _normalised_vertex(
+        vertex: tuple[float, float, float],
+        preview: MeshVertexPreview,
+    ) -> tuple[float, float, float]:
+        center = tuple(
+            (preview.bounds_min[index] + preview.bounds_max[index]) / 2.0
+            for index in range(3)
+        )
+        spans = tuple(
+            preview.bounds_max[index] - preview.bounds_min[index]
+            for index in range(3)
+        )
+        scale = max(max(spans), 1e-9)
+        return tuple((vertex[index] - center[index]) / scale for index in range(3))
+
+    def _rotate_preview_point(
+        x: float,
+        y: float,
+        z: float,
+        rotation_x: float,
+        rotation_y: float,
+    ) -> tuple[float, float, float]:
+        cy = math.cos(rotation_y)
+        sy = math.sin(rotation_y)
+        xz_x = cy * x + sy * z
+        xz_z = -sy * x + cy * z
+
+        cx = math.cos(rotation_x)
+        sx = math.sin(rotation_x)
+        yz_y = cx * y - sx * xz_z
+        yz_z = sx * y + cx * xz_z
+        return xz_x, yz_y, yz_z
+
+    def _preview_bounds_corners(
+        preview: MeshVertexPreview,
+    ) -> tuple[tuple[float, float, float], ...]:
+        xmin, ymin, zmin = preview.bounds_min
+        xmax, ymax, zmax = preview.bounds_max
+        return (
+            (xmin, ymin, zmin),
+            (xmin, ymin, zmax),
+            (xmin, ymax, zmin),
+            (xmin, ymax, zmax),
+            (xmax, ymin, zmin),
+            (xmax, ymin, zmax),
+            (xmax, ymax, zmin),
+            (xmax, ymax, zmax),
+        )
+
+    def _draw_preview_axes(
+        painter: Any,
+        rect: Any,
+        *,
+        rotation_x: float,
+        rotation_y: float,
+    ) -> None:
+        origin = QtCore.QPointF(rect.left() + 42, rect.bottom() - 36)
+        axes = (
+            ("X", (1.0, 0.0, 0.0), "#d84f31"),
+            ("Y", (0.0, 1.0, 0.0), "#16884c"),
+            ("Z", (0.0, 0.0, 1.0), "#236fb4"),
+        )
+        for label, vector, color in axes:
+            rotated = _rotate_preview_point(
+                vector[0],
+                vector[1],
+                vector[2],
+                rotation_x,
+                rotation_y,
+            )
+            end = QtCore.QPointF(
+                origin.x() + rotated[0] * 26,
+                origin.y() - rotated[1] * 26,
+            )
+            painter.setPen(QtGui.QPen(QtGui.QColor(color), 2))
+            painter.drawLine(origin, end)
+            painter.drawText(end + QtCore.QPointF(3, -3), label)
+
+    def _event_xy(event: Any) -> tuple[float, float]:
+        if hasattr(event, "position"):
+            pos = event.position()
+        else:  # pragma: no cover - Qt5 compatibility
+            pos = event.pos()
+        return float(pos.x()), float(pos.y())
 
     def _pixmap_from_bgr_frame(frame: Any) -> Any:
         if frame is None:
@@ -3708,6 +4113,142 @@ def build_main_window(qt: Any, project_root: Path) -> Any:
             capture_face_layout.addLayout(capture_summary_grid)
             capture_face_layout.addLayout(capture_action_row)
 
+            self._mesh_keypoints_card = QtWidgets.QFrame()
+            self._mesh_keypoints_card.setObjectName("ActionCard")
+            mesh_keypoints_layout = QtWidgets.QVBoxLayout(self._mesh_keypoints_card)
+            mesh_keypoints_layout.setContentsMargins(14, 12, 14, 12)
+            mesh_keypoints_layout.setSpacing(9)
+
+            mesh_keypoints_title = QtWidgets.QLabel("Object geometry inputs")
+            mesh_keypoints_title.setObjectName("CardTitle")
+            mesh_keypoints_note = QtWidgets.QLabel(
+                "Match each inferred PoseTag object to one OBJ mesh, then "
+                "generate the annotation-ready keypoints JSON. Mesh import "
+                "stages the input; Stage 6 completes only after "
+                "objects/<object>/keypoints.json exists and validates."
+            )
+            mesh_keypoints_note.setObjectName("MutedText")
+            mesh_keypoints_note.setWordWrap(True)
+
+            self._mesh_keypoint_objects = QtWidgets.QListWidget()
+            self._mesh_keypoint_objects.setObjectName("MeshKeypointObjectList")
+            self._mesh_keypoint_objects.setMinimumHeight(150)
+            self._mesh_keypoint_objects.setMaximumHeight(420)
+            self._mesh_keypoint_objects.setSelectionMode(
+                QtWidgets.QAbstractItemView.SelectionMode.SingleSelection
+            )
+            self._mesh_keypoint_objects.itemSelectionChanged.connect(
+                self._update_mesh_keypoint_selection
+            )
+
+            self._mesh_keypoint_details = QtWidgets.QLabel()
+            self._mesh_keypoint_details.setObjectName("OutputText")
+            self._mesh_keypoint_details.setWordWrap(True)
+            self._mesh_keypoint_details.setTextInteractionFlags(
+                QtCore.Qt.TextInteractionFlag.TextSelectableByMouse
+            )
+
+            self._mesh_keypoint_preview = _MeshPreviewCanvas()
+
+            self._mesh_keypoint_object_command = QtWidgets.QLineEdit()
+            self._mesh_keypoint_object_command.setObjectName("CommandPreview")
+            self._mesh_keypoint_object_command.setReadOnly(True)
+            self._mesh_keypoint_object_command.setPlaceholderText(
+                "Select an inferred object to preview its command."
+            )
+            self._mesh_keypoint_copy_object_button = QtWidgets.QPushButton(
+                "Copy Object Command"
+            )
+            self._mesh_keypoint_copy_object_button.setObjectName(
+                "SecondaryActionButton"
+            )
+            self._mesh_keypoint_copy_object_button.clicked.connect(
+                self._copy_selected_mesh_keypoint_command
+            )
+            mesh_object_command_row = QtWidgets.QHBoxLayout()
+            mesh_object_command_row.setContentsMargins(0, 0, 0, 0)
+            mesh_object_command_row.addWidget(
+                self._mesh_keypoint_object_command,
+                1,
+            )
+            mesh_object_command_row.addWidget(
+                self._mesh_keypoint_copy_object_button
+            )
+            mesh_object_command_widget = QtWidgets.QWidget()
+            mesh_object_command_widget.setLayout(mesh_object_command_row)
+
+            mesh_keypoints_body = QtWidgets.QHBoxLayout()
+            mesh_keypoints_body.setContentsMargins(0, 0, 0, 0)
+            mesh_keypoints_body.setSpacing(12)
+            mesh_keypoints_body.addWidget(
+                _make_field("Inferred objects", self._mesh_keypoint_objects),
+                2,
+            )
+            mesh_keypoints_body.addWidget(
+                _make_field("Object preview", self._mesh_keypoint_preview),
+                6,
+            )
+            mesh_keypoints_body.addWidget(
+                _make_field("Selected object", self._mesh_keypoint_details),
+                3,
+            )
+
+            self._mesh_keypoint_import_button = QtWidgets.QPushButton("Import OBJ")
+            self._mesh_keypoint_import_button.setObjectName("PrimaryActionButton")
+            self._mesh_keypoint_import_button.clicked.connect(
+                self._import_mesh_for_selected_object
+            )
+            self._mesh_keypoint_open_meshes_button = QtWidgets.QPushButton(
+                "Open Meshes Folder"
+            )
+            self._mesh_keypoint_open_meshes_button.setObjectName(
+                "SecondaryActionButton"
+            )
+            self._mesh_keypoint_open_meshes_button.clicked.connect(
+                self._open_meshes_folder
+            )
+            self._mesh_keypoint_reset_view_button = QtWidgets.QPushButton(
+                "Reset View"
+            )
+            self._mesh_keypoint_reset_view_button.setObjectName(
+                "SecondaryActionButton"
+            )
+            self._mesh_keypoint_reset_view_button.setToolTip(
+                "Reset the selected OBJ preview pan, zoom, and rotation."
+            )
+            self._mesh_keypoint_reset_view_button.clicked.connect(
+                self._reset_mesh_keypoint_view
+            )
+            self._mesh_keypoint_copy_all_button = QtWidgets.QPushButton(
+                "Copy Missing Commands"
+            )
+            self._mesh_keypoint_copy_all_button.setObjectName("SecondaryActionButton")
+            self._mesh_keypoint_copy_all_button.clicked.connect(
+                self._copy_missing_mesh_keypoint_commands
+            )
+            mesh_keypoints_refresh_button = QtWidgets.QPushButton("Refresh Status")
+            mesh_keypoints_refresh_button.setObjectName("SecondaryActionButton")
+            mesh_keypoints_refresh_button.clicked.connect(self._refresh)
+            mesh_keypoints_action_row = QtWidgets.QHBoxLayout()
+            mesh_keypoints_action_row.addWidget(self._mesh_keypoint_import_button)
+            mesh_keypoints_action_row.addWidget(
+                self._mesh_keypoint_open_meshes_button
+            )
+            mesh_keypoints_action_row.addWidget(
+                self._mesh_keypoint_reset_view_button
+            )
+            mesh_keypoints_action_row.addWidget(self._mesh_keypoint_copy_all_button)
+            mesh_keypoints_action_row.addWidget(mesh_keypoints_refresh_button)
+            mesh_keypoints_action_row.addStretch(1)
+
+            mesh_keypoints_layout.addWidget(mesh_keypoints_title)
+            mesh_keypoints_layout.addWidget(mesh_keypoints_note)
+            mesh_keypoints_layout.addLayout(mesh_keypoints_body)
+            mesh_keypoints_layout.addWidget(
+                _make_field("Selected command", mesh_object_command_widget)
+            )
+            mesh_keypoints_layout.addLayout(mesh_keypoints_action_row)
+
             detail_content = QtWidgets.QWidget()
             detail_content_layout = QtWidgets.QVBoxLayout(detail_content)
             detail_content_layout.setContentsMargins(0, 0, 0, 0)
@@ -3720,6 +4261,7 @@ def build_main_window(qt: Any, project_root: Path) -> Any:
             detail_content_layout.addWidget(self._object_tags_card)
             detail_content_layout.addWidget(self._board_building_card)
             detail_content_layout.addWidget(self._capture_face_card)
+            detail_content_layout.addWidget(self._mesh_keypoints_card)
             detail_content_layout.addWidget(command_card)
             detail_content_layout.addStretch(1)
 
@@ -3878,7 +4420,7 @@ def build_main_window(qt: Any, project_root: Path) -> Any:
             self.statusBar().showMessage(
                 "Dashboard can generate ChArUco board files and prepare "
                 "camera-calibration, object-tag, board-building, and "
-                "face-shot capture workflows."
+                "face-shot capture workflows, plus preview mesh-keypoint commands."
             )
 
             self._render_board_batch_rows()
@@ -4776,6 +5318,7 @@ def build_main_window(qt: Any, project_root: Path) -> Any:
             self._object_tags_card.setVisible(model.stage_id == 3)
             self._board_building_card.setVisible(model.stage_id == 4)
             self._capture_face_card.setVisible(model.stage_id == 5)
+            self._mesh_keypoints_card.setVisible(model.stage_id == 6)
             if model.stage_id == 2:
                 self._sync_calibration_from_project_metadata()
                 self._update_calibration_flow()
@@ -4786,6 +5329,8 @@ def build_main_window(qt: Any, project_root: Path) -> Any:
                 self._update_board_building_flow()
             if model.stage_id == 5:
                 self._update_capture_face_flow()
+            if model.stage_id == 6:
+                self._update_mesh_keypoint_flow()
             self._render_side_panel_calibration_result()
             self._render_stage_rail_selection()
 
@@ -4888,6 +5433,7 @@ def build_main_window(qt: Any, project_root: Path) -> Any:
             self._object_tags_card.setVisible(False)
             self._board_building_card.setVisible(False)
             self._capture_face_card.setVisible(False)
+            self._mesh_keypoints_card.setVisible(False)
             self._render_health()
 
         def _render_stage_rail_selection(self) -> None:
@@ -5173,6 +5719,248 @@ def build_main_window(qt: Any, project_root: Path) -> Any:
                     stage_complete=model.status == "complete",
                 )
             )
+
+        def _update_mesh_keypoint_flow(self) -> None:
+            if not hasattr(self, "_mesh_keypoint_objects"):
+                return
+
+            previous = self._selected_mesh_keypoint_status()
+            previous_name = previous.object_name if previous is not None else ""
+            statuses = inspect_keypoint_object_statuses(self._current_project_root())
+
+            self._mesh_keypoint_objects.blockSignals(True)
+            self._mesh_keypoint_objects.clear()
+            preferred_row = -1
+            first_incomplete_row = -1
+            for row, status in enumerate(statuses):
+                item = QtWidgets.QListWidgetItem(_mesh_keypoint_list_item(status))
+                item.setData(QtCore.Qt.ItemDataRole.UserRole, status)
+                item.setToolTip(_format_mesh_keypoint_details(status))
+                item.setSizeHint(QtCore.QSize(260, 70))
+                item.setForeground(
+                    QtGui.QBrush(QtGui.QColor(_mesh_keypoint_row_color(status)))
+                )
+                self._mesh_keypoint_objects.addItem(item)
+                if status.object_name == previous_name:
+                    preferred_row = row
+                if first_incomplete_row < 0 and not status.keypoints_valid:
+                    first_incomplete_row = row
+
+            if not statuses:
+                item = QtWidgets.QListWidgetItem(
+                    "No objects inferred from boards, registry, or shots."
+                )
+                item.setFlags(QtCore.Qt.ItemFlag.NoItemFlags)
+                self._mesh_keypoint_objects.addItem(item)
+            elif preferred_row >= 0:
+                self._mesh_keypoint_objects.setCurrentRow(preferred_row)
+            elif first_incomplete_row >= 0:
+                self._mesh_keypoint_objects.setCurrentRow(first_incomplete_row)
+            else:
+                self._mesh_keypoint_objects.setCurrentRow(0)
+            self._mesh_keypoint_objects.blockSignals(False)
+            self._update_mesh_keypoint_selection()
+
+            model = self._model_by_stage_id(self._selected_stage_id)
+            if model is None or model.stage_id != 6:
+                return
+            selected = self._selected_mesh_keypoint_status()
+            command = (
+                selected.command_preview
+                if selected is not None
+                else model.command_preview
+            )
+            self._command_preview.setText(command)
+            self._command_preview.setCursorPosition(0)
+            self._copy_button.setEnabled(bool(command))
+            self._command_note.setText(
+                _mesh_keypoint_command_card_note(statuses, model)
+            )
+            self._copy_feedback.setText(
+                _mesh_keypoint_command_ready_message(
+                    statuses,
+                    stage_complete=model.status == "complete",
+                )
+            )
+
+        def _selected_mesh_keypoint_status(
+            self,
+        ) -> Optional[MeshKeypointObjectStatus]:
+            if not hasattr(self, "_mesh_keypoint_objects"):
+                return None
+            item = self._mesh_keypoint_objects.currentItem()
+            if item is None:
+                return None
+            payload = item.data(QtCore.Qt.ItemDataRole.UserRole)
+            if isinstance(payload, MeshKeypointObjectStatus):
+                return payload
+            return None
+
+        def _mesh_keypoint_statuses_from_list(
+            self,
+        ) -> tuple[MeshKeypointObjectStatus, ...]:
+            statuses: list[MeshKeypointObjectStatus] = []
+            if not hasattr(self, "_mesh_keypoint_objects"):
+                return ()
+            for row in range(self._mesh_keypoint_objects.count()):
+                item = self._mesh_keypoint_objects.item(row)
+                if item is None:
+                    continue
+                payload = item.data(QtCore.Qt.ItemDataRole.UserRole)
+                if isinstance(payload, MeshKeypointObjectStatus):
+                    statuses.append(payload)
+            return tuple(statuses)
+
+        def _update_mesh_keypoint_selection(self) -> None:
+            status = self._selected_mesh_keypoint_status()
+            if status is None:
+                self._mesh_keypoint_details.setText(
+                    "No inferred object is selected."
+                )
+                self._mesh_keypoint_preview.show_status(None)
+                self._mesh_keypoint_object_command.clear()
+                self._mesh_keypoint_import_button.setEnabled(False)
+                self._mesh_keypoint_reset_view_button.setEnabled(False)
+                self._mesh_keypoint_copy_object_button.setEnabled(False)
+                self._mesh_keypoint_copy_all_button.setEnabled(False)
+                return
+
+            self._mesh_keypoint_details.setText(
+                _format_mesh_keypoint_details(status)
+            )
+            self._mesh_keypoint_preview.show_status(status)
+            self._mesh_keypoint_object_command.setText(status.command_preview)
+            self._mesh_keypoint_object_command.setCursorPosition(0)
+            self._mesh_keypoint_import_button.setEnabled(True)
+            self._mesh_keypoint_reset_view_button.setEnabled(status.mesh_exists)
+            self._mesh_keypoint_copy_object_button.setEnabled(True)
+            self._mesh_keypoint_copy_all_button.setEnabled(
+                bool(self._mesh_keypoint_statuses_from_list())
+            )
+
+            model = self._model_by_stage_id(self._selected_stage_id)
+            if model is not None and model.stage_id == 6:
+                self._command_preview.setText(status.command_preview)
+                self._command_preview.setCursorPosition(0)
+                self._copy_button.setEnabled(True)
+
+        def _reset_mesh_keypoint_view(self) -> None:
+            if not hasattr(self, "_mesh_keypoint_preview"):
+                return
+            self._mesh_keypoint_preview.reset_view()
+
+        def _copy_selected_mesh_keypoint_command(self) -> None:
+            status = self._selected_mesh_keypoint_status()
+            if status is None:
+                message = "Select an inferred object before copying a command."
+                self.statusBar().showMessage(message, 3000)
+                return
+            QtWidgets.QApplication.clipboard().setText(status.command_preview)
+            self.statusBar().showMessage(
+                f"Copied keypoint command for {status.object_name}.",
+                3000,
+            )
+
+        def _copy_missing_mesh_keypoint_commands(self) -> None:
+            statuses = self._mesh_keypoint_statuses_from_list()
+            selected = tuple(status for status in statuses if not status.keypoints_valid)
+            commands = [status.command_preview for status in (selected or statuses)]
+            if not commands:
+                message = "No mesh-keypoint commands are available to copy."
+                self.statusBar().showMessage(message, 3000)
+                return
+            QtWidgets.QApplication.clipboard().setText("\n".join(commands))
+            self.statusBar().showMessage(
+                f"Copied {len(commands)} mesh-keypoint command"
+                f"{'s' if len(commands) != 1 else ''}.",
+                3000,
+            )
+
+        def _open_meshes_folder(self) -> None:
+            meshes_dir = self._current_project_root() / "meshes"
+            try:
+                meshes_dir.mkdir(parents=True, exist_ok=True)
+            except OSError as exc:
+                self.statusBar().showMessage(
+                    f"Could not create meshes folder: {exc}",
+                    5000,
+                )
+                return
+
+            opened = QtGui.QDesktopServices.openUrl(
+                QtCore.QUrl.fromLocalFile(str(meshes_dir.resolve()))
+            )
+            message = (
+                "Opened meshes folder."
+                if opened
+                else "Could not open the meshes folder."
+            )
+            self.statusBar().showMessage(message, 4000)
+            self._refresh()
+
+        def _import_mesh_for_selected_object(self) -> None:
+            status = self._selected_mesh_keypoint_status()
+            if status is None:
+                self.statusBar().showMessage(
+                    "Select an inferred object before importing an OBJ mesh.",
+                    4000,
+                )
+                return
+
+            selected, _ = QtWidgets.QFileDialog.getOpenFileName(
+                self,
+                f"Import OBJ mesh for {status.object_name}",
+                str(self._current_project_root()),
+                "OBJ meshes (*.obj);;All files (*)",
+            )
+            if not selected:
+                return
+
+            source = Path(selected).expanduser()
+            if source.suffix.lower() not in supported_mesh_extensions():
+                supported = ", ".join(supported_mesh_extensions())
+                QtWidgets.QMessageBox.warning(
+                    self,
+                    "Unsupported Mesh",
+                    f"Stage 6 currently supports: {supported}",
+                )
+                return
+            if not source.is_file():
+                self.statusBar().showMessage("Selected mesh file was not found.", 4000)
+                return
+
+            destination = status.mesh_path
+            try:
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                if source.resolve() == destination.resolve():
+                    self.statusBar().showMessage(
+                        "Selected mesh is already in the expected project slot.",
+                        4000,
+                    )
+                    self._refresh()
+                    return
+                if destination.exists():
+                    answer = QtWidgets.QMessageBox.question(
+                        self,
+                        "Replace Existing Mesh",
+                        (
+                            f"{destination.name} already exists for "
+                            f"{status.object_name}. Replace it?"
+                        ),
+                    )
+                    if answer != QtWidgets.QMessageBox.StandardButton.Yes:
+                        self.statusBar().showMessage("Mesh import cancelled.", 3000)
+                        return
+                shutil.copy2(source, destination)
+            except OSError as exc:
+                self.statusBar().showMessage(f"Mesh import failed: {exc}", 5000)
+                return
+
+            self.statusBar().showMessage(
+                f"Imported OBJ mesh for {status.object_name}.",
+                4000,
+            )
+            self._refresh()
 
         def _sync_capture_face_choices(
             self,
@@ -6383,9 +7171,10 @@ _RAIL_STAGE_NAMES = {
     3: "Tags",
     4: "Boards",
     5: "Shots",
-    6: "Annotate",
-    7: "Dataset",
-    8: "Export",
+    6: "Keypoints",
+    7: "Annotate",
+    8: "Dataset",
+    9: "Export",
 }
 
 _RAIL_STATUS_LABELS = {
@@ -7093,6 +7882,116 @@ def _format_health_issues(health: ProjectHealthViewModel) -> str:
     )
 
 
+def _mesh_keypoint_list_item(status: MeshKeypointObjectStatus) -> str:
+    faces = ", ".join(status.faces) if status.faces else "faces not explicit"
+    return (
+        f"{status.object_name}\n"
+        f"{_mesh_keypoint_mesh_state(status)} | "
+        f"{_mesh_keypoint_json_state(status)}\n"
+        f"{faces}"
+    )
+
+
+def _mesh_keypoint_row_color(status: MeshKeypointObjectStatus) -> str:
+    if status.keypoints_valid:
+        return "#087a3d"
+    if status.mesh_exists:
+        return "#8a5b00"
+    return "#566575"
+
+
+def _format_mesh_keypoint_details(status: MeshKeypointObjectStatus) -> str:
+    faces = ", ".join(status.faces) if status.faces else "(no explicit faces)"
+    sources = ", ".join(status.sources) if status.sources else "(unknown source)"
+    if status.keypoints_valid:
+        stage_status = "Stage status: annotation-ready keypoints are valid."
+    elif status.mesh_exists:
+        stage_status = (
+            "Stage status: mesh input is staged; keypoints JSON still needs "
+            "generation."
+        )
+    else:
+        stage_status = (
+            "Stage status: mesh input and keypoints JSON still need generation."
+        )
+    lines = [
+        f"Object: {status.object_name}",
+        f"Faces: {faces}",
+        f"Sources: {sources}",
+        stage_status,
+        "",
+        f"Mesh OBJ: {_display_path(status.mesh_path)}",
+        f"Mesh status: {_mesh_keypoint_mesh_state(status)}",
+        "",
+        f"Keypoints JSON: {_display_path(status.keypoints_path)}",
+        f"Keypoints status: {_mesh_keypoint_json_state(status)}",
+    ]
+    if status.keypoints_errors:
+        lines.extend(["", "Keypoint errors:", *_format_items(status.keypoints_errors)])
+    return "\n".join(lines)
+
+
+def _mesh_keypoint_mesh_state(status: MeshKeypointObjectStatus) -> str:
+    return "mesh found" if status.mesh_exists else "mesh missing"
+
+
+def _mesh_keypoint_json_state(status: MeshKeypointObjectStatus) -> str:
+    if status.keypoints_valid:
+        return "keypoints valid"
+    if status.keypoints_exists:
+        return "keypoints need attention"
+    return "keypoints missing"
+
+
+def _mesh_keypoint_command_card_note(
+    statuses: Sequence[MeshKeypointObjectStatus],
+    model: StageViewModel,
+) -> str:
+    if not statuses:
+        return (
+            "Stage 6 needs object identities from board YAMLs, the tag "
+            "registry, or the face-shot manifest before mesh import can be "
+            "guided."
+        )
+    if model.status == "complete":
+        return (
+            "All inferred objects have annotation-ready keypoints. Import OBJ "
+            "only if you need to replace a mesh and regenerate keypoints."
+        )
+    return (
+        "Import OBJ copies the selected mesh into meshes/<object>.obj. Copy "
+        "Object Command or Copy Missing Commands prepares the "
+        "posetag-gen-keypoints runs that write objects/<object>/keypoints.json. "
+        "Stage 6 remains missing until that JSON exists and validates."
+    )
+
+
+def _mesh_keypoint_command_ready_message(
+    statuses: Sequence[MeshKeypointObjectStatus],
+    *,
+    stage_complete: bool = False,
+) -> str:
+    if not statuses:
+        return "No inferred objects are available for mesh-keypoint commands yet."
+    if stage_complete:
+        return "All inferred objects have keypoints. Copy only if you need to rerun."
+    missing_meshes = sum(not status.mesh_exists for status in statuses)
+    missing_keypoints = sum(not status.keypoints_valid for status in statuses)
+    mesh_phrase = (
+        "1 object needs OBJ mesh input"
+        if missing_meshes == 1
+        else f"{missing_meshes} objects need OBJ mesh input"
+    )
+    keypoints_phrase = (
+        "1 object needs keypoints JSON"
+        if missing_keypoints == 1
+        else f"{missing_keypoints} objects need keypoints JSON"
+    )
+    return (
+        f"{mesh_phrase}; {keypoints_phrase}."
+    )
+
+
 def _command_card_title(model: StageViewModel) -> str:
     if model.status == "complete" and model.command_preview:
         return "Rerun command"
@@ -7100,6 +7999,11 @@ def _command_card_title(model: StageViewModel) -> str:
 
 
 def _command_card_note(model: StageViewModel) -> str:
+    if model.key == "generate_mesh_keypoints":
+        return (
+            "Use the object geometry inputs panel to import OBJ meshes, then "
+            "copy the selected posetag-gen-keypoints command."
+        )
     if model.status == "complete" and model.command_preview:
         return (
             "This stage is already complete. The checked paths above are the "
@@ -7109,8 +8013,8 @@ def _command_card_note(model: StageViewModel) -> str:
     if model.command_preview:
         return (
             "Copy the preview into a terminal. Camera calibration, "
-            "object-board building, annotation, and dataset workflows are not "
-            "executed by the dashboard."
+            "object-board building, mesh-keypoint, annotation, and dataset "
+            "workflows are not executed by the dashboard."
         )
     return "No command preview is defined for this stage."
 
@@ -7281,7 +8185,8 @@ def _project_root_hint(root: Path) -> str:
             "Stage 1 board generation, Stage 2 calibration launch, and Stage "
             "3 object tag generation. Stage 4 can launch the existing "
             "board-building workflow, and Stage 5 can open guided face-shot "
-            "capture."
+            "capture. Stage 6 can stage OBJ mesh inputs and preview "
+            "mesh-keypoint generation before annotation."
         )
     if root.exists():
         return "Selected path exists but is not a folder."
@@ -7510,7 +8415,8 @@ QLabel#OutputText {
     font-family: "Menlo", "Consolas", "Courier New", monospace;
     font-size: 11px;
 }
-QLabel#CharucoPreviewCanvas {
+QLabel#CharucoPreviewCanvas,
+QLabel#MeshKeypointPreview {
     color: #5c6b7b;
     background: #edf4f8;
     border: 1px solid #d4e0e9;
@@ -7551,23 +8457,28 @@ QListWidget#WorkflowRail {
     border: none;
     padding: 0;
 }
-QListWidget#BatchCaptureQueue {
+QListWidget#BatchCaptureQueue,
+QListWidget#MeshKeypointObjectList {
     background: #ffffff;
     border: 1px solid #b8ccda;
     border-radius: 7px;
     padding: 5px;
 }
-QListWidget#BatchCaptureQueue::item {
+QListWidget#BatchCaptureQueue::item,
+QListWidget#MeshKeypointObjectList::item {
     padding: 7px 8px;
     border: 1px solid transparent;
     border-radius: 6px;
 }
-QListWidget#BatchCaptureQueue::item:hover {
+QListWidget#BatchCaptureQueue::item:hover,
+QListWidget#MeshKeypointObjectList::item:hover {
     background: #eff7fb;
     border: 1px solid #bad7e7;
 }
 QListWidget#BatchCaptureQueue::item:selected,
-QListWidget#BatchCaptureQueue::item:selected:!active {
+QListWidget#BatchCaptureQueue::item:selected:!active,
+QListWidget#MeshKeypointObjectList::item:selected,
+QListWidget#MeshKeypointObjectList::item:selected:!active {
     background: #d9efff;
     color: #08253d;
     border: 2px solid #0b6f8f;

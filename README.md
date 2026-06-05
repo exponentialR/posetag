@@ -662,38 +662,77 @@ When `--manifest` is enabled, PoseTag appends one row per save to
 
 ---
 
-### 4) Derive canonical 3D keypoints from meshes (once per object)
+### 4) Derive annotation-ready 3D keypoints from meshes (once per object)
 
-PoseTag currently includes a detailed mesh-keypoint utility that remains
-module-invoked during the migration. It computes the 8 AABB corners in the
-object frame, writes per-face corner orderings, and can also write
-`object_config.yaml`.
-
-**Current utility**
+The canonical command for the annotation-ready mesh-keypoint stage is:
 
 ```bash
-python3 -m gen_keypoints
+posetag-gen-keypoints --project_root my_project \
+  --mesh meshes/connection_plate_white.obj
+```
+
+It computes the 8 AABB corners in the object frame, writes per-face corner
+orderings, and can also write `object_config.yaml`. The output consumed by
+annotation is:
+
+```text
+objects/<object>/keypoints.json
+```
+
+PoseTag infers known objects and faces from `boards/*.yaml`,
+`boards/tag_registry.yaml`, and `shots/manifest.csv`. It groups board names
+such as `<object>_sideA`, `<object>_front`, and `<object>_back` under the base
+object. If the mesh filename matches a known object, the object name is filled
+from the filename:
+
+```bash
+posetag-gen-keypoints --project_root my_project \
+  --mesh meshes/connection_plate_white.obj
+```
+
+If the mesh filename differs from the PoseTag object identity, pass the mapping
+explicitly:
+
+```bash
+posetag-gen-keypoints --project_root my_project \
+  --mesh meshes/unity_export_plate_v12.obj \
+  --object_name connection_plate_white
 ```
 
 Expected layout:
 
 ```text
 <project_root>/
-  meshes/<object>.obj
+  meshes/<object>.obj                 # supported annotation-ready mesh input
   objects/<object>/keypoints.json
   objects/<object>/object_config.yaml
-  faces/<object>/sideA|B|C|D/*.yaml
+  boards/<object>_sideA.yaml
+  boards/tag_registry.yaml
+  shots/manifest.csv
 ```
 
 What it does:
 
-- lists meshes under `meshes/*.obj`
+- lists known objects and supported meshes with `--list`
 - computes an axis-aligned bounding box in the object frame
 - writes `keypoints.json` containing corner points plus face mappings
-- optionally writes `object_config.yaml`
-- provides in-window previews and an optional Open3D view
+- optionally writes `object_config.yaml` with mesh metadata and
+  `T_mesh_object`
+- refuses to overwrite an existing `keypoints.json` unless `--force` or
+  `--keep-both` is supplied
+- keeps the legacy OpenCV browser available through `--browse`
 
-Key controls:
+The annotation-ready generator currently supports `.obj` meshes. Coordinates
+are saved in metres after applying `--units_to_m`. The default
+`T_mesh_object` is identity, meaning mesh frame and object frame are the same.
+
+Legacy browser:
+
+```bash
+python3 -m gen_keypoints
+```
+
+Browser controls:
 
 - `W/S` or arrow keys to navigate meshes
 - `ENTER` or `G` to generate `keypoints.json`
@@ -707,11 +746,27 @@ Typical outputs:
 - `objects/<object_name>/keypoints.json`
 - `objects/<object_name>/object_config.yaml`
 
+`canonical_keypoints/` outputs from `python3 -m generate_canonical_keypoints`
+are separate sampled-point files and are not consumed by annotation. Use
+`objects/<object>/keypoints.json` for the PoseTag annotation workflow.
+
+The optional `posetag-gui` dashboard shows this as Stage 6 between face-shot
+capture and annotation. It lists inferred objects, shows each expected
+`meshes/<object>.obj` input and `objects/<object>/keypoints.json` output,
+can import a selected `.obj` into the project mesh folder, and previews the
+`posetag-gen-keypoints` commands. Clicking an object shows an interactive OBJ
+viewport when a mesh is staged; drag to rotate, secondary-drag to pan, and use
+the mouse wheel to zoom. The stage remains missing until
+`objects/<object>/keypoints.json` exists and validates.
+
 Optional mesh visualisation:
 
 ```bash
-python3 -m view_keypoints --object_name connection_plate_white --show_axes
+python3 -m view_keypoints --project_root my_project \
+  --object_name connection_plate_white --show_axes
 ```
+
+Detailed Step 4 notes: `docs/workflows/step4_mesh_keypoints.md`.
 
 ---
 
@@ -934,14 +989,14 @@ flowchart LR
   C["Capture face shots<br/>posetag-capture-face<br/>-> raw/ann PNG + meta JSON"]
   D["Annotate faces<br/>posetag-annotate<br/>-> T_board_object per face"]
   E["Meshes (.obj)"]
-  F["Generate canonical keypoints<br/>python -m gen_keypoints<br/>-> keypoints.json"]
+  F["Generate mesh keypoints<br/>posetag-gen-keypoints<br/>-> objects/&lt;object&gt;/keypoints.json"]
   G["GT capture<br/>posetag-collect<br/>Live/Bag/Video; best face per object"]
   H["Detect tags + compute T_cam_board"]
   I["Compose T_cam_object = T_cam_board @ T_board_object<br/>-> save RGB / pose"]
   J["Train RGB-only pose net"]
 
-  A --> B --> C --> D --> G
-  E --> F --> D
+  A --> B --> C --> F --> D --> G
+  E --> F
   G --> H --> I --> J
 ```
 
@@ -993,12 +1048,15 @@ are:
 - `posetag-calib-charuco` -> ChArUco colour calibration
 - `posetag-make-board` -> per-face board YAML and tag registry creation
 - `posetag-capture-face` -> face-shot capture
+- `posetag-gen-keypoints` -> annotation-ready mesh keypoint generation
 - `posetag-annotate` -> single, batch, and browse annotation flows
 - `posetag-collect` -> dataset capture
 - `posetag-gui` -> optional workflow dashboard for status, ChArUco board
   setup, guided calibration launch, object AprilTag generation, and
   board-building guidance
-- `python3 -m gen_keypoints` -> canonical keypoint generation
+- `python3 -m gen_keypoints` -> legacy mesh-keypoint browser
+- `python3 -m generate_canonical_keypoints` -> experimental sampled keypoint
+  files under `canonical_keypoints/` (not annotation-ready)
 - `python3 -m view_keypoints` -> mesh/keypoint visualisation
 
 ---
