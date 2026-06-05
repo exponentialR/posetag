@@ -227,12 +227,17 @@ substitute for `objects/<object>/keypoints.json`.
 }
 ```
 
-The generator writes all eight AABB corners and four side mappings
-(`sideA` through `sideD`). Each face mapping lists exactly four point names in
-the click-order convention expected by the annotation UI.
+The generator writes all eight AABB corners and four canonical side mappings
+(`sideA` through `sideD`). If earlier workflow outputs infer additional face
+labels such as `front` or `back`, the generator also writes matching
+`<object>_<face>` entries so every inferred or captured face key is present for
+annotation. Each face mapping lists exactly four point names in the click-order
+convention expected by the annotation UI.
 
 Coordinates are stored in metres after multiplying raw mesh coordinates by
-`units_to_m`.
+`units_to_m`. `units_to_m`, mesh vertices, transformed bounds, and all saved
+keypoint coordinates must be finite numeric values; `NaN` and `Infinity` are
+invalid.
 
 ## Object Config Schema
 
@@ -272,8 +277,11 @@ frame for visualization.
 - Existing `objects/<object>/keypoints.json` is not overwritten unless
   `--force` is supplied.
 - `--force` and `--keep-both` cannot be combined.
-- Non-positive `--units_to_m` values fail before writing outputs.
-- OBJ files with no vertex records fail clearly.
+- Non-finite or non-positive `--units_to_m` values fail before writing outputs.
+- OBJ files with no vertex records, `NaN`, or `Infinity` vertex coordinates
+  fail clearly.
+- Existing keypoint JSON that omits any inferred/captured face key keeps Stage
+  6 in a needs-attention state.
 
 ## Verify Before Step 5
 
@@ -284,7 +292,8 @@ Before moving to face annotation:
 2. Confirm the object name matches the base object name used in board YAMLs,
    `boards/tag_registry.yaml`, and `shots/manifest.csv`.
 3. Confirm `units_to_m` matches the mesh export units.
-4. Confirm `faces` contains the expected `<object>_sideX` keys.
+4. Confirm `faces` contains the expected `<object>_<face>` keys for every
+   board/registry/manifest face that will be annotated.
 5. Optionally run:
 
    ```bash

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import csv
 import json
+import math
 import re
 import shlex
 from dataclasses import dataclass
@@ -214,6 +215,10 @@ def load_obj_vertex_preview(
                     )
                 except ValueError:
                     continue
+                if not all(_is_finite_number(value) for value in vertex):
+                    raise MeshKeypointWorkflowError(
+                        f"OBJ mesh contains non-finite vertex coordinates: {path}"
+                    )
                 vertex_count += 1
                 if bounds_min is None or bounds_max is None:
                     bounds_min = [vertex[0], vertex[1], vertex[2]]
@@ -372,7 +377,14 @@ def inspect_keypoint_object_statuses(
         keypoints_path = expected_keypoints_path(root, item.object_name)
         mesh_path = _configured_mesh_path(root, item.object_name)
         keypoints_exists = keypoints_path.exists()
-        keypoints_errors = _read_keypoint_errors(keypoints_path) if keypoints_exists else ()
+        keypoints_errors = (
+            _read_keypoint_errors(
+                keypoints_path,
+                expected_faces=expected_face_keys(item.object_name, item.faces),
+            )
+            if keypoints_exists
+            else ()
+        )
         statuses.append(
             MeshKeypointObjectStatus(
                 object_name=item.object_name,
@@ -478,13 +490,19 @@ def choose_keypoints_output_path(
     )
 
 
-def validate_keypoint_payload(payload: Mapping[str, object]) -> tuple[str, ...]:
+def validate_keypoint_payload(
+    payload: Mapping[str, object],
+    *,
+    expected_faces: Iterable[str] = (),
+) -> tuple[str, ...]:
     """Return schema errors for ``objects/<object>/keypoints.json``."""
 
     errors: list[str] = []
     units = payload.get("units_to_m")
-    if not isinstance(units, (int, float)) or float(units) <= 0:
-        errors.append("keypoints.json field 'units_to_m' must be a positive number.")
+    if not _is_finite_number(units) or float(units) <= 0:
+        errors.append(
+            "keypoints.json field 'units_to_m' must be a finite positive number."
+        )
 
     points = payload.get("points")
     if not isinstance(points, Mapping) or not points:
@@ -495,7 +513,9 @@ def validate_keypoint_payload(payload: Mapping[str, object]) -> tuple[str, ...]:
             if not isinstance(name, str) or not name:
                 errors.append("keypoint names must be non-empty strings.")
             if not _is_xyz(xyz):
-                errors.append(f"keypoint {name!r} must contain three numeric coordinates.")
+                errors.append(
+                    f"keypoint {name!r} must contain three finite numeric coordinates."
+                )
 
     faces = payload.get("faces")
     if not isinstance(faces, Mapping) or not faces:
@@ -518,8 +538,33 @@ def validate_keypoint_payload(payload: Mapping[str, object]) -> tuple[str, ...]:
                     f"face {face_name!r} references missing keypoint(s): "
                     + ", ".join(missing)
                 )
+        expected = tuple(dict.fromkeys(str(face) for face in expected_faces if str(face)))
+        missing_faces = [face for face in expected if face not in faces]
+        if missing_faces:
+            errors.append(
+                "keypoints.json field 'faces' is missing expected face(s): "
+                + ", ".join(missing_faces)
+            )
 
     return tuple(errors)
+
+
+def expected_face_keys(
+    object_name: str,
+    faces: Iterable[str],
+) -> tuple[str, ...]:
+    """Return full keypoint face keys expected for an inferred object."""
+
+    name = validate_object_name(object_name)
+    keys: list[str] = []
+    for face in faces:
+        label = str(face).strip()
+        if not label:
+            continue
+        key = label if label.startswith(f"{name}_") else f"{name}_{label}"
+        if key not in keys:
+            keys.append(key)
+    return tuple(keys)
 
 
 def object_config_payload(
@@ -602,7 +647,11 @@ def _iter_manifest_rows(path: Path) -> Iterable[dict[str, str]]:
         return
 
 
-def _read_keypoint_errors(path: Path) -> tuple[str, ...]:
+def _read_keypoint_errors(
+    path: Path,
+    *,
+    expected_faces: Iterable[str] = (),
+) -> tuple[str, ...]:
     try:
         with path.open("r", encoding="utf-8") as handle:
             payload = json.load(handle)
@@ -610,13 +659,21 @@ def _read_keypoint_errors(path: Path) -> tuple[str, ...]:
         return (f"Could not read keypoints JSON: {exc}",)
     if not isinstance(payload, Mapping):
         return ("keypoints.json must contain a mapping.",)
-    return validate_keypoint_payload(payload)
+    return validate_keypoint_payload(payload, expected_faces=expected_faces)
 
 
 def _is_xyz(value: object) -> bool:
     if not isinstance(value, list) or len(value) != 3:
         return False
-    return all(isinstance(item, (int, float)) for item in value)
+    return all(_is_finite_number(item) for item in value)
+
+
+def _is_finite_number(value: object) -> bool:
+    return (
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and math.isfinite(float(value))
+    )
 
 
 def _relative_display_path(root: Path, path: Path) -> str:

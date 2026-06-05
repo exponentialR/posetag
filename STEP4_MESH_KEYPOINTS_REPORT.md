@@ -43,6 +43,10 @@ point files under `canonical_keypoints/`, which are not consumed by annotation.
 - Grouped common object-face board suffixes such as `_front`, `_back`,
   `_left`, `_right`, `_top`, and `_bottom` under the base PoseTag object while
   preserving the existing `_sideA`, `_sideB`, ... convention.
+- Validated that annotation-ready `faces` mappings cover every inferred or
+  captured object face before Stage 6 can complete.
+- Rejected non-finite `units_to_m`, OBJ vertices, transformed bounds, and
+  keypoint coordinates so `NaN`/`Infinity` cannot enter annotation geometry.
 - Added safe mesh filename autofill when the mesh stem matches a known object
   or when no prior object identities exist.
 - Added explicit object mapping for mismatched mesh filenames via
@@ -82,7 +86,7 @@ python3 -m unittest tests.test_step4_mesh_keypoints -v
 Result:
 
 ```text
-9 tests passed
+12 tests passed
 ```
 
 ```bash
@@ -92,7 +96,7 @@ python3 -m unittest discover -s tests -v
 Result:
 
 ```text
-254 tests passed
+258 tests passed
 ```
 
 ```bash
@@ -102,7 +106,7 @@ python3 -m unittest tests.test_workflow_status tests.test_workflow_gui tests.tes
 Result:
 
 ```text
-63 tests passed
+67 tests passed
 ```
 
 ```bash
@@ -181,10 +185,15 @@ Hardware-free tests verify:
   - `units_to_m`
   - identity `T_mesh_object` by default
 - `keypoints.json` contains:
-  - positive `units_to_m`
+  - finite positive `units_to_m`
   - eight AABB corner points
   - `faces` mappings for `<object>_sideA` through `<object>_sideD`
+  - matching `<object>_<face>` mappings for inferred/captured aliases such as
+    `front` and `back`
   - exactly four point names per face mapping
+- Stage 6 refuses existing keypoint JSON that omits any inferred/captured face
+  key.
+- OBJ and JSON geometry containing `NaN` or `Infinity` is rejected.
 - existing `keypoints.json` requires `--force` or `--keep-both`.
 - unsupported mesh extensions fail clearly.
 - missing mesh paths fail clearly.

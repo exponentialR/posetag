@@ -92,6 +92,7 @@ from utils.logger import init_project_logger
 from posetag.workflows.mesh_keypoints import (
     MeshKeypointWorkflowError,
     choose_keypoints_output_path,
+    expected_face_keys,
     format_known_objects,
     infer_known_objects,
     object_config_payload,
@@ -116,11 +117,21 @@ def load_obj_vertices(path: Path) -> np.ndarray:
     with path.open("r", encoding="utf-8", errors="ignore") as f:
         for line in f:
             if line.startswith("v "):
-                _, x, y, z, *rest = line.strip().split()
-                try: vs.append([float(x), float(y), float(z)])
-                except ValueError: pass
+                parts = line.strip().split()
+                if len(parts) < 4:
+                    continue
+                _, x, y, z, *rest = parts
+                try:
+                    vertex = [float(x), float(y), float(z)]
+                except ValueError:
+                    continue
+                if not np.all(np.isfinite(vertex)):
+                    raise MeshKeypointWorkflowError(
+                        f"OBJ mesh contains non-finite vertex coordinates: {path}"
+                    )
+                vs.append(vertex)
     if not vs:
-        raise SystemExit(f"[!] No vertices found in {path}")
+        raise MeshKeypointWorkflowError(f"No vertices found in {path}")
     return np.asarray(vs, dtype=np.float64)
 
 def corners_from_bounds(vmin, vmax, r=6):
@@ -291,7 +302,12 @@ def _three_view(V, C, w=LEFT_W, h=PANEL_H):
 
 # ---------------- Payload & preview ----------------
 
-def _make_faces_mapping(obj_name: str, extents, auto=True):
+def _make_faces_mapping(
+    obj_name: str,
+    extents,
+    auto=True,
+    expected_face_labels=(),
+):
     def parse_face(s): return (s[1].lower(), +1 if s[0]=="+" else -1)
     if auto:
         a_axis, c_axis = auto_side_mapping(extents)
@@ -303,25 +319,80 @@ def _make_faces_mapping(obj_name: str, extents, auto=True):
     B = face_corner_names(*parse_face(facespec[1]))
     C = face_corner_names(*parse_face(facespec[2]))
     D = face_corner_names(*parse_face(facespec[3]))
-    faces = {
-        f"{obj_name}_sideA": A,
-        f"{obj_name}_sideB": B,
-        f"{obj_name}_sideC": C,
-        f"{obj_name}_sideD": D,
+    side_faces = {
+        "sideA": A,
+        "sideB": B,
+        "sideC": C,
+        "sideD": D,
     }
+    faces = {f"{obj_name}_{label}": corners for label, corners in side_faces.items()}
+    for label in expected_face_labels:
+        face_label = str(label).strip()
+        if not face_label:
+            continue
+        key = (
+            face_label
+            if face_label.startswith(f"{obj_name}_")
+            else f"{obj_name}_{face_label}"
+        )
+        if key in faces:
+            continue
+        corners = _expected_face_corners(face_label, side_faces)
+        if corners is not None:
+            faces[key] = corners
     return faces, facespec
+
+
+def _expected_face_corners(face_label: str, side_faces: dict[str, list[str]]):
+    aliases = {
+        "front": "sideA",
+        "back": "sideB",
+        "right": "sideC",
+        "left": "sideD",
+        "top": "+Z",
+        "upper": "+Z",
+        "bottom": "-Z",
+        "lower": "-Z",
+    }
+    if face_label in side_faces:
+        return side_faces[face_label]
+    alias = aliases.get(face_label.lower())
+    if alias in side_faces:
+        return side_faces[alias]
+    if alias in {"+Z", "-Z"}:
+        axis = alias[1].lower()
+        sign = +1 if alias[0] == "+" else -1
+        return face_corner_names(axis, sign)
+    return None
 
 def _any_annotations_exist(project_root: Path, obj_name: str) -> bool:
     return any((project_root/"faces"/obj_name).glob("side*/**/*.yaml"))
 
 def _compute_payload(project_root: Path, obj_name: str, obj_path: Path,
-                     units_to_m: float, auto_sides: bool, round_dec=6):
+                     units_to_m: float, auto_sides: bool, round_dec=6,
+                     expected_face_labels=()):
     V = load_obj_vertices(obj_path)
     V = apply_T_mesh_object(V, project_root/"objects"/obj_name/"object_config.yaml")
+    if not np.all(np.isfinite(V)):
+        raise MeshKeypointWorkflowError(
+            "OBJ mesh contains non-finite coordinates after applying T_mesh_object."
+        )
     vmin = V.min(axis=0)*units_to_m; vmax = V.max(axis=0)*units_to_m
+    if not np.all(np.isfinite(vmin)) or not np.all(np.isfinite(vmax)):
+        raise MeshKeypointWorkflowError("Generated keypoint bounds are non-finite.")
     points = corners_from_bounds(vmin, vmax, r=round_dec)
-    faces, facespec = _make_faces_mapping(obj_name, vmax-vmin, auto=auto_sides)
-    payload = {"units_to_m": float(units_to_m), "points": points, "faces": faces, "facespec": facespec}
+    faces, facespec = _make_faces_mapping(
+        obj_name,
+        vmax-vmin,
+        auto=auto_sides,
+        expected_face_labels=expected_face_labels,
+    )
+    payload = {
+        "units_to_m": float(units_to_m),
+        "points": points,
+        "faces": faces,
+        "facespec": facespec,
+    }
     cuboid = np.array(list(points.values()), dtype=np.float64)
     return payload, V*units_to_m, cuboid
 
@@ -342,12 +413,16 @@ def generate_keypoints_for_mesh(
 
     root = Path(project_root).expanduser()
     mesh = validate_mesh_path(root, mesh_path)
-    if units_to_m <= 0:
-        raise MeshKeypointWorkflowError("--units_to_m must be positive.")
+    if not np.isfinite(float(units_to_m)) or units_to_m <= 0:
+        raise MeshKeypointWorkflowError("--units_to_m must be finite and positive.")
     if round_decimals < 0:
         raise MeshKeypointWorkflowError("--round-decimals must be zero or greater.")
 
     identity = resolve_object_identity(root, mesh, object_name=object_name)
+    expected_face_labels = _known_face_labels(
+        identity.known_objects,
+        identity.object_name,
+    )
     payload, _, _ = _compute_payload(
         root,
         identity.object_name,
@@ -355,9 +430,13 @@ def generate_keypoints_for_mesh(
         float(units_to_m),
         auto_sides,
         round_dec=round_decimals,
+        expected_face_labels=expected_face_labels,
     )
     facespec = payload.pop("facespec")
-    schema_errors = validate_keypoint_payload(payload)
+    schema_errors = validate_keypoint_payload(
+        payload,
+        expected_faces=expected_face_keys(identity.object_name, expected_face_labels),
+    )
     if schema_errors:
         raise MeshKeypointWorkflowError(" ".join(schema_errors))
 
@@ -367,7 +446,10 @@ def generate_keypoints_for_mesh(
         keep_both=keep_both,
     )
     save_path.parent.mkdir(parents=True, exist_ok=True)
-    save_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    save_path.write_text(
+        json.dumps(payload, indent=2, allow_nan=False),
+        encoding="utf-8",
+    )
 
     config_path = save_path.parent / "object_config.yaml"
     if write_config:
@@ -387,6 +469,13 @@ def generate_keypoints_for_mesh(
         "object_config_path": config_path if write_config else "",
         "inferred_from_mesh": identity.inferred_from_mesh,
     }
+
+
+def _known_face_labels(known_objects, object_name: str) -> tuple[str, ...]:
+    for item in known_objects:
+        if item.object_name == object_name:
+            return item.faces
+    return ()
 
 def _open3d_preview(obj_name: str, obj_path: Path, kp_dict: dict):
     try:

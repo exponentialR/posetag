@@ -428,7 +428,9 @@ class WorkflowStatusTests(unittest.TestCase):
     def test_partial_face_shot_coverage_needs_attention(self) -> None:
         with TemporaryDirectory() as tmpdir:
             project_root = Path(tmpdir) / "project"
-            board_paths, _registry_path = _write_two_face_board_and_registry(project_root)
+            board_paths, _registry_path = _write_two_face_board_and_registry(
+                project_root
+            )
             _write_face_capture(
                 project_root,
                 board_paths["sideA"],
@@ -484,7 +486,10 @@ class WorkflowStatusTests(unittest.TestCase):
                 board_paths["sideB"],
                 timestamp="20260530_120100",
             )
-            keypoints_path = _write_valid_keypoints(project_root, "connection_plate_white")
+            keypoints_path = _write_valid_keypoints(
+                project_root,
+                "connection_plate_white",
+            )
 
             stage6 = _stage_by_id(project_root, 6)
             stage7 = _stage_by_id(project_root, 7)
@@ -494,6 +499,34 @@ class WorkflowStatusTests(unittest.TestCase):
             self.assertIn(str(keypoints_path), stage6.checked_paths)
             self.assertEqual(stage7.status, WorkflowStatus.MISSING)
             self.assertIn("Face annotation status", stage7.message)
+
+    def test_keypoints_missing_captured_side_keep_stage6_invalid(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            project_root = Path(tmpdir) / "project"
+            board_paths, _registry_path = _write_two_face_board_and_registry(project_root)
+            _write_face_capture(
+                project_root,
+                board_paths["sideA"],
+                timestamp="20260530_120000",
+            )
+            _write_face_capture(
+                project_root,
+                board_paths["sideB"],
+                timestamp="20260530_120100",
+            )
+            keypoints_path = _write_valid_keypoints(project_root, "connection_plate_white")
+            payload = json.loads(keypoints_path.read_text(encoding="utf-8"))
+            del payload["faces"]["connection_plate_white_sideB"]
+            keypoints_path.write_text(json.dumps(payload), encoding="utf-8")
+
+            stage6 = _stage_by_id(project_root, 6)
+            stage7 = _stage_by_id(project_root, 7)
+
+            self.assertEqual(stage6.status, WorkflowStatus.NEEDS_ATTENTION)
+            self.assertTrue(
+                any("connection_plate_white_sideB" in error for error in stage6.errors)
+            )
+            self.assertEqual(stage7.status, WorkflowStatus.NOT_APPLICABLE)
 
     def test_invalid_keypoints_after_face_shots_need_attention(self) -> None:
         with TemporaryDirectory() as tmpdir:

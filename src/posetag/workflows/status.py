@@ -24,6 +24,7 @@ from posetag.pipelines.make_board import (
 )
 from posetag.workflows.capture_face import inspect_capture_face_outputs
 from posetag.workflows.mesh_keypoints import (
+    expected_face_keys,
     expected_keypoints_path,
     infer_known_objects,
     validate_keypoint_payload,
@@ -661,7 +662,10 @@ def inspect_mesh_keypoints(
         if not isinstance(payload, Mapping):
             errors.append(f"{keypoints_path}: keypoints.json must contain a mapping.")
             continue
-        schema_errors = validate_keypoint_payload(payload)
+        schema_errors = validate_keypoint_payload(
+            payload,
+            expected_faces=expected_face_keys(item.object_name, item.faces),
+        )
         if schema_errors:
             errors.extend(f"{keypoints_path}: {message}" for message in schema_errors)
             continue

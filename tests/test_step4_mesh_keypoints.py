@@ -15,6 +15,7 @@ import gen_keypoints
 from posetag.workflows.mesh_keypoints import (
     MeshKeypointWorkflowError,
     default_mesh_path,
+    expected_face_keys,
     expected_keypoints_path,
     infer_known_objects,
     inspect_keypoint_object_statuses,
@@ -81,8 +82,16 @@ class MeshKeypointWorkflowTests(unittest.TestCase):
     def test_known_objects_are_inferred_from_boards_registry_and_manifest(self) -> None:
         with TemporaryDirectory() as tmpdir:
             project_root = Path(tmpdir) / "project"
-            side_a = _write_board(project_root, "connection_plate_white_sideA", (52, 53))
-            side_b = _write_board(project_root, "connection_plate_white_sideB", (62, 63))
+            side_a = _write_board(
+                project_root,
+                "connection_plate_white_sideA",
+                (52, 53),
+            )
+            side_b = _write_board(
+                project_root,
+                "connection_plate_white_sideB",
+                (62, 63),
+            )
             _write_registry(
                 project_root,
                 {
@@ -141,6 +150,25 @@ class MeshKeypointWorkflowTests(unittest.TestCase):
 
             self.assertEqual([item.object_name for item in known], ["column_white"])
             self.assertEqual(known[0].faces, ("back", "front", "sideA", "sideB"))
+
+            mesh_path = _write_box_obj(project_root / "meshes" / "column_white.obj")
+            result = gen_keypoints.generate_keypoints_for_mesh(
+                project_root,
+                mesh_path,
+            )
+            payload = json.loads(
+                Path(result["keypoints_path"]).read_text(encoding="utf-8")
+            )
+
+            self.assertIn("column_white_front", payload["faces"])
+            self.assertIn("column_white_back", payload["faces"])
+            self.assertEqual(
+                validate_keypoint_payload(
+                    payload,
+                    expected_faces=expected_face_keys("column_white", known[0].faces),
+                ),
+                (),
+            )
 
     def test_object_statuses_expose_mesh_import_and_command_paths(self) -> None:
         with TemporaryDirectory() as tmpdir:
@@ -213,6 +241,80 @@ class MeshKeypointWorkflowTests(unittest.TestCase):
             self.assertTrue(statuses[0].mesh_exists)
             self.assertTrue(statuses[0].keypoints_valid)
             self.assertIn("unity_export_plate_v12.obj", statuses[0].command_preview)
+
+    def test_status_rejects_keypoints_missing_inferred_face(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            project_root = Path(tmpdir) / "project"
+            side_a = _write_board(project_root, "connection_plate_white_sideA", (52, 53))
+            side_b = _write_board(project_root, "connection_plate_white_sideB", (62, 63))
+            _write_registry(
+                project_root,
+                {
+                    "52": ("connection_plate_white_sideA", side_a),
+                    "62": ("connection_plate_white_sideB", side_b),
+                },
+            )
+            mesh_path = _write_box_obj(
+                project_root / "meshes" / "connection_plate_white.obj"
+            )
+            result = gen_keypoints.generate_keypoints_for_mesh(
+                project_root,
+                mesh_path,
+            )
+            keypoints_path = Path(result["keypoints_path"])
+            payload = json.loads(keypoints_path.read_text(encoding="utf-8"))
+            del payload["faces"]["connection_plate_white_sideB"]
+            keypoints_path.write_text(json.dumps(payload), encoding="utf-8")
+
+            statuses = inspect_keypoint_object_statuses(project_root)
+
+            self.assertEqual(len(statuses), 1)
+            self.assertFalse(statuses[0].keypoints_valid)
+            self.assertTrue(
+                any(
+                    "connection_plate_white_sideB" in error
+                    for error in statuses[0].keypoints_errors
+                )
+            )
+
+    def test_non_finite_geometry_is_rejected(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            project_root = Path(tmpdir) / "project"
+            mesh_path = project_root / "meshes" / "bad.obj"
+            mesh_path.parent.mkdir(parents=True)
+            mesh_path.write_text(
+                "\n".join(["v 0 0 0", "v nan 1 1", "v 1 1 1"]) + "\n",
+                encoding="utf-8",
+            )
+
+            with self.assertRaises(MeshKeypointWorkflowError) as ctx:
+                gen_keypoints.generate_keypoints_for_mesh(project_root, mesh_path)
+
+            self.assertIn("non-finite", str(ctx.exception))
+
+    def test_non_finite_existing_keypoint_payload_is_invalid(self) -> None:
+        payload = {
+            "units_to_m": float("inf"),
+            "points": {
+                "a": [0.0, 0.0, 0.0],
+                "b": [1.0, 0.0, 0.0],
+                "c": [1.0, float("nan"), 0.0],
+                "d": [0.0, 1.0, 0.0],
+            },
+            "faces": {
+                "part_sideA": ["a", "b", "c", "d"],
+            },
+        }
+
+        errors = validate_keypoint_payload(
+            payload,
+            expected_faces=("part_sideA",),
+        )
+
+        self.assertTrue(any("units_to_m" in error for error in errors))
+        self.assertTrue(
+            any("finite numeric coordinates" in error for error in errors)
+        )
 
     def test_mesh_extension_and_missing_mesh_validation(self) -> None:
         with TemporaryDirectory() as tmpdir:

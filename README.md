@@ -716,6 +716,7 @@ What it does:
 - lists known objects and supported meshes with `--list`
 - computes an axis-aligned bounding box in the object frame
 - writes `keypoints.json` containing corner points plus face mappings
+- includes face mappings for every inferred board/registry/manifest face key
 - optionally writes `object_config.yaml` with mesh metadata and
   `T_mesh_object`
 - refuses to overwrite an existing `keypoints.json` unless `--force` or
@@ -725,6 +726,8 @@ What it does:
 The annotation-ready generator currently supports `.obj` meshes. Coordinates
 are saved in metres after applying `--units_to_m`. The default
 `T_mesh_object` is identity, meaning mesh frame and object frame are the same.
+Stage 6 requires finite mesh/keypoint coordinates and a `faces` entry for every
+inferred or captured object face before annotation can proceed.
 
 Legacy browser:
 
