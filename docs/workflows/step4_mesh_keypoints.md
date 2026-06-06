@@ -148,17 +148,25 @@ posetag-gen-keypoints --project_root my_project --browse
 annotation. It checks inferred objects from earlier workflow outputs, shows
 the expected `meshes/<object>.obj` mesh input and
 `objects/<object>/keypoints.json` annotation output for each object, and can
-copy or import a selected `.obj` into the project `meshes/` folder. Clicking
-an inferred object displays an interactive OBJ viewport for the staged mesh,
-or the expected import path when the mesh is still missing. The viewport is a
-pre-generation inspection aid: left-drag rotates, secondary-drag pans, and the
-mouse wheel zooms. Stage 6 still reports missing until the annotation-ready
-`objects/<object>/keypoints.json` file exists and validates.
+copy or import a selected `.obj` into the project `meshes/` folder. Importing
+an OBJ generates `objects/<object>/keypoints.json` for that object when the
+canonical keypoint file is absent, using the selected units-to-metre scale.
+The dashboard can also remove the selected object's Stage 6 geometry artifacts
+without deleting board definitions, face shots, or tag registry entries.
+Clicking an inferred object displays an
+interactive OBJ viewport for the staged mesh, or the expected import path when
+the mesh is still missing. The viewport is a pre-generation inspection aid:
+left-drag rotates, secondary-drag pans, and the mouse wheel zooms. Stage 6
+still reports missing until the annotation-ready `objects/<object>/keypoints.json`
+file exists and validates.
 
 ![Stage 6 mesh-keypoint dashboard preview](assets/stage4_mesh_keypoints_dashboard.png)
 
-The Stage 6 command card previews `posetag-gen-keypoints`; it does not open a
-native 3D mesh editor or run keypoint generation automatically.
+The Stage 6 command card still previews `posetag-gen-keypoints` for
+reproducibility. The dashboard import and generation actions write only absent
+canonical `keypoints.json` files; they do not overwrite existing or invalid
+keypoints. Use `posetag-gen-keypoints --force` deliberately after confirming
+units when a generated file needs replacement.
 
 ## Project Directory Side Effects
 
