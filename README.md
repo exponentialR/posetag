@@ -756,10 +756,13 @@ are separate sampled-point files and are not consumed by annotation. Use
 The optional `posetag-gui` dashboard shows this as Stage 6 between face-shot
 capture and annotation. It lists inferred objects, shows each expected
 `meshes/<object>.obj` input and `objects/<object>/keypoints.json` output,
-can import a selected `.obj` into the project mesh folder, and previews the
-`posetag-gen-keypoints` commands. Clicking an object shows an interactive OBJ
-viewport when a mesh is staged; drag to rotate, secondary-drag to pan, and use
-the mouse wheel to zoom. The stage remains missing until
+can import a selected `.obj` into the project mesh folder, and generates
+keypoints for that object when `keypoints.json` is absent using the selected
+units-to-metre scale. It can also remove the selected object's Stage 6 geometry
+artifacts so the mesh/keypoints can be reuploaded.
+Clicking an object shows an interactive OBJ viewport when a mesh is staged;
+drag to rotate, secondary-drag to pan, and use the mouse wheel to zoom. The
+stage remains missing until
 `objects/<object>/keypoints.json` exists and validates.
 
 Optional mesh visualisation:
@@ -777,6 +780,10 @@ Detailed Step 4 notes: `docs/workflows/step4_mesh_keypoints.md`.
 
 Click 4 corners; the tool detects tags to get `T_cam_board`, solves
 `T_cam_object`, and then derives `T_board_object = inv(T_cam_board) @ T_cam_object`.
+This step follows mesh-keypoint generation and expects
+`objects/<object>/keypoints.json`. Face labels may be generic sides such as
+`sideA` or named faces such as `front` and `back`; face-suffixed captures such
+as `column_white_front` use `objects/column_white/keypoints.json`.
 
 **Single shot**
 
@@ -798,15 +805,32 @@ posetag-annotate --batch latest --force
 posetag-annotate --browse
 ```
 
+In the GUI, Stage 7 shows the expected face-transform queue, the current
+annotation output count, dry-run/batch launch controls, and process logs. The
+**Open Annotator** button launches the existing `posetag-annotate --browse`
+workflow with `POSETAG_PROJECT` set for the selected project; corner clicking
+still happens in the OpenCV annotator window.
+
 **Dry run**
 
 ```bash
+posetag-annotate --shot /abs/path/to/shot_raw.png --dry-run
 posetag-annotate --batch latest --dry-run
 ```
 
+Required inputs:
+
+- `shots/manifest.csv` for batch and browse mode
+- raw shot image, captured annotated/reference image, and metadata JSON from
+  `posetag-capture-face`
+- board YAML referenced by the shot metadata or manifest row
+- camera intrinsics from metadata `camera` or manifest `fx`, `fy`, `cx`, `cy`
+- `objects/<object>/keypoints.json` from `posetag-gen-keypoints`
+
 **Outputs**
 
-- YAML: `faces/<object>/sideA|B|C|D/<face_key>_T_board_object.yaml`
+- YAML: `faces/<object>/<face-label>/<face_key>_T_board_object.yaml`, for
+  example `faces/column_white/front/column_white_front_T_board_object.yaml`
 - Review images next to the raw shot:
   `*_ann.png` and `*_reproj.png`
 - Auto-maintained face manifest:
@@ -814,6 +838,9 @@ posetag-annotate --batch latest --dry-run
 
 Batch annotation uses `shots/manifest.csv` as its source of truth for captures
 and automatically rebuilds `faces/face_manifest.csv` from the YAML outputs.
+`--batch latest` selects the latest saved shot per object/side/board group;
+`--dry-run` validates the selected images, metadata, board YAML, intrinsics,
+optional calibration distortion YAML, and keypoints JSON before opening any UI.
 
 Useful notes:
 
@@ -821,6 +848,8 @@ Useful notes:
 - `--auto-correct-scale` divides `T_cam_board` translation by `s` when
   `|s-1| > --scale-tol`
 - RMS reprojection error is shown during review and written into the YAML
+
+Detailed Step 5 notes: `docs/workflows/step5_annotate_faces.md`.
 
 ---
 
