@@ -178,6 +178,13 @@ from posetag.workflows.mesh_keypoints import (
 )
 
 CAPTURE_FACE_QUEUE_LABEL = "All missing registered faces"
+MESH_PREVIEW_TOOLTIP = (
+    "Left-drag rotates the OBJ preview. Right-drag or middle-drag pans. "
+    "Mouse wheel zooms."
+)
+MESH_DETACH_VIEWER_LABEL = "Detach Viewer"
+MESH_DETACHED_VIEWER_TITLE_PREFIX = "PoseTag Mesh Viewer"
+_QT_WIDGET_SIZE_MAX = 16777215
 
 
 def build_main_window(qt: Any, project_root: Path) -> Any:
@@ -388,23 +395,24 @@ def build_main_window(qt: Any, project_root: Path) -> Any:
             self.setPixmap(scaled)
 
     class _MeshPreviewCanvas(_ImagePreviewCanvas):
-        def __init__(self) -> None:
+        def __init__(self, *, detached: bool = False) -> None:
             super().__init__(
                 "Select an inferred object to preview its staged OBJ mesh.",
                 object_name="MeshKeypointPreview",
             )
-            self.setMinimumSize(560, 420)
-            self.setMaximumHeight(540)
+            if detached:
+                self.setMinimumSize(900, 640)
+                self.setMaximumHeight(_QT_WIDGET_SIZE_MAX)
+            else:
+                self.setMinimumSize(760, 560)
+                self.setMaximumHeight(780)
             self.setSizePolicy(
                 QtWidgets.QSizePolicy.Policy.Expanding,
                 QtWidgets.QSizePolicy.Policy.Expanding,
             )
             self.setMouseTracking(True)
             self.setCursor(QtCore.Qt.CursorShape.OpenHandCursor)
-            self.setToolTip(
-                "Left-drag rotates the OBJ preview. Right-drag or middle-drag "
-                "pans. Mouse wheel zooms."
-            )
+            self.setToolTip(MESH_PREVIEW_TOOLTIP)
             self._preview: Optional[MeshVertexPreview] = None
             self._rotation_x = -0.35
             self._rotation_y = 0.55
@@ -514,9 +522,14 @@ def build_main_window(qt: Any, project_root: Path) -> Any:
         def _render_current(self) -> None:
             if self._preview is None:
                 return
+            size = self.contentsRect().size()
+            canvas_width = max(640, int(size.width()))
+            canvas_height = max(420, int(size.height()))
             self.show_pixmap(
                 _mesh_preview_pixmap(
                     self._preview,
+                    canvas_width=canvas_width,
+                    canvas_height=canvas_height,
                     rotation_x=self._rotation_x,
                     rotation_y=self._rotation_y,
                     zoom=self._zoom,
@@ -528,14 +541,16 @@ def build_main_window(qt: Any, project_root: Path) -> Any:
     def _mesh_preview_pixmap(
         preview: MeshVertexPreview,
         *,
+        canvas_width: int = 1040,
+        canvas_height: int = 640,
         rotation_x: float,
         rotation_y: float,
         zoom: float,
         pan_x: float,
         pan_y: float,
     ) -> Any:
-        width = 1040
-        height = 640
+        width = max(640, int(canvas_width))
+        height = max(420, int(canvas_height))
         canvas = QtGui.QPixmap(width, height)
         canvas.fill(QtGui.QColor("#f8fbfd"))
         painter = QtGui.QPainter(canvas)
@@ -690,12 +705,9 @@ def build_main_window(qt: Any, project_root: Path) -> Any:
     ) -> tuple[float, float, float]:
         x, y, z = _normalised_vertex(vertex, preview)
         rotated = _rotate_preview_point(x, y, z, rotation_x, rotation_y)
-        depth = 3.0 + rotated[2]
-        scale = min(rect.width(), rect.height()) * 0.72 * zoom
-        if depth <= 0.25:
-            depth = 0.25
-        screen_x = rect.center().x() + pan_x + (rotated[0] / depth) * scale
-        screen_y = rect.center().y() + pan_y - (rotated[1] / depth) * scale
+        scale = min(rect.width(), rect.height()) * 0.82 * zoom
+        screen_x = rect.center().x() + pan_x + rotated[0] * scale
+        screen_y = rect.center().y() + pan_y - rotated[1] * scale
         return screen_x, screen_y, rotated[2]
 
     def _normalised_vertex(
@@ -2013,6 +2025,7 @@ def build_main_window(qt: Any, project_root: Path) -> Any:
             self._capture_previous_manifest_mtime_ns: Optional[int] = None
             self._capture_manifest_existed_at_launch = False
             self._capture_manifest_seen = False
+            self._mesh_keypoint_viewer_windows: list[Any] = []
 
             self._calibration_output_timer = QtCore.QTimer(self)
             self._calibration_output_timer.setInterval(1000)
@@ -4149,6 +4162,18 @@ def build_main_window(qt: Any, project_root: Path) -> Any:
             )
 
             self._mesh_keypoint_preview = _MeshPreviewCanvas()
+            self._mesh_keypoint_detach_view_button = QtWidgets.QPushButton(
+                MESH_DETACH_VIEWER_LABEL
+            )
+            self._mesh_keypoint_detach_view_button.setObjectName(
+                "SecondaryActionButton"
+            )
+            self._mesh_keypoint_detach_view_button.setToolTip(
+                "Open the selected OBJ preview in a separate resizable window."
+            )
+            self._mesh_keypoint_detach_view_button.clicked.connect(
+                self._open_detached_mesh_keypoint_viewer
+            )
 
             self._mesh_keypoint_object_command = QtWidgets.QLineEdit()
             self._mesh_keypoint_object_command.setObjectName("CommandPreview")
@@ -4177,21 +4202,41 @@ def build_main_window(qt: Any, project_root: Path) -> Any:
             mesh_object_command_widget = QtWidgets.QWidget()
             mesh_object_command_widget.setLayout(mesh_object_command_row)
 
+            mesh_preview_label = QtWidgets.QLabel("Object preview")
+            mesh_preview_label.setObjectName("FieldLabel")
+            mesh_preview_header = QtWidgets.QHBoxLayout()
+            mesh_preview_header.setContentsMargins(0, 0, 0, 0)
+            mesh_preview_header.addWidget(mesh_preview_label)
+            mesh_preview_header.addStretch(1)
+            mesh_preview_header.addWidget(self._mesh_keypoint_detach_view_button)
+            mesh_preview_column = QtWidgets.QWidget()
+            mesh_preview_layout = QtWidgets.QVBoxLayout(mesh_preview_column)
+            mesh_preview_layout.setContentsMargins(0, 0, 0, 0)
+            mesh_preview_layout.setSpacing(4)
+            mesh_preview_layout.addLayout(mesh_preview_header)
+            mesh_preview_layout.addWidget(self._mesh_keypoint_preview, 1)
+
+            mesh_keypoint_side_panel = QtWidgets.QWidget()
+            mesh_keypoint_side_layout = QtWidgets.QVBoxLayout(
+                mesh_keypoint_side_panel
+            )
+            mesh_keypoint_side_layout.setContentsMargins(0, 0, 0, 0)
+            mesh_keypoint_side_layout.setSpacing(10)
+            mesh_keypoint_side_layout.addWidget(
+                _make_field("Inferred objects", self._mesh_keypoint_objects)
+            )
+            mesh_keypoint_side_layout.addWidget(
+                _make_field("Selected object", self._mesh_keypoint_details)
+            )
+            mesh_keypoint_side_layout.addStretch(1)
+            mesh_keypoint_side_panel.setMinimumWidth(280)
+            mesh_keypoint_side_panel.setMaximumWidth(360)
+
             mesh_keypoints_body = QtWidgets.QHBoxLayout()
             mesh_keypoints_body.setContentsMargins(0, 0, 0, 0)
             mesh_keypoints_body.setSpacing(12)
-            mesh_keypoints_body.addWidget(
-                _make_field("Inferred objects", self._mesh_keypoint_objects),
-                2,
-            )
-            mesh_keypoints_body.addWidget(
-                _make_field("Object preview", self._mesh_keypoint_preview),
-                6,
-            )
-            mesh_keypoints_body.addWidget(
-                _make_field("Selected object", self._mesh_keypoint_details),
-                3,
-            )
+            mesh_keypoints_body.addWidget(mesh_keypoint_side_panel, 0)
+            mesh_keypoints_body.addWidget(mesh_preview_column, 1)
 
             self._mesh_keypoint_import_button = QtWidgets.QPushButton("Import OBJ")
             self._mesh_keypoint_import_button.setObjectName("PrimaryActionButton")
@@ -4243,7 +4288,7 @@ def build_main_window(qt: Any, project_root: Path) -> Any:
 
             mesh_keypoints_layout.addWidget(mesh_keypoints_title)
             mesh_keypoints_layout.addWidget(mesh_keypoints_note)
-            mesh_keypoints_layout.addLayout(mesh_keypoints_body)
+            mesh_keypoints_layout.addLayout(mesh_keypoints_body, 1)
             mesh_keypoints_layout.addWidget(
                 _make_field("Selected command", mesh_object_command_widget)
             )
@@ -5821,6 +5866,7 @@ def build_main_window(qt: Any, project_root: Path) -> Any:
                 self._mesh_keypoint_object_command.clear()
                 self._mesh_keypoint_import_button.setEnabled(False)
                 self._mesh_keypoint_reset_view_button.setEnabled(False)
+                self._mesh_keypoint_detach_view_button.setEnabled(False)
                 self._mesh_keypoint_copy_object_button.setEnabled(False)
                 self._mesh_keypoint_copy_all_button.setEnabled(False)
                 return
@@ -5833,6 +5879,7 @@ def build_main_window(qt: Any, project_root: Path) -> Any:
             self._mesh_keypoint_object_command.setCursorPosition(0)
             self._mesh_keypoint_import_button.setEnabled(True)
             self._mesh_keypoint_reset_view_button.setEnabled(status.mesh_exists)
+            self._mesh_keypoint_detach_view_button.setEnabled(True)
             self._mesh_keypoint_copy_object_button.setEnabled(True)
             self._mesh_keypoint_copy_all_button.setEnabled(
                 bool(self._mesh_keypoint_statuses_from_list())
@@ -5848,6 +5895,87 @@ def build_main_window(qt: Any, project_root: Path) -> Any:
             if not hasattr(self, "_mesh_keypoint_preview"):
                 return
             self._mesh_keypoint_preview.reset_view()
+
+        def _open_detached_mesh_keypoint_viewer(self) -> None:
+            status = self._selected_mesh_keypoint_status()
+            if status is None:
+                self.statusBar().showMessage(
+                    "Select an inferred object before opening the viewer.",
+                    3000,
+                )
+                return
+
+            dialog = QtWidgets.QDialog(self)
+            dialog.setWindowTitle(
+                f"{MESH_DETACHED_VIEWER_TITLE_PREFIX}: {status.object_name}"
+            )
+            dialog.setModal(False)
+            dialog.setAttribute(QtCore.Qt.WidgetAttribute.WA_DeleteOnClose, True)
+            dialog.resize(1180, 820)
+
+            title = QtWidgets.QLabel(status.object_name)
+            title.setObjectName("CardTitle")
+            subtitle = QtWidgets.QLabel(_format_mesh_keypoint_details(status))
+            subtitle.setObjectName("OutputText")
+            subtitle.setWordWrap(True)
+            subtitle.setMaximumWidth(360)
+            subtitle.setTextInteractionFlags(
+                QtCore.Qt.TextInteractionFlag.TextSelectableByMouse
+            )
+
+            viewer = _MeshPreviewCanvas(detached=True)
+            viewer.show_status(status)
+
+            reset_button = QtWidgets.QPushButton("Reset View")
+            reset_button.setObjectName("SecondaryActionButton")
+            reset_button.setEnabled(status.mesh_exists)
+            reset_button.clicked.connect(viewer.reset_view)
+            maximize_button = QtWidgets.QPushButton("Maximize")
+            maximize_button.setObjectName("SecondaryActionButton")
+            maximize_button.clicked.connect(dialog.showMaximized)
+            close_button = QtWidgets.QPushButton("Close")
+            close_button.setObjectName("SecondaryActionButton")
+            close_button.clicked.connect(dialog.close)
+
+            action_row = QtWidgets.QHBoxLayout()
+            action_row.addWidget(reset_button)
+            action_row.addWidget(maximize_button)
+            action_row.addStretch(1)
+            action_row.addWidget(close_button)
+
+            side_layout = QtWidgets.QVBoxLayout()
+            side_layout.setContentsMargins(0, 0, 0, 0)
+            side_layout.setSpacing(8)
+            side_layout.addWidget(title)
+            side_layout.addWidget(subtitle)
+            side_layout.addStretch(1)
+
+            body = QtWidgets.QHBoxLayout()
+            body.setSpacing(12)
+            body.addWidget(viewer, 1)
+            body.addLayout(side_layout, 0)
+
+            layout = QtWidgets.QVBoxLayout(dialog)
+            layout.setContentsMargins(14, 14, 14, 14)
+            layout.setSpacing(10)
+            layout.addLayout(body, 1)
+            layout.addLayout(action_row)
+            dialog.setStyleSheet(_style_sheet())
+
+            self._mesh_keypoint_viewer_windows.append(dialog)
+
+            def _forget_window(*_: Any) -> None:
+                if dialog in self._mesh_keypoint_viewer_windows:
+                    self._mesh_keypoint_viewer_windows.remove(dialog)
+
+            dialog.destroyed.connect(_forget_window)
+            dialog.show()
+            dialog.raise_()
+            dialog.activateWindow()
+            self.statusBar().showMessage(
+                f"Opened mesh viewer for {status.object_name}.",
+                3000,
+            )
 
         def _copy_selected_mesh_keypoint_command(self) -> None:
             status = self._selected_mesh_keypoint_status()

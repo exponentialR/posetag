@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import inspect
 import os
 import subprocess
 import sys
@@ -18,6 +19,9 @@ import yaml
 
 from posetag.gui import app as gui_app
 from posetag.gui.main_window import (
+    MESH_DETACHED_VIEWER_TITLE_PREFIX,
+    MESH_DETACH_VIEWER_LABEL,
+    MESH_PREVIEW_TOOLTIP,
     _board_building_command_card_note,
     _board_building_command_ready_message,
     _board_building_run_button_label,
@@ -66,6 +70,7 @@ from posetag.gui.main_window import (
     _stage_rail_number_style,
     _stage_status_chip_style,
     _style_sheet,
+    build_main_window,
 )
 from posetag.workflows.calibration_flow import (
     CameraCalibrationOutputSummary,
@@ -434,6 +439,20 @@ class WorkflowGuiTests(unittest.TestCase):
             staged_ready,
             "0 objects need OBJ mesh input; 1 object needs keypoints JSON.",
         )
+
+    def test_mesh_keypoint_preview_has_detachable_large_viewer(self) -> None:
+        source = inspect.getsource(build_main_window)
+
+        self.assertEqual(MESH_DETACH_VIEWER_LABEL, "Detach Viewer")
+        self.assertEqual(
+            MESH_DETACHED_VIEWER_TITLE_PREFIX,
+            "PoseTag Mesh Viewer",
+        )
+        self.assertIn("Left-drag rotates", MESH_PREVIEW_TOOLTIP)
+        self.assertIn("setMinimumSize(760, 560)", source)
+        self.assertIn("setMinimumSize(900, 640)", source)
+        self.assertIn("_open_detached_mesh_keypoint_viewer", source)
+        self.assertIn("showMaximized", source)
 
     def test_project_root_hint_does_not_create_empty_project(self) -> None:
         with TemporaryDirectory() as tmpdir:
