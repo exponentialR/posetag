@@ -14,13 +14,17 @@ Controls:
 """
 
 from __future__ import annotations
-import argparse, json, os
+import argparse, json
 from pathlib import Path
 import numpy as np
-import open3d as o3d
 import yaml
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
+from utils.project_config import resolve_project_root
+
+try:
+    import open3d as o3d
+except Exception:
+    o3d = None
 
 def _load_keypoints(kp_path: Path) -> dict:
     with kp_path.open("r") as f:
@@ -38,16 +42,16 @@ def _load_object_cfg(cfg_path: Path) -> dict | None:
         cfg = yaml.safe_load(f) or {}
     return cfg
 
-def _resolve_mesh_path(obj_name: str, args_obj: str | None, cfg: dict | None) -> Path:
+def _resolve_mesh_path(project_root: Path, obj_name: str, args_obj: str | None, cfg: dict | None) -> Path:
     # Priority: CLI --obj > object_config.yaml > meshes/<obj>.obj (best effort)
     if args_obj:
         p = Path(args_obj)
-        return (p if p.is_absolute() else (REPO_ROOT / p)).resolve()
+        return (p if p.is_absolute() else (project_root / p)).resolve()
     if cfg and "mesh" in cfg and "path" in cfg["mesh"]:
         p = Path(cfg["mesh"]["path"])
-        return (p if p.is_absolute() else (REPO_ROOT / p)).resolve()
+        return (p if p.is_absolute() else (project_root / p)).resolve()
     # fallback guesses
-    cand = REPO_ROOT / "meshes" / f"{obj_name}.obj"
+    cand = project_root / "meshes" / f"{obj_name}.obj"
     if cand.exists():
         return cand.resolve()
     raise FileNotFoundError("Could not resolve mesh path. Pass --obj or set meshes/<name>.obj or object_config.yaml: mesh.path")
@@ -89,8 +93,9 @@ def _axis(length=0.05) -> o3d.geometry.TriangleMesh:
 
 def main():
     ap = argparse.ArgumentParser("Visualise keypoints on mesh")
+    ap.add_argument("--project_root", default=None, help="PoseTag project root")
     ap.add_argument("--object_name", required=True, help="e.g. connection_plate_white")
-    ap.add_argument("--obj", default=None, help="Path to OBJ (overrides object_config)")
+    ap.add_argument("--obj", "--mesh", dest="obj", default=None, help="Path to OBJ (overrides object_config)")
     ap.add_argument("--keypoints", default=None, help="Path to keypoints.json")
     ap.add_argument("--object_config", default=None, help="Path to object_config.yaml")
     ap.add_argument("--units_to_m", type=float, default=None, help="Override scale (m per OBJ unit)")
@@ -98,14 +103,18 @@ def main():
     ap.add_argument("--show_axes", action="store_true", help="Show world axes")
     args = ap.parse_args()
 
-    obj_dir = REPO_ROOT / "objects" / args.object_name
+    if o3d is None:
+        raise SystemExit("[!] view_keypoints needs open3d; install the optional visualization dependency.")
+
+    project_root = resolve_project_root(args.project_root)
+    obj_dir = project_root / "objects" / args.object_name
     kp_path = Path(args.keypoints) if args.keypoints else (obj_dir / "keypoints.json")
     cfg_path = Path(args.object_config) if args.object_config else (obj_dir / "object_config.yaml")
 
     kp = _load_keypoints(kp_path)
     cfg = _load_object_cfg(cfg_path)
 
-    mesh_path = _resolve_mesh_path(args.object_name, args.obj, cfg)
+    mesh_path = _resolve_mesh_path(project_root, args.object_name, args.obj, cfg)
     scale = _get_units_to_m(kp, cfg, args.units_to_m)
     T_mo = _get_T_mesh_object(cfg)  # maps object->mesh
 

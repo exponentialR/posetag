@@ -146,6 +146,44 @@ def _write_face_capture(
     append_capture_manifest(project_root / "shots" / "manifest.csv", metadata)
 
 
+def _write_valid_keypoints(project_root: Path, object_name: str) -> Path:
+    path = project_root / "objects" / object_name / "keypoints.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(
+            {
+                "units_to_m": 1.0,
+                "points": {
+                    "xmin_ymin_zmin": [0.0, 0.0, 0.0],
+                    "xmin_ymin_zmax": [0.0, 0.0, 1.0],
+                    "xmin_ymax_zmin": [0.0, 1.0, 0.0],
+                    "xmin_ymax_zmax": [0.0, 1.0, 1.0],
+                    "xmax_ymin_zmin": [1.0, 0.0, 0.0],
+                    "xmax_ymin_zmax": [1.0, 0.0, 1.0],
+                    "xmax_ymax_zmin": [1.0, 1.0, 0.0],
+                    "xmax_ymax_zmax": [1.0, 1.0, 1.0],
+                },
+                "faces": {
+                    f"{object_name}_sideA": [
+                        "xmax_ymax_zmin",
+                        "xmax_ymax_zmax",
+                        "xmax_ymin_zmax",
+                        "xmax_ymin_zmin",
+                    ],
+                    f"{object_name}_sideB": [
+                        "xmin_ymax_zmin",
+                        "xmin_ymax_zmax",
+                        "xmin_ymin_zmax",
+                        "xmin_ymin_zmin",
+                    ],
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    return path
+
+
 class WorkflowStatusTests(unittest.TestCase):
     def test_empty_project_reports_calibration_first_gui_order(self) -> None:
         with TemporaryDirectory() as tmpdir:
@@ -158,7 +196,7 @@ class WorkflowStatusTests(unittest.TestCase):
             self.assertEqual(by_id[2].status, WorkflowStatus.NOT_APPLICABLE)
             self.assertEqual(by_id[3].status, WorkflowStatus.NOT_APPLICABLE)
             self.assertEqual(by_id[4].status, WorkflowStatus.NOT_APPLICABLE)
-            self.assertEqual(len(summaries), 9)
+            self.assertEqual(len(summaries), 10)
             self.assertEqual(
                 [summary.name for summary in summaries],
                 [
@@ -168,6 +206,7 @@ class WorkflowStatusTests(unittest.TestCase):
                     "Generate Object AprilTags",
                     "Build Object Board Definitions",
                     "Capture Face Shots",
+                    "Generate Mesh Keypoints / Object Geometry",
                     "Annotate Faces / Board-To-Object Transforms",
                     "Collect Dataset / Estimate Poses",
                     "Review And Export",
@@ -379,15 +418,19 @@ class WorkflowStatusTests(unittest.TestCase):
 
             stage5 = _stage_by_id(project_root, 5)
             stage6 = _stage_by_id(project_root, 6)
+            stage7 = _stage_by_id(project_root, 7)
 
             self.assertEqual(stage5.status, WorkflowStatus.MISSING)
             self.assertIn("No face-shot manifest", stage5.message)
             self.assertEqual(stage6.status, WorkflowStatus.NOT_APPLICABLE)
+            self.assertEqual(stage7.status, WorkflowStatus.NOT_APPLICABLE)
 
     def test_partial_face_shot_coverage_needs_attention(self) -> None:
         with TemporaryDirectory() as tmpdir:
             project_root = Path(tmpdir) / "project"
-            board_paths, _registry_path = _write_two_face_board_and_registry(project_root)
+            board_paths, _registry_path = _write_two_face_board_and_registry(
+                project_root
+            )
             _write_face_capture(
                 project_root,
                 board_paths["sideA"],
@@ -417,10 +460,96 @@ class WorkflowStatusTests(unittest.TestCase):
 
             stage5 = _stage_by_id(project_root, 5)
             stage6 = _stage_by_id(project_root, 6)
+            stage7 = _stage_by_id(project_root, 7)
 
             self.assertEqual(stage5.status, WorkflowStatus.COMPLETE)
             self.assertIn("valid face-shot coverage for 2 registered faces", stage5.message)
             self.assertEqual(stage6.status, WorkflowStatus.MISSING)
+            self.assertIn("Missing annotation-ready keypoints", stage6.message)
+            self.assertIn(
+                str(project_root / "objects" / "connection_plate_white" / "keypoints.json"),
+                stage6.checked_paths,
+            )
+            self.assertEqual(stage7.status, WorkflowStatus.NOT_APPLICABLE)
+
+    def test_valid_keypoints_after_face_shots_mark_stage6_complete(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            project_root = Path(tmpdir) / "project"
+            board_paths, _registry_path = _write_two_face_board_and_registry(project_root)
+            _write_face_capture(
+                project_root,
+                board_paths["sideA"],
+                timestamp="20260530_120000",
+            )
+            _write_face_capture(
+                project_root,
+                board_paths["sideB"],
+                timestamp="20260530_120100",
+            )
+            keypoints_path = _write_valid_keypoints(
+                project_root,
+                "connection_plate_white",
+            )
+
+            stage6 = _stage_by_id(project_root, 6)
+            stage7 = _stage_by_id(project_root, 7)
+
+            self.assertEqual(stage6.status, WorkflowStatus.COMPLETE)
+            self.assertIn("annotation-ready keypoints for 1 object", stage6.message)
+            self.assertIn(str(keypoints_path), stage6.checked_paths)
+            self.assertEqual(stage7.status, WorkflowStatus.MISSING)
+            self.assertIn("Face annotation status", stage7.message)
+
+    def test_keypoints_missing_captured_side_keep_stage6_invalid(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            project_root = Path(tmpdir) / "project"
+            board_paths, _registry_path = _write_two_face_board_and_registry(project_root)
+            _write_face_capture(
+                project_root,
+                board_paths["sideA"],
+                timestamp="20260530_120000",
+            )
+            _write_face_capture(
+                project_root,
+                board_paths["sideB"],
+                timestamp="20260530_120100",
+            )
+            keypoints_path = _write_valid_keypoints(project_root, "connection_plate_white")
+            payload = json.loads(keypoints_path.read_text(encoding="utf-8"))
+            del payload["faces"]["connection_plate_white_sideB"]
+            keypoints_path.write_text(json.dumps(payload), encoding="utf-8")
+
+            stage6 = _stage_by_id(project_root, 6)
+            stage7 = _stage_by_id(project_root, 7)
+
+            self.assertEqual(stage6.status, WorkflowStatus.NEEDS_ATTENTION)
+            self.assertTrue(
+                any("connection_plate_white_sideB" in error for error in stage6.errors)
+            )
+            self.assertEqual(stage7.status, WorkflowStatus.NOT_APPLICABLE)
+
+    def test_invalid_keypoints_after_face_shots_need_attention(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            project_root = Path(tmpdir) / "project"
+            board_path, _registry_path = _write_valid_board_and_registry(project_root)
+            _write_face_capture(
+                project_root,
+                board_path,
+                timestamp="20260530_120000",
+            )
+            keypoints_path = project_root / "objects" / "connection_plate_white" / "keypoints.json"
+            keypoints_path.parent.mkdir(parents=True, exist_ok=True)
+            keypoints_path.write_text(
+                json.dumps({"units_to_m": 1.0, "points": {}, "faces": {}}),
+                encoding="utf-8",
+            )
+
+            stage6 = _stage_by_id(project_root, 6)
+            stage7 = _stage_by_id(project_root, 7)
+
+            self.assertEqual(stage6.status, WorkflowStatus.NEEDS_ATTENTION)
+            self.assertTrue(any("points" in error for error in stage6.errors))
+            self.assertEqual(stage7.status, WorkflowStatus.NOT_APPLICABLE)
 
     def test_broken_face_shot_output_needs_attention(self) -> None:
         with TemporaryDirectory() as tmpdir:

@@ -4,8 +4,8 @@ gen_keypoints.py
 Interactive browser to generate canonical keypoints (axis-aligned box corners)
 for OBJ meshes and to preview them in a single stacked OpenCV window.
 
-Project layout (no CLI args needed)
------------------------------------
+Project layout
+--------------
 <project_root>/
   meshes/<object>.obj                 # input meshes
   objects/<object>/
@@ -75,18 +75,32 @@ Tips / Troubleshooting
 
 Run
 ---
-python -m src.gen_keypoints
+posetag-gen-keypoints --project_root my_project --mesh meshes/<object>.obj
+python -m gen_keypoints               # legacy browser
 """
 
 from __future__ import annotations
+import argparse
 import json
 from pathlib import Path
-from typing import Tuple
+from typing import Optional, Tuple
 import numpy as np
 import cv2, yaml
 
 from utils.project_config import resolve_project_root, ensure_project_dirs
 from utils.logger import init_project_logger
+from posetag.workflows.mesh_keypoints import (
+    MeshKeypointWorkflowError,
+    choose_keypoints_output_path,
+    expected_face_keys,
+    format_known_objects,
+    infer_known_objects,
+    object_config_payload,
+    resolve_object_identity,
+    supported_mesh_extensions,
+    validate_keypoint_payload,
+    validate_mesh_path,
+)
 
 def _pill_width(text):
     (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
@@ -103,11 +117,21 @@ def load_obj_vertices(path: Path) -> np.ndarray:
     with path.open("r", encoding="utf-8", errors="ignore") as f:
         for line in f:
             if line.startswith("v "):
-                _, x, y, z, *rest = line.strip().split()
-                try: vs.append([float(x), float(y), float(z)])
-                except ValueError: pass
+                parts = line.strip().split()
+                if len(parts) < 4:
+                    continue
+                _, x, y, z, *rest = parts
+                try:
+                    vertex = [float(x), float(y), float(z)]
+                except ValueError:
+                    continue
+                if not np.all(np.isfinite(vertex)):
+                    raise MeshKeypointWorkflowError(
+                        f"OBJ mesh contains non-finite vertex coordinates: {path}"
+                    )
+                vs.append(vertex)
     if not vs:
-        raise SystemExit(f"[!] No vertices found in {path}")
+        raise MeshKeypointWorkflowError(f"No vertices found in {path}")
     return np.asarray(vs, dtype=np.float64)
 
 def corners_from_bounds(vmin, vmax, r=6):
@@ -278,7 +302,12 @@ def _three_view(V, C, w=LEFT_W, h=PANEL_H):
 
 # ---------------- Payload & preview ----------------
 
-def _make_faces_mapping(obj_name: str, extents, auto=True):
+def _make_faces_mapping(
+    obj_name: str,
+    extents,
+    auto=True,
+    expected_face_labels=(),
+):
     def parse_face(s): return (s[1].lower(), +1 if s[0]=="+" else -1)
     if auto:
         a_axis, c_axis = auto_side_mapping(extents)
@@ -290,27 +319,163 @@ def _make_faces_mapping(obj_name: str, extents, auto=True):
     B = face_corner_names(*parse_face(facespec[1]))
     C = face_corner_names(*parse_face(facespec[2]))
     D = face_corner_names(*parse_face(facespec[3]))
-    faces = {
-        f"{obj_name}_sideA": A,
-        f"{obj_name}_sideB": B,
-        f"{obj_name}_sideC": C,
-        f"{obj_name}_sideD": D,
+    side_faces = {
+        "sideA": A,
+        "sideB": B,
+        "sideC": C,
+        "sideD": D,
     }
+    faces = {f"{obj_name}_{label}": corners for label, corners in side_faces.items()}
+    for label in expected_face_labels:
+        face_label = str(label).strip()
+        if not face_label:
+            continue
+        key = (
+            face_label
+            if face_label.startswith(f"{obj_name}_")
+            else f"{obj_name}_{face_label}"
+        )
+        if key in faces:
+            continue
+        corners = _expected_face_corners(face_label, side_faces)
+        if corners is not None:
+            faces[key] = corners
     return faces, facespec
+
+
+def _expected_face_corners(face_label: str, side_faces: dict[str, list[str]]):
+    aliases = {
+        "front": "sideA",
+        "back": "sideB",
+        "right": "sideC",
+        "left": "sideD",
+        "top": "+Z",
+        "upper": "+Z",
+        "bottom": "-Z",
+        "lower": "-Z",
+    }
+    if face_label in side_faces:
+        return side_faces[face_label]
+    alias = aliases.get(face_label.lower())
+    if alias in side_faces:
+        return side_faces[alias]
+    if alias in {"+Z", "-Z"}:
+        axis = alias[1].lower()
+        sign = +1 if alias[0] == "+" else -1
+        return face_corner_names(axis, sign)
+    return None
 
 def _any_annotations_exist(project_root: Path, obj_name: str) -> bool:
     return any((project_root/"faces"/obj_name).glob("side*/**/*.yaml"))
 
 def _compute_payload(project_root: Path, obj_name: str, obj_path: Path,
-                     units_to_m: float, auto_sides: bool, round_dec=6):
+                     units_to_m: float, auto_sides: bool, round_dec=6,
+                     expected_face_labels=()):
     V = load_obj_vertices(obj_path)
     V = apply_T_mesh_object(V, project_root/"objects"/obj_name/"object_config.yaml")
+    if not np.all(np.isfinite(V)):
+        raise MeshKeypointWorkflowError(
+            "OBJ mesh contains non-finite coordinates after applying T_mesh_object."
+        )
     vmin = V.min(axis=0)*units_to_m; vmax = V.max(axis=0)*units_to_m
+    if not np.all(np.isfinite(vmin)) or not np.all(np.isfinite(vmax)):
+        raise MeshKeypointWorkflowError("Generated keypoint bounds are non-finite.")
     points = corners_from_bounds(vmin, vmax, r=round_dec)
-    faces, facespec = _make_faces_mapping(obj_name, vmax-vmin, auto=auto_sides)
-    payload = {"units_to_m": float(units_to_m), "points": points, "faces": faces, "facespec": facespec}
+    faces, facespec = _make_faces_mapping(
+        obj_name,
+        vmax-vmin,
+        auto=auto_sides,
+        expected_face_labels=expected_face_labels,
+    )
+    payload = {
+        "units_to_m": float(units_to_m),
+        "points": points,
+        "faces": faces,
+        "facespec": facespec,
+    }
     cuboid = np.array(list(points.values()), dtype=np.float64)
     return payload, V*units_to_m, cuboid
+
+
+def generate_keypoints_for_mesh(
+    project_root: Path,
+    mesh_path: Path | str,
+    *,
+    object_name: Optional[str] = None,
+    units_to_m: float = 1.0,
+    auto_sides: bool = True,
+    round_decimals: int = 6,
+    write_config: bool = True,
+    force: bool = False,
+    keep_both: bool = False,
+) -> dict[str, Path | str | bool]:
+    """Generate annotation-ready keypoints for one mesh without opening the UI."""
+
+    root = Path(project_root).expanduser()
+    mesh = validate_mesh_path(root, mesh_path)
+    if not np.isfinite(float(units_to_m)) or units_to_m <= 0:
+        raise MeshKeypointWorkflowError("--units_to_m must be finite and positive.")
+    if round_decimals < 0:
+        raise MeshKeypointWorkflowError("--round-decimals must be zero or greater.")
+
+    identity = resolve_object_identity(root, mesh, object_name=object_name)
+    expected_face_labels = _known_face_labels(
+        identity.known_objects,
+        identity.object_name,
+    )
+    payload, _, _ = _compute_payload(
+        root,
+        identity.object_name,
+        mesh,
+        float(units_to_m),
+        auto_sides,
+        round_dec=round_decimals,
+        expected_face_labels=expected_face_labels,
+    )
+    facespec = payload.pop("facespec")
+    schema_errors = validate_keypoint_payload(
+        payload,
+        expected_faces=expected_face_keys(identity.object_name, expected_face_labels),
+    )
+    if schema_errors:
+        raise MeshKeypointWorkflowError(" ".join(schema_errors))
+
+    save_path = choose_keypoints_output_path(
+        identity.output_path,
+        force=force,
+        keep_both=keep_both,
+    )
+    save_path.parent.mkdir(parents=True, exist_ok=True)
+    save_path.write_text(
+        json.dumps(payload, indent=2, allow_nan=False),
+        encoding="utf-8",
+    )
+
+    config_path = save_path.parent / "object_config.yaml"
+    if write_config:
+        cfg = object_config_payload(
+            root,
+            mesh,
+            units_to_m=float(units_to_m),
+            facespec=facespec,
+        )
+        config_path.write_text(yaml.safe_dump(cfg, sort_keys=False), encoding="utf-8")
+
+    return {
+        "project_root": root,
+        "mesh_path": mesh,
+        "object_name": identity.object_name,
+        "keypoints_path": save_path,
+        "object_config_path": config_path if write_config else "",
+        "inferred_from_mesh": identity.inferred_from_mesh,
+    }
+
+
+def _known_face_labels(known_objects, object_name: str) -> tuple[str, ...]:
+    for item in known_objects:
+        if item.object_name == object_name:
+            return item.faces
+    return ()
 
 def _open3d_preview(obj_name: str, obj_path: Path, kp_dict: dict):
     try:
@@ -329,10 +494,19 @@ def _open3d_preview(obj_name: str, obj_path: Path, kp_dict: dict):
 # ---------------- Browser ----------------
 
 def _index_meshes(project_root: Path):
-    ms = sorted((project_root/"meshes").glob("*.obj"))
+    exts = set(supported_mesh_extensions())
+    ms = sorted(
+        p
+        for p in (project_root/"meshes").rglob("*")
+        if p.is_file() and p.suffix.lower() in exts
+    )
     out=[]
     for p in ms:
-        name=p.stem
+        try:
+            identity = resolve_object_identity(project_root, p)
+            name = identity.object_name
+        except MeshKeypointWorkflowError:
+            name=p.stem
         kp=project_root/"objects"/name/"keypoints.json"
         cfg=project_root/"objects"/name/"object_config.yaml"
         ann=_any_annotations_exist(project_root,name)
@@ -340,12 +514,13 @@ def _index_meshes(project_root: Path):
                     "has_kp":kp.exists(),"has_cfg":cfg.exists(),"has_ann":ann})
     return out
 
-def main():
-    pr = resolve_project_root(None); ensure_project_dirs(pr)
+def _browse_project(pr: Path) -> int:
+    ensure_project_dirs(pr)
     log = init_project_logger(pr/"logs"/"gen_keypoints.log", level="INFO", console=True)
 
     entries=_index_meshes(pr)
-    if not entries: raise SystemExit(f"[!] No .obj files in {pr}/meshes")
+    if not entries:
+        raise SystemExit(f"[!] No supported mesh files in {pr}/meshes")
 
     i=0; auto=True; units=1.0; write_cfg=True; mode="bbox"
     win="Gen Keypoints"; cv2.namedWindow(win, cv2.WINDOW_NORMAL)
@@ -444,6 +619,146 @@ def main():
             entries[i]["has_kp"]=True
             entries[i]["has_cfg"]=entries[i]["has_cfg"] or write_cfg
     cv2.destroyAllWindows()
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Generate annotation-ready PoseTag object keypoints from OBJ meshes. "
+            "Outputs go to objects/<object>/keypoints.json."
+        )
+    )
+    parser.add_argument(
+        "--project_root",
+        default=None,
+        help="PoseTag project root. Defaults to the active project resolution rules.",
+    )
+    parser.add_argument(
+        "--mesh",
+        default=None,
+        help=(
+            "Mesh to process. Relative paths are resolved under the project root. "
+            "Use --browse or omit --mesh for the legacy OpenCV browser."
+        ),
+    )
+    parser.add_argument(
+        "--object_name",
+        default=None,
+        help=(
+            "Explicit PoseTag object identity for objects/<object>/keypoints.json. "
+            "Required when the mesh filename differs from the object name."
+        ),
+    )
+    parser.add_argument(
+        "--units_to_m",
+        type=float,
+        default=1.0,
+        help="Scale from mesh units to metres for saved keypoint coordinates.",
+    )
+    parser.add_argument(
+        "--manual-sides",
+        action="store_true",
+        help="Use fixed +X,-X,+Y,-Y side mapping instead of auto-mapping thin axes.",
+    )
+    parser.add_argument(
+        "--no-object-config",
+        action="store_true",
+        help="Do not write objects/<object>/object_config.yaml.",
+    )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Overwrite objects/<object>/keypoints.json if it already exists.",
+    )
+    parser.add_argument(
+        "--keep-both",
+        action="store_true",
+        help="Keep an existing keypoints.json and write keypoints_v2.json, etc.",
+    )
+    parser.add_argument(
+        "--round-decimals",
+        type=int,
+        default=6,
+        help="Decimal places for generated AABB corner coordinates.",
+    )
+    parser.add_argument(
+        "--list",
+        action="store_true",
+        help="Print inferred objects/faces and supported meshes, then exit.",
+    )
+    parser.add_argument(
+        "--browse",
+        action="store_true",
+        help="Open the legacy OpenCV mesh browser.",
+    )
+    return parser
+
+
+def _print_inventory(project_root: Path) -> None:
+    known = infer_known_objects(project_root)
+    print("Known PoseTag objects/faces:")
+    print(format_known_objects(known))
+    print()
+    print("Supported mesh extensions:", ", ".join(supported_mesh_extensions()))
+    mesh_dir = project_root / "meshes"
+    meshes = []
+    if mesh_dir.exists():
+        meshes = sorted(
+            path
+            for path in mesh_dir.rglob("*")
+            if path.is_file() and path.suffix.lower() in supported_mesh_extensions()
+        )
+    if meshes:
+        print("Meshes:")
+        for path in meshes:
+            try:
+                identity = resolve_object_identity(project_root, path)
+                target = identity.output_path
+                status = "exists" if target.exists() else "missing"
+                print(f"- {path.relative_to(project_root)} -> {identity.object_name} ({status})")
+            except MeshKeypointWorkflowError as exc:
+                print(f"- {path.relative_to(project_root)} -> needs --object_name ({exc})")
+    else:
+        print(f"No supported meshes found under {mesh_dir}.")
+
+
+def main(argv=None):
+    parser = build_parser()
+    args = parser.parse_args(argv)
+
+    project_root = resolve_project_root(args.project_root)
+    ensure_project_dirs(project_root)
+
+    try:
+        if args.list:
+            _print_inventory(project_root)
+            return 0
+
+        if args.mesh:
+            if args.browse:
+                parser.error("--browse cannot be combined with --mesh.")
+            result = generate_keypoints_for_mesh(
+                project_root,
+                args.mesh,
+                object_name=args.object_name,
+                units_to_m=args.units_to_m,
+                auto_sides=not args.manual_sides,
+                round_decimals=args.round_decimals,
+                write_config=not args.no_object_config,
+                force=args.force,
+                keep_both=args.keep_both,
+            )
+            print(f"Object: {result['object_name']}")
+            print(f"Mesh: {result['mesh_path']}")
+            print(f"Output: {result['keypoints_path']}")
+            if result["object_config_path"]:
+                print(f"Object config: {result['object_config_path']}")
+            return 0
+
+        return _browse_project(project_root)
+    except MeshKeypointWorkflowError as exc:
+        raise SystemExit(f"[!] {exc}") from exc
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

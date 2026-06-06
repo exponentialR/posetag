@@ -9,6 +9,7 @@ pose-estimation algorithms in their existing pipeline modules.
 from __future__ import annotations
 
 import math
+import json
 from dataclasses import asdict, dataclass
 from enum import Enum
 from pathlib import Path
@@ -22,6 +23,12 @@ from posetag.pipelines.make_board import (
     load_registry,
 )
 from posetag.workflows.capture_face import inspect_capture_face_outputs
+from posetag.workflows.mesh_keypoints import (
+    expected_face_keys,
+    expected_keypoints_path,
+    infer_known_objects,
+    validate_keypoint_payload,
+)
 
 
 class WorkflowStatus(str, Enum):
@@ -71,9 +78,10 @@ _STAGE_NAMES = {
     3: ("generate_object_tags", "Generate Object AprilTags"),
     4: ("build_object_boards", "Build Object Board Definitions"),
     5: ("capture_face_shots", "Capture Face Shots"),
-    6: ("annotate_faces", "Annotate Faces / Board-To-Object Transforms"),
-    7: ("collect_dataset", "Collect Dataset / Estimate Poses"),
-    8: ("review_export", "Review And Export"),
+    6: ("generate_mesh_keypoints", "Generate Mesh Keypoints / Object Geometry"),
+    7: ("annotate_faces", "Annotate Faces / Board-To-Object Transforms"),
+    8: ("collect_dataset", "Collect Dataset / Estimate Poses"),
+    9: ("review_export", "Review And Export"),
 }
 
 _CALIBRATION_REQUIRED_FIELDS = (
@@ -117,6 +125,10 @@ def inspect_project(project_root: Union[Path, str]) -> list[StageSummary]:
         board_definitions_complete=board_definitions.status
         == WorkflowStatus.COMPLETE,
     )
+    mesh_keypoints = inspect_mesh_keypoints(
+        root,
+        face_shots_complete=face_shots.status == WorkflowStatus.COMPLETE,
+    )
     summaries = [
         project_setup,
         charuco_board,
@@ -124,10 +136,11 @@ def inspect_project(project_root: Union[Path, str]) -> list[StageSummary]:
         object_tags,
         board_definitions,
         face_shots,
+        mesh_keypoints,
     ]
     summaries.extend(
         _placeholder_summaries(
-            face_shots_complete=face_shots.status == WorkflowStatus.COMPLETE
+            mesh_keypoints_complete=mesh_keypoints.status == WorkflowStatus.COMPLETE
         )
     )
     return summaries
@@ -541,7 +554,7 @@ def inspect_capture_face_shots(
             ),
             checked_paths=checked_paths,
             warnings=outputs.warnings,
-            next_action="Proceed to Stage 6 face annotation.",
+            next_action="Proceed to Stage 6 mesh keypoints / object geometry.",
         )
 
     if not outputs.manifest_exists:
@@ -588,52 +601,161 @@ def inspect_capture_face_shots(
         warnings=outputs.warnings,
         next_action=(
             "Capture at least one valid face shot for every registered board "
-            "face before annotation."
+            "face before mesh keypoint checks and annotation."
         ),
     )
 
 
-def _placeholder_summaries(face_shots_complete: bool) -> list[StageSummary]:
-    stage6_status = (
+def inspect_mesh_keypoints(
+    project_root: Union[Path, str],
+    *,
+    face_shots_complete: bool = False,
+) -> StageSummary:
+    """Inspect Stage 6 annotation-ready object keypoint JSON files."""
+
+    root = Path(project_root).expanduser()
+    known_objects = infer_known_objects(root)
+    expected_paths = [
+        expected_keypoints_path(root, item.object_name)
+        for item in known_objects
+    ]
+    checked_paths = _path_tuple(expected_paths)
+
+    if not face_shots_complete:
+        return _stage(
+            stage_id=6,
+            status=WorkflowStatus.NOT_APPLICABLE,
+            message="Mesh keypoints depend on completed face-shot coverage.",
+            checked_paths=checked_paths,
+            next_action="Complete Stage 5 before checking Stage 6.",
+        )
+
+    if not known_objects:
+        return _stage(
+            stage_id=6,
+            status=WorkflowStatus.NEEDS_ATTENTION,
+            message="Could not infer any PoseTag objects for mesh keypoint checks.",
+            checked_paths=checked_paths,
+            errors=(
+                "Expected object identities from boards, tag registry, or shots manifest.",
+            ),
+            next_action=(
+                "Repair board/shot metadata, then run posetag-gen-keypoints "
+                "for each object."
+            ),
+        )
+
+    errors: list[str] = []
+    valid_paths: list[Path] = []
+    missing_paths: list[Path] = []
+
+    for item, keypoints_path in zip(known_objects, expected_paths):
+        if not keypoints_path.exists():
+            missing_paths.append(keypoints_path)
+            continue
+        try:
+            with keypoints_path.open("r", encoding="utf-8") as handle:
+                payload = json.load(handle)
+        except (OSError, json.JSONDecodeError) as exc:
+            errors.append(f"{keypoints_path}: Could not read keypoints JSON: {exc}")
+            continue
+        if not isinstance(payload, Mapping):
+            errors.append(f"{keypoints_path}: keypoints.json must contain a mapping.")
+            continue
+        schema_errors = validate_keypoint_payload(
+            payload,
+            expected_faces=expected_face_keys(item.object_name, item.faces),
+        )
+        if schema_errors:
+            errors.extend(f"{keypoints_path}: {message}" for message in schema_errors)
+            continue
+        valid_paths.append(keypoints_path)
+
+    if errors:
+        return _stage(
+            stage_id=6,
+            status=WorkflowStatus.NEEDS_ATTENTION,
+            message="Mesh keypoint files exist but need attention.",
+            checked_paths=checked_paths,
+            errors=tuple(errors),
+            next_action=(
+                "Repair the invalid keypoints JSON or rerun posetag-gen-keypoints "
+                "with the correct object and mesh."
+            ),
+        )
+
+    if missing_paths:
+        object_count = len(known_objects)
+        missing_count = len(missing_paths)
+        return _stage(
+            stage_id=6,
+            status=WorkflowStatus.MISSING,
+            message=(
+                f"Missing annotation-ready keypoints for {missing_count}/"
+                f"{object_count} inferred object"
+                f"{'s' if object_count != 1 else ''}."
+            ),
+            checked_paths=checked_paths,
+            next_action=(
+                "Run posetag-gen-keypoints for each object mesh so annotation "
+                "can read objects/<object>/keypoints.json."
+            ),
+        )
+
+    count = len(valid_paths)
+    return _stage(
+        stage_id=6,
+        status=WorkflowStatus.COMPLETE,
+        message=(
+            f"Found annotation-ready keypoints for {count} object"
+            f"{'s' if count != 1 else ''}."
+        ),
+        checked_paths=checked_paths,
+        next_action="Proceed to Stage 7 face annotation.",
+    )
+
+
+def _placeholder_summaries(mesh_keypoints_complete: bool) -> list[StageSummary]:
+    stage7_status = (
         WorkflowStatus.MISSING
-        if face_shots_complete
+        if mesh_keypoints_complete
         else WorkflowStatus.NOT_APPLICABLE
     )
-    stage6_message = (
+    stage7_message = (
         "Face annotation status validation is not implemented yet."
-        if face_shots_complete
-        else "Face annotation depends on captured face shots."
+        if mesh_keypoints_complete
+        else "Face annotation depends on mesh keypoints."
     )
-    stage6_next_action = (
-        "Run the annotation workflow after confirming face-shot coverage."
-        if face_shots_complete
-        else "Complete Stage 5 before checking Stage 6."
+    stage7_next_action = (
+        "Run the annotation workflow after confirming mesh keypoints."
+        if mesh_keypoints_complete
+        else "Complete Stage 6 before checking Stage 7."
     )
 
     return [
         _stage(
-            stage_id=6,
-            status=stage6_status,
-            message=stage6_message,
+            stage_id=7,
+            status=stage7_status,
+            message=stage7_message,
             checked_paths=(),
-            next_action=stage6_next_action,
+            next_action=stage7_next_action,
         ),
         _stage(
-            stage_id=7,
+            stage_id=8,
             status=WorkflowStatus.NOT_APPLICABLE,
             message=(
                 "Dataset collection depends on calibration, boards, and "
                 "annotations."
             ),
             checked_paths=(),
-            next_action="Complete Stages 2-6 before checking Stage 7.",
+            next_action="Complete Stages 2-7 before checking Stage 8.",
         ),
         _stage(
-            stage_id=8,
+            stage_id=9,
             status=WorkflowStatus.NOT_APPLICABLE,
             message="Review and export depends on generated dataset outputs.",
             checked_paths=(),
-            next_action="Complete Stage 7 before checking Stage 8.",
+            next_action="Complete Stage 8 before checking Stage 9.",
         ),
     ]
 

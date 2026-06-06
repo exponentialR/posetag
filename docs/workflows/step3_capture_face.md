@@ -329,7 +329,7 @@ CSV row.
 
 ## Verify Before Step 4
 
-Before moving to face annotation:
+Before moving to mesh keypoint / object geometry validation:
 
 1. Confirm `shots/manifest.csv` exists and has one row per saved reference
    image.
@@ -341,6 +341,10 @@ Before moving to face annotation:
    annotation.
 5. Confirm the annotated image overlays the detected tag IDs expected for that
    face.
+
+Step 4 then links these same object/face identities to
+`objects/<object>/keypoints.json` before annotation computes
+`T_board_object`.
 
 ## Current Implementation Note
 
