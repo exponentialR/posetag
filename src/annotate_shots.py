@@ -98,7 +98,7 @@ import argparse, csv, json, os, sys, itertools
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 import cv2, yaml
@@ -110,6 +110,7 @@ from utils.annotation_utils import (
     detect_tags, load_board, se3, inv_se3,
     load_keypoints_fuzzy
 )
+from posetag.workflows.mesh_keypoints import split_object_face, validate_keypoint_payload
 
 EXIT_QUIT_ALL = 99
 import logging
@@ -118,17 +119,23 @@ UI_LOG: list[str] = []
 log: logging.Logger  # global
 
 _PILL = {
-    "ok": ((224, 245, 228), (35, 120, 55)),
-    "warn": ((241, 225, 201), (110, 85, 45)),
-    "info": ((229, 238, 249), (70, 95, 160)),
+    "ok": ((228, 245, 224), (55, 120, 35)),
+    "warn": ((213, 235, 247), (37, 102, 145)),
+    "bad": ((222, 222, 241), (59, 64, 153)),
+    "info": ((249, 238, 229), (160, 95, 70)),
 }
 
-UI_H = 720
-UI_W_LEFT = 820  # was 860
-UI_W_MID = 520  # was 380  ← Faces list wider
-UI_W_RIGHT = 480
+UI_H = 640
+UI_W_LEFT = 640
+UI_W_MID = 390
+UI_W_RIGHT = 320
 UI_WIN_H = 820
 UI_WIN_W = UI_W_LEFT + UI_W_MID + UI_W_RIGHT
+
+KEY_UP = {2490368, 65362, 63232, ord("w"), ord("W"), ord("k"), ord("K")}
+KEY_DOWN = {2621440, 65364, 63233, ord("s"), ord("S"), ord("j"), ord("J")}
+KEY_PAGE_UP = {2162688, 65365, 63276}
+KEY_PAGE_DOWN = {2228224, 65366, 63277}
 
 
 class UIBufferHandler(logging.Handler):
@@ -157,15 +164,17 @@ def _ellipsize_end(text: str, max_w: int, scale=0.5, thk=1):
 def _ellipsize_middle(text: str, max_w: int, scale=0.5, thk=1):
     if _measure(text, scale, thk) <= max_w:
         return text
-    left, right = 0, 0
-    while True:
-        cand = text[:left] + "..." + text[len(text) - right:]
-        if _measure(cand, scale, thk) <= max_w or (left + right) >= len(text):
-            return cand if cand else "..."
-        if (left <= right) and (left < len(text)):
-            left += 1
-        elif right < len(text):
-            right += 1
+    if _measure("...", scale, thk) > max_w:
+        return "."
+    best = "..."
+    for kept in range(1, len(text) + 1):
+        left = (kept + 1) // 2
+        right = kept // 2
+        cand = text[:left] + "..." + (text[-right:] if right else "")
+        if _measure(cand, scale, thk) > max_w:
+            break
+        best = cand
+    return best
 
 
 def _wrap_to_width(text: str, max_w: int, scale=0.5, thk=1):
@@ -212,70 +221,251 @@ def _pill(text: str, kind: str = "info"):
     return img
 
 
+def _rms_kind(rms: float | None) -> str:
+    if rms is None:
+        return "info"
+    if rms <= 3.0:
+        return "ok"
+    if rms <= 8.0:
+        return "warn"
+    return "bad"
+
+
 def _right_column(project_root, it, args, height, w=480):
-    info = [
-        f"Project: {project_root}",
-        "",
-        f"Object: {it['object']}   side: {it['side']}",
-        f"Face key: {it['face_key']}",
-        f"Shot: {it['raw'].name if it['raw'] else '-'}",
-        f"Board YAML: {Path(it['board']).name if it['board'] else '-'}",
-        "",
-        ("Status"),
-        f"  ANN : {'OK' if it['ann_ok'] else 'MISSING'}" + (
-            f"  (RMS {it['rms']:.2f}px)" if it.get('rms') is not None else ""),
-        f"  KP  : {'OK' if it['kp_ok'] else 'missing'}",
-        f"  BOARD: {'OK' if it['board_ok'] else 'missing'}",
-        "",
-        f"pts-type           : {args.pts_type}",
-        f"check-tag-scale    : {'ON' if args.check_tag_scale else 'OFF'}",
-        f"auto-correct-scale : {'ON' if args.auto_correct_scale else 'OFF'}",
-        f"force overwrite    : {'ON' if args.force else 'OFF'}",
-        "",
-        "ENTER: annotate   A: pts   T: check-scale   C: auto-scale   F: force   R: reload   Q: quit",
-        "", "Logs:",
-    ]
-    top_h = min(360, height)
-    top = _text_panel(info, w=w, h=top_h)
+    ann = "OK" if it["ann_ok"] else "MISSING"
+    kp = "OK" if it["kp_ok"] else "missing"
+    board = "OK" if it["board_ok"] else "missing"
+    pan = np.full((height, w, 3), (249, 251, 252), np.uint8)
+
+    def title(text: str, y: int) -> int:
+        cv2.rectangle(pan, (10, y), (w - 10, y + 26), (232, 243, 248), -1)
+        cv2.putText(
+            pan,
+            text,
+            (18, y + 18),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.48,
+            (22, 34, 48),
+            1,
+            cv2.LINE_AA,
+        )
+        return y + 38
+
+    def row(label: str, value: str, y: int, *, kind: str | None = None) -> int:
+        cv2.putText(
+            pan,
+            label,
+            (18, y),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.42,
+            (88, 104, 120),
+            1,
+            cv2.LINE_AA,
+        )
+        text = _ellipsize_middle(str(value), w - 120, 0.45, 1)
+        if kind is None:
+            cv2.putText(
+                pan,
+                text,
+                (116, y),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.45,
+                (34, 48, 64),
+                1,
+                cv2.LINE_AA,
+            )
+        else:
+            chip = _pill(text, kind)
+            ch, cw = chip.shape[:2]
+            pan[y - ch + 6:y + 6, 116:116 + min(cw, w - 126)] = chip[:, :min(cw, w - 126)]
+        return y + 24
+
+    y = 18
+    y = title("Selection", y)
+    y = row("Project", _ellipsize_middle(str(project_root), w - 120, 0.45, 1), y)
+    y = row("Object", it["object"], y)
+    y = row("Face", it["side"], y)
+    y = row("Face key", it["face_key"], y)
+    y = row("Shot", it["raw"].name if it["raw"] else "-", y)
+    y = row("Board", Path(it["board"]).name if it["board"] else "-", y)
+
+    y += 8
+    y = title("Status", y)
+    ann_value = ann
+    if it.get("rms") is not None:
+        ann_value = f"{ann}  RMS {it['rms']:.2f}px"
+    y = row("Annot.", ann_value, y, kind=_rms_kind(it.get("rms")) if it["ann_ok"] else "warn")
+    y = row("Keypoints", kp, y, kind="ok" if it["kp_ok"] else "warn")
+    y = row("Board", board, y, kind="ok" if it["board_ok"] else "warn")
+
+    y += 8
+    y = title("Options", y)
+    y = row("Corners", args.pts_type, y)
+    y = row("Scale", "check ON" if args.check_tag_scale else "check OFF", y)
+    y = row("Auto", "correct ON" if args.auto_correct_scale else "correct OFF", y)
+    y = row("Force", "overwrite ON" if args.force else "overwrite OFF", y)
+
+    y += 8
+    y = title("Keys", y)
+    enter_action = "ENTER redo selected" if it["ann_ok"] else "ENTER annotate"
+    for line in (
+        enter_action,
+        "J/K, arrows, or W/S select",
+        "A corner mode, T scale check",
+        "C auto-scale, F force",
+        "R reload, Q quit",
+    ):
+        if y > height - 42:
+            break
+        cv2.putText(
+            pan,
+            line,
+            (18, y),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.42,
+            (89, 104, 118),
+            1,
+            cv2.LINE_AA,
+        )
+        y += 22
+
+    if y >= height - 72:
+        return pan
 
     # rough estimate of how many log lines fit
     line_h = 20
+    top_h = y + 8
     max_lines = max(1, (height - top_h) // line_h)
-    tail = UI_LOG[-max_lines:] if UI_LOG else ["(no messages yet)"]
-    bottom = _text_panel(tail, w=w, h=max(1, height - top_h))
-    return np.vstack([top, bottom])
+    log_lines = max(0, max_lines - 1)
+    tail = UI_LOG[-log_lines:] if (UI_LOG and log_lines) else ["(no messages yet)"]
+    bottom = _text_panel(
+        ["Recent log", *tail],
+        w=w,
+        h=max(1, height - top_h),
+        color=(231, 238, 245),
+        bg=(22, 30, 38),
+    )
+    pan[top_h:height] = bottom[:height - top_h]
+    return pan
 
 
-def _infer_object_and_side(shot_raw_path: Path, meta_json: dict | None, row) -> tuple[str, str]:
-    obj = None
-    side = None
+def _normalise_side_letter(side: str | None) -> str:
+    token = str(side or "").strip()
+    if not token:
+        return ""
+    if token.lower().startswith("side") and len(token) >= 5:
+        return token[-1].upper()
+    return token[0].upper()
+
+
+def _normalise_face_label(face: str | None) -> str:
+    token = str(face or "").strip()
+    if not token:
+        return ""
+    if token.lower() in {"unresolved", "unknown", "none", "n/a", "na"}:
+        return ""
+    if token.lower().startswith("side") and len(token) >= 5:
+        suffix = token[4:]
+        return f"side{suffix[:1].upper()}{suffix[1:]}"
+    if len(token) == 1 and token.upper() in {"A", "B", "C", "D"}:
+        return f"side{token.upper()}"
+    return token
+
+
+def _face_key(object_base: str, face_label: str) -> str:
+    # matches gen_keypoints faces naming
+    label = _normalise_face_label(face_label) or str(face_label).strip()
+    if label.startswith(f"{object_base}_"):
+        return label
+    return f"{object_base}_{label}"
+
+
+def _face_label_from_face_key(object_base: str, face_key: str) -> str:
+    base, face = split_object_face(face_key)
+    if face and base == object_base:
+        return face
+    prefix = f"{object_base}_"
+    if face_key.startswith(prefix):
+        return face_key[len(prefix):]
+    return face_key
+
+
+def _annotation_target(
+    shot_raw_path: Path,
+    meta_json: dict | None,
+    row,
+    *,
+    board_yaml_path: Optional[Path] = None,
+) -> tuple[str, str, str]:
+    candidates: list[str] = []
+    if board_yaml_path is not None and board_yaml_path.stem:
+        candidates.append(board_yaml_path.stem)
     if meta_json:
-        obj = meta_json.get("object_base") or meta_json.get("object")
-        side = meta_json.get("side")
-        full = meta_json.get("object_full")
-        if (not side) and full and "_side" in full:
-            side = full.split("_side")[-1][:1].upper()
-    if not obj and row and getattr(row, "object_base", None):
-        obj = row.object_base
-    if not side and row and getattr(row, "side", None):
-        side = row.side
+        candidates.extend(
+            str(meta_json.get(key, "")).strip()
+            for key in ("object_full", "object_base", "object")
+        )
+    if row:
+        candidates.extend(
+            str(getattr(row, key, "")).strip()
+            for key in ("object_full", "object_base")
+        )
 
     # Fallback: parse from shots/<object>/<side>/... path
+    path_side = ""
     parts = list(shot_raw_path.parts)
     if "shots" in parts:
         i = parts.index("shots")
-        if not obj and i + 1 < len(parts):
-            obj = parts[i + 1]
-        if not side and i + 2 < len(parts):
-            side_token = parts[i + 2]  # e.g. "sideA"
-            if side_token.lower().startswith("side") and len(side_token) >= 5:
-                side = side_token[-1].upper()
+        if i + 1 < len(parts):
+            candidates.append(parts[i + 1])
+        if i + 2 < len(parts):
+            path_side = parts[i + 2]
 
-    if not obj:
+    object_base = ""
+    face_label = ""
+    face_key = board_yaml_path.stem if board_yaml_path is not None else ""
+
+    for candidate in candidates:
+        if not candidate:
+            continue
+        base, face = split_object_face(candidate)
+        if face:
+            object_base = object_base or base
+            face_label = face_label or face
+            face_key = face_key or _face_key(base, face)
+            break
+        object_base = object_base or base
+
+    side_candidates: list[str] = []
+    if meta_json:
+        side_candidates.append(str(meta_json.get("side", "")).strip())
+    if row:
+        side_candidates.append(str(getattr(row, "side", "")).strip())
+    side_candidates.append(path_side)
+    for side in side_candidates:
+        face_label = face_label or _normalise_face_label(side)
+
+    if face_key and object_base and not face_label:
+        face_label = _face_label_from_face_key(object_base, face_key)
+    if object_base and face_label and not face_key:
+        face_key = _face_key(object_base, face_label)
+
+    if not object_base:
         raise SystemExit("[!] Could not infer object name (wanted meta.object_base or manifest.object_base).")
-    if not side:
-        side = "X"
-    return obj, side.upper()
+    if not face_label:
+        raise SystemExit("[!] Could not infer face label (wanted board YAML stem, meta.object_full, or manifest side).")
+    if not face_key:
+        face_key = _face_key(object_base, face_label)
+    return object_base, face_label, face_key
+
+
+def _infer_object_and_side(shot_raw_path: Path, meta_json: dict | None, row) -> tuple[str, str]:
+    object_base, face_label, _face_key_value = _annotation_target(
+        shot_raw_path,
+        meta_json,
+        row,
+    )
+    return object_base, face_label
 
 
 def _index_faces(project_root: Path, manifest: Path) -> List[dict]:
@@ -283,18 +473,24 @@ def _index_faces(project_root: Path, manifest: Path) -> List[dict]:
     latest = _latest_per_face(rows, object_filter=None, side=None)
     items = []
     for r in latest:
-        obj = r.object_base
-        side = r.side.upper()
-        face_key = _face_key(obj, side)
-        out_yaml = _out_yaml_path(project_root, obj, side)
+        board_path = _resolve_project_path(project_root, r.face_yaml)
+        raw_path = _resolve_project_path(project_root, r.path_raw) or Path(r.path_raw)
+        obj, face_label, face_key = _annotation_target(
+            raw_path,
+            None,
+            r,
+            board_yaml_path=board_path if board_path else None,
+        )
+        out_yaml = _out_yaml_path(project_root, obj, face_label, face_key=face_key)
         kp_ok = (project_root / "objects" / obj / "keypoints.json").exists()
-        board_ok = Path(r.face_yaml).exists() if r.face_yaml else False
+        meta_path = _resolve_project_path(project_root, r.path_meta) if r.path_meta else None
+        board_ok = board_path.exists() if board_path else False
 
         rms = _load_rms_if_any(out_yaml) if out_yaml.exists() else None
         items.append({
-            "object": obj, "side": side, "face_key": face_key, "ts": r.timestamp,
-            "raw": Path(r.path_raw), "meta": Path(r.path_meta) if r.path_meta else None,
-            "board": r.face_yaml, "out_yaml": out_yaml,
+            "object": obj, "side": face_label, "face_key": face_key, "ts": r.timestamp,
+            "raw": raw_path, "meta": meta_path,
+            "board": str(board_path) if board_path else r.face_yaml, "out_yaml": out_yaml,
             "ann_ok": out_yaml.exists(), "kp_ok": kp_ok, "board_ok": board_ok,
             "rms": rms,
         })
@@ -312,9 +508,29 @@ def _browse_and_annotate(project_root: Path, manifest: Path, args):
         return
 
     i = 0
+
+    def on_browser_mouse(event, _x, _y, flags, _param):
+        nonlocal i
+        if event != cv2.EVENT_MOUSEWHEEL or not items:
+            return
+        try:
+            delta = cv2.getMouseWheelDelta(flags)
+        except AttributeError:
+            delta = flags
+        if delta > 0:
+            i = (i - 1) % len(items)
+        elif delta < 0:
+            i = (i + 1) % len(items)
+
     while True:
         it = items[i]
-        left = _render_raw_thumb(it["raw"], target_h=UI_H, target_w=UI_W_LEFT)
+        thumb_label = f"{it['object']} / {it['side']}"
+        left = _render_raw_thumb(
+            it["raw"],
+            target_h=UI_H,
+            target_w=UI_W_LEFT,
+            label=thumb_label,
+        )
         faces_w = UI_W_MID
         mid = _render_list_faces(left.shape[0], faces_w, "Faces (latest per manifest)", items, i)
         right = _right_column(project_root, it, args, height=left.shape[0], w=UI_W_RIGHT)
@@ -325,15 +541,20 @@ def _browse_and_annotate(project_root: Path, manifest: Path, args):
         except Exception:
             pass
 
+        cv2.setMouseCallback("Annotate", on_browser_mouse)
         cv2.imshow("Annotate", strip)
 
         k = cv2.waitKeyEx(60) & 0xFFFFFFFF
         if k in (ord('q'), 27):
             break
-        elif k in (2490368, ord('w'), ord('W')):  # up
+        elif k in KEY_UP:
             i = (i - 1) % len(items)
-        elif k in (2621440, ord('s'), ord('S')):  # down
+        elif k in KEY_DOWN:
             i = (i + 1) % len(items)
+        elif k in KEY_PAGE_UP:
+            i = (i - 6) % len(items)
+        elif k in KEY_PAGE_DOWN:
+            i = (i + 6) % len(items)
         elif k in (ord('a'), ord('A')):
             args.pts_type = "any" if args.pts_type == "quad" else "quad"
         elif k in (ord('t'), ord('T')):
@@ -346,9 +567,8 @@ def _browse_and_annotate(project_root: Path, manifest: Path, args):
             items = _index_faces(project_root, manifest)
             i = min(i, len(items) - 1)
         elif k in (13, 10):  # ENTER → annotate selection
-            if it["ann_ok"] and not args.force:
-                log.info(f"[i] Skip (already annotated): {it['out_yaml']}")
-                continue
+            if it["ann_ok"]:
+                log.info(f"[i] Redo annotation: {it['out_yaml']}")
             try:
                 annotate_single_shot(
                     project_root, it["raw"],
@@ -410,13 +630,30 @@ class ShotRow:
     cy: Optional[float]
 
 
+@dataclass
+class AnnotationPreflight:
+    shot_raw_path: Path
+    annotated_path: Path
+    reprojection_path: Path
+    meta_path: Path
+    board_yaml_path: Path
+    keypoints_path: Path
+    object_base: str
+    side: str  # Face label, e.g. "sideA", "front", or "back".
+    face_key: str
+    K: np.ndarray
+    meta_json: dict
+    row: Optional[ShotRow]
+    calib_path: Optional[Path] = None
+
+
 # -------------------------- Faces manifest (CSV) --------------------------
 
 @dataclass
 class FaceManifestRow:
     timestamp: str  # ISO time from YAML file mtime
     object: str
-    side: str  # A|B|C|D
+    side: str  # A|B|C|D for side labels, or a named face such as front/back.
     face_key: str
     yaml_path: str  # path to *_T_board_object.yaml (prefer relative to project_root)
     board_yaml: str
@@ -430,6 +667,11 @@ def _face_manifest_path(project_root: Path) -> Path:
 
 
 def _side_from_face_key(face_key: str) -> str:
+    base, face = split_object_face(face_key)
+    if face:
+        if face.lower().startswith("side") and len(face) >= 5:
+            return face[-1].upper()
+        return face
     m = re.search(r"_side([ABCD])", face_key, re.IGNORECASE)
     return m.group(1).upper() if m else "X"
 
@@ -442,7 +684,8 @@ def _scan_face_yamls(project_root: Path) -> List[FaceManifestRow]:
 
     for y in root.glob("*/*/*_T_board_object.yaml"):
         try:
-            data = yaml.safe_load(open(y, "r"))
+            with y.open("r", encoding="utf-8") as handle:
+                data = yaml.safe_load(handle)
             obj = str(data.get("object", "")).strip()
             face_key = str(data.get("face_key", "")).strip() or (y.stem.replace("_T_board_object", ""))
             side = _side_from_face_key(face_key)
@@ -524,7 +767,7 @@ def _read_manifest(path: Path) -> List[ShotRow]:
                 timestamp=d.get("timestamp", ""),
                 object_base=d.get("object_base", ""),
                 object_full=d.get("object_full", ""),
-                side=str(d.get("side", "")).strip() or "",
+                side=_normalise_side_letter(str(d.get("side", "")).strip()) or "",
                 face_yaml=d.get("face_yaml", ""),
                 path_raw=d.get("path_raw", ""),
                 path_ann=d.get("path_ann") or None,
@@ -539,14 +782,253 @@ def _read_manifest(path: Path) -> List[ShotRow]:
     return rows
 
 
-def _face_key(object_base: str, side_letter: str) -> str:
-    # matches gen_keypoints faces naming
-    return f"{object_base}_side{side_letter.upper()}"
+def _out_yaml_path(
+    project_root: Path,
+    object_base: str,
+    face_label: str,
+    *,
+    face_key: Optional[str] = None,
+) -> Path:
+    label = _normalise_face_label(face_label) or str(face_label).strip()
+    key = face_key or _face_key(object_base, label)
+    return project_root / "faces" / object_base / label / f"{key}_T_board_object.yaml"
 
 
-def _out_yaml_path(project_root: Path, object_base: str, side_letter: str) -> Path:
-    face_key = _face_key(object_base, side_letter)
-    return project_root / "faces" / object_base / f"side{side_letter.upper()}" / f"{face_key}_T_board_object.yaml"
+def _resolve_project_path(project_root: Path, value: str | Path | None) -> Optional[Path]:
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    path = Path(text).expanduser()
+    return path if path.is_absolute() else (project_root / path).resolve()
+
+
+def _same_path(left: Path, right: Path) -> bool:
+    try:
+        return left.expanduser().resolve() == right.expanduser().resolve()
+    except Exception:
+        return left == right
+
+
+def _find_manifest_row_for_shot(
+    project_root: Path,
+    shot_raw_path: Path,
+    *,
+    manifest_path: Optional[Path] = None,
+) -> Optional[ShotRow]:
+    manifest = manifest_path or (project_root / "shots" / "manifest.csv")
+    if not manifest.exists():
+        return None
+    target = shot_raw_path if shot_raw_path.is_absolute() else (project_root / shot_raw_path).resolve()
+    for row in _read_manifest(manifest):
+        row_raw = _resolve_project_path(project_root, row.path_raw)
+        if row_raw is not None and _same_path(row_raw, target):
+            return row
+    return None
+
+
+def _load_json_mapping(path: Path, label: str) -> dict:
+    if not path.exists():
+        raise SystemExit(f"[!] {label} not found: {path}")
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise SystemExit(f"[!] {label} is malformed: {path}: {exc}") from exc
+    except OSError as exc:
+        raise SystemExit(f"[!] Could not read {label}: {path}: {exc}") from exc
+    if not isinstance(data, dict):
+        raise SystemExit(f"[!] {label} must contain a JSON object: {path}")
+    return data
+
+
+def _finite_float(value: Any, field: str, source: str) -> float:
+    try:
+        number = float(value)
+    except Exception as exc:
+        raise SystemExit(f"[!] {source} field '{field}' must be numeric.") from exc
+    if not np.isfinite(number):
+        raise SystemExit(f"[!] {source} field '{field}' must be finite.")
+    return number
+
+
+def _camera_matrix_from_values(values: Mapping[str, Any], source: str) -> np.ndarray:
+    missing = [key for key in ("fx", "fy", "cx", "cy") if key not in values]
+    if missing:
+        joined = ", ".join(missing)
+        raise SystemExit(f"[!] Camera intrinsics missing from {source}: {joined}.")
+    fx = _finite_float(values["fx"], "fx", source)
+    fy = _finite_float(values["fy"], "fy", source)
+    cx = _finite_float(values["cx"], "cx", source)
+    cy = _finite_float(values["cy"], "cy", source)
+    return np.array([[fx, 0.0, cx], [0.0, fy, cy], [0.0, 0.0, 1.0]], float)
+
+
+def _resolve_calib_path(project_root: Path, calib: Optional[str]) -> Optional[Path]:
+    if not calib:
+        return None
+    raw = Path(str(calib).strip()).expanduser()
+    if not str(raw):
+        return None
+    candidates = [raw if raw.is_absolute() else (project_root / raw).resolve()]
+    if not raw.is_absolute() and len(raw.parts) == 1:
+        candidates.append((project_root / "calib" / raw).resolve())
+    for path in candidates:
+        if path.exists():
+            return path
+    raise SystemExit(f"[!] Calibration YAML not found: {candidates[0]}")
+
+
+def _validate_board_yaml(board_yaml_path: Path) -> None:
+    try:
+        load_board(board_yaml_path)
+    except FileNotFoundError as exc:
+        raise SystemExit(f"[!] Board YAML not found: {board_yaml_path}") from exc
+    except Exception as exc:
+        raise SystemExit(f"[!] Malformed board YAML: {board_yaml_path}: {exc}") from exc
+
+
+def _validate_keypoints(project_root: Path, object_base: str, face_key: str) -> Path:
+    keypoints_path = project_root / "objects" / object_base / "keypoints.json"
+    payload = _load_json_mapping(keypoints_path, "Keypoints JSON")
+    errors = validate_keypoint_payload(payload, expected_faces=(face_key,))
+    if errors:
+        details = "; ".join(errors)
+        raise SystemExit(f"[!] Malformed keypoints JSON: {keypoints_path}: {details}")
+    return keypoints_path
+
+
+def _as_se3_matrix(matrix: Any, label: str) -> np.ndarray:
+    try:
+        arr = np.asarray(matrix, dtype=float)
+    except Exception as exc:
+        raise ValueError(f"{label} must be numeric.") from exc
+    if arr.shape != (4, 4):
+        raise ValueError(f"{label} must be a 4x4 matrix.")
+    if not np.all(np.isfinite(arr)):
+        raise ValueError(f"{label} must contain only finite values.")
+    if not np.allclose(arr[3], np.array([0.0, 0.0, 0.0, 1.0])):
+        raise ValueError(f"{label} must be a homogeneous SE(3) matrix.")
+    return arr
+
+
+def compose_board_object_transform(T_cam_board: Any, T_cam_object: Any) -> np.ndarray:
+    """Return T_board_object using PoseTag's annotation convention."""
+
+    T_cb = _as_se3_matrix(T_cam_board, "T_cam_board")
+    T_co = _as_se3_matrix(T_cam_object, "T_cam_object")
+    return inv_se3(T_cb) @ T_co
+
+
+def build_annotation_record(
+    *,
+    object_name: str,
+    face_key: str,
+    board_yaml_path: str | Path,
+    shot_raw_path: str | Path,
+    rms_px: float,
+    T_cam_board: Any,
+    T_cam_object: Any,
+    corner_mapping: Mapping[str, Sequence[float]],
+    clicked_uv: Sequence[Sequence[float]],
+    face_corner_names: Sequence[str],
+    pnp_fit: Mapping[str, Any],
+    tag_size_m: float,
+    tag_scale_ratio: float,
+    tag_scale_pairs: int,
+    tag_scale_auto_corrected: bool,
+) -> dict:
+    T_board_obj = compose_board_object_transform(T_cam_board, T_cam_object)
+    names = list(face_corner_names)
+    return {
+        "object": object_name,
+        "face_key": face_key,
+        "board_yaml": str(board_yaml_path),
+        "image": str(shot_raw_path),
+        "rms_px": float(rms_px),
+        "T_board_object": {"matrix": T_board_obj.tolist()},
+        "corner_uv": {n: [float(corner_mapping[n][0]), float(corner_mapping[n][1])] for n in names},
+        "pnp": {"rvec": [float(x) for x in np.asarray(pnp_fit["rvec"]).ravel()],
+                "tvec": [float(x) for x in np.asarray(pnp_fit["tvec"]).ravel()]},
+        "clicked_uv_raw": [(float(u), float(v)) for (u, v) in clicked_uv],
+        "face_corner_names": names,
+        "assignment": {n: [float(corner_mapping[n][0]), float(corner_mapping[n][1])] for n in names},
+        "notes": "Accepted.",
+        "diagnostics": {
+            "board_tag_size_mm": float(tag_size_m * 1000.0),
+            "tag_scale_ratio": float(tag_scale_ratio),
+            "tag_scale_pairs": int(tag_scale_pairs),
+            "tag_scale_auto_corrected": bool(tag_scale_auto_corrected),
+        },
+    }
+
+
+def preflight_annotation_shot(
+    project_root: Path,
+    shot_raw_path: Path,
+    *,
+    row: Optional[ShotRow] = None,
+    manifest_path: Optional[Path] = None,
+    calib: Optional[str] = None,
+) -> AnnotationPreflight:
+    root = Path(project_root).expanduser().resolve()
+    shot = shot_raw_path.expanduser()
+    if not shot.is_absolute():
+        shot = (root / shot).resolve()
+    if not shot.exists():
+        raise SystemExit(f"[!] Shot image not found: {shot}")
+    if not shot.name.endswith("_raw.png"):
+        raise SystemExit("[!] Shot image must end with _raw.png")
+
+    row = row or _find_manifest_row_for_shot(root, shot, manifest_path=manifest_path)
+    meta_path = (
+        _resolve_project_path(root, row.path_meta)
+        if row and row.path_meta
+        else shot.with_name(shot.name.replace("_raw.png", "_meta.json"))
+    )
+    if meta_path is None:
+        raise SystemExit(f"[!] Shot metadata JSON not found for: {shot}")
+    meta_json = _load_json_mapping(meta_path, "Shot metadata JSON")
+    K, board_yaml_path_text, meta_json = _load_K_and_face(root, meta_path, row, meta_json=meta_json)
+    board_yaml_path = Path(board_yaml_path_text)
+    _validate_board_yaml(board_yaml_path)
+
+    object_base, face_label, face_key = _annotation_target(
+        shot,
+        meta_json,
+        row,
+        board_yaml_path=board_yaml_path,
+    )
+    keypoints_path = _validate_keypoints(root, object_base, face_key)
+
+    image = meta_json.get("image", {})
+    image = image if isinstance(image, Mapping) else {}
+    ann_value = image.get("path_ann") or (row.path_ann if row and row.path_ann else None)
+    annotated_path = _resolve_project_path(root, ann_value) if ann_value else shot.with_name(shot.name.replace("_raw.png", "_ann.png"))
+    assert annotated_path is not None
+    if not annotated_path.exists():
+        raise SystemExit(f"[!] Captured annotated shot image not found: {annotated_path}")
+    reprojection_path = annotated_path.with_name(annotated_path.name.replace("_ann", "_reproj"))
+
+    calib_path = _resolve_calib_path(root, calib)
+    if calib_path is not None:
+        _load_dist_from_calib(str(calib_path))
+
+    return AnnotationPreflight(
+        shot_raw_path=shot,
+        annotated_path=annotated_path,
+        reprojection_path=reprojection_path,
+        meta_path=meta_path,
+        board_yaml_path=board_yaml_path,
+        keypoints_path=keypoints_path,
+        object_base=object_base,
+        side=face_label,
+        face_key=face_key,
+        K=K,
+        meta_json=meta_json,
+        row=row,
+        calib_path=calib_path,
+    )
 
 
 # -------------------------- Small UI helpers --------------------------
@@ -589,9 +1071,17 @@ def _hstack(L, M=None, R=None):
     return np.hstack([l, m, r])
 
 
-def _text_panel(lines: List[str], w=380, h=720, scale=0.5, thk=1, color=(240, 240, 240)):
+def _text_panel(
+    lines: List[str],
+    w=380,
+    h=720,
+    scale=0.5,
+    thk=1,
+    color=(240, 240, 240),
+    bg=(18, 18, 18),
+):
     """Draws a list of strings with wrapping and end/middle ellipses as needed."""
-    img = np.full((h, w, 3), 18, np.uint8)
+    img = np.full((h, w, 3), bg, np.uint8)
     y = 24
     line_h = int(round(20 * max(0.8, scale / 0.5)))  # keep spacing nice if scale changes
     for ln in lines:
@@ -608,7 +1098,9 @@ def _help_panel(mode: str, h: int):
     if mode == "quad":
         lines = [
             "Annotate (quad)",
-            "Drag box, then adjust 4 corners.",
+            "Drag a rectangle around the face.",
+            "Release to create 4 corners.",
+            "Drag any corner to refine.",
             "SHIFT: axis lock",
             "ENTER: accept",
             "u: undo    r: reset",
@@ -623,7 +1115,13 @@ def _help_panel(mode: str, h: int):
             "u: undo    r: reset",
             "q/ESC: abort   Q/X: quit-all",
         ]
-    return _text_panel(lines, w=380, h=h)
+    return _text_panel(
+        lines,
+        w=UI_W_RIGHT,
+        h=h,
+        color=(36, 52, 68),
+        bg=(247, 250, 252),
+    )
 
 
 def _show_dash(L, M, R, banner=""):
@@ -638,13 +1136,31 @@ def _show_dash(L, M, R, banner=""):
 # -------------------------- Annotation widgets --------------------------
 
 def _load_dist_from_calib(calib_path: Optional[str]):
-    if not calib_path: return np.zeros((1, 5), dtype=float)
-    try:
-        y = yaml.safe_load(open(calib_path, "r"))
-        dc = y["distortion_coefficients"]
-        return np.array([[dc["k1"], dc["k2"], dc["p1"], dc["p2"], dc.get("k3", 0.0)]], dtype=float)
-    except Exception:
+    if not calib_path:
         return np.zeros((1, 5), dtype=float)
+    path = Path(calib_path).expanduser()
+    if not path.exists():
+        raise SystemExit(f"[!] Calibration YAML not found: {path}")
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            y = yaml.safe_load(handle)
+    except yaml.YAMLError as exc:
+        raise SystemExit(f"[!] Calibration YAML is malformed: {path}: {exc}") from exc
+    except OSError as exc:
+        raise SystemExit(f"[!] Could not read calibration YAML: {path}: {exc}") from exc
+    if not isinstance(y, Mapping):
+        raise SystemExit(f"[!] Calibration YAML must contain a mapping: {path}")
+    dc = y.get("distortion_coefficients")
+    if not isinstance(dc, Mapping):
+        raise SystemExit(f"[!] Calibration YAML missing distortion_coefficients: {path}")
+    coeffs = [
+        _finite_float(dc.get("k1"), "k1", "calibration distortion_coefficients"),
+        _finite_float(dc.get("k2"), "k2", "calibration distortion_coefficients"),
+        _finite_float(dc.get("p1"), "p1", "calibration distortion_coefficients"),
+        _finite_float(dc.get("p2"), "p2", "calibration distortion_coefficients"),
+        _finite_float(dc.get("k3", 0.0), "k3", "calibration distortion_coefficients"),
+    ]
+    return np.array([coeffs], dtype=float)
 
 
 def _reproj(pts3d, T_cam_obj, K, img, draw=True, dist=None):
@@ -662,8 +1178,144 @@ def _reproj(pts3d, T_cam_obj, K, img, draw=True, dist=None):
     return uv, None
 
 
+def _annotation_display_scale(img) -> float:
+    h, w = img.shape[:2]
+    if h <= 0 or w <= 0:
+        return 1.0
+    return min(UI_W_LEFT / float(w), UI_H / float(h), 1.0)
+
+
+def _resize_for_annotation_display(img, scale: float):
+    if img is None:
+        return None
+    if abs(scale - 1.0) < 1e-9:
+        return img.copy()
+    h, w = img.shape[:2]
+    return cv2.resize(
+        img,
+        (max(1, int(round(w * scale))), max(1, int(round(h * scale)))),
+        interpolation=cv2.INTER_AREA,
+    )
+
+
+def _display_pts_to_image_pts(
+    pts: Sequence[Tuple[float, float]],
+    scale: float,
+) -> list[Tuple[float, float]]:
+    if abs(scale - 1.0) < 1e-9:
+        return [(float(u), float(v)) for u, v in pts]
+    return [(float(u) / scale, float(v) / scale) for u, v in pts]
+
+
+def _draw_annotation_banner(vis, lines, *, accent=(0, 160, 210)):
+    if not lines:
+        return
+    pad_x = 14
+    pad_y = 11
+    line_h = 22
+    max_w = 0
+    for line in lines:
+        (tw, _th), _ = cv2.getTextSize(line, cv2.FONT_HERSHEY_SIMPLEX, 0.56, 1)
+        max_w = max(max_w, tw)
+    x0, y0 = 16, 16
+    x1 = min(vis.shape[1] - 16, x0 + max_w + pad_x * 2)
+    y1 = min(vis.shape[0] - 16, y0 + line_h * len(lines) + pad_y)
+    overlay = vis.copy()
+    cv2.rectangle(overlay, (x0, y0), (x1, y1), (18, 28, 38), -1)
+    cv2.rectangle(overlay, (x0, y0), (x0 + 5, y1), accent, -1)
+    cv2.addWeighted(overlay, 0.82, vis, 0.18, 0, dst=vis)
+    for idx, line in enumerate(lines):
+        cv2.putText(
+            vis,
+            line,
+            (x0 + pad_x, y0 + 24 + idx * line_h),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.56,
+            (245, 248, 250),
+            1,
+            cv2.LINE_AA,
+        )
+
+
+def _draw_corner_handles(vis, pts, *, color=(0, 210, 110)):
+    if not pts:
+        return
+    for i in range(len(pts)):
+        a = pts[i]
+        b = pts[(i + 1) % len(pts)]
+        if len(pts) == 4 or i + 1 < len(pts):
+            cv2.line(
+                vis,
+                (int(a[0]), int(a[1])),
+                (int(b[0]), int(b[1])),
+                color,
+                2,
+                cv2.LINE_AA,
+            )
+    for i, (u, v) in enumerate(pts):
+        center = (int(u), int(v))
+        cv2.circle(vis, center, 8, (255, 255, 255), -1, cv2.LINE_AA)
+        cv2.circle(vis, center, 8, color, 2, cv2.LINE_AA)
+        cv2.putText(
+            vis,
+            str(i + 1),
+            (center[0] + 10, center[1] - 8),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.55,
+            color,
+            2,
+            cv2.LINE_AA,
+        )
+
+
+def _draw_review_corners(
+    canvas,
+    pts: Sequence[Sequence[float]],
+    *,
+    color: tuple[int, int, int],
+    names: Optional[Sequence[str]] = None,
+    radius: int = 5,
+    closed: bool = True,
+) -> None:
+    points = [(float(u), float(v)) for u, v in pts]
+    if not points:
+        return
+    if len(points) > 1:
+        pair_count = len(points) if closed and len(points) > 2 else len(points) - 1
+        for i in range(pair_count):
+            a = points[i]
+            b = points[(i + 1) % len(points)]
+            cv2.line(
+                canvas,
+                (int(round(a[0])), int(round(a[1]))),
+                (int(round(b[0])), int(round(b[1]))),
+                color,
+                2,
+                cv2.LINE_AA,
+            )
+    for i, (u, v) in enumerate(points):
+        x, y = int(round(u)), int(round(v))
+        if not (0 <= x < canvas.shape[1] and 0 <= y < canvas.shape[0]):
+            continue
+        cv2.circle(canvas, (x, y), radius + 2, (255, 255, 255), -1, cv2.LINE_AA)
+        cv2.circle(canvas, (x, y), radius, color, -1, cv2.LINE_AA)
+        if names and i < len(names):
+            cv2.putText(
+                canvas,
+                str(names[i]),
+                (x + 6, y - 6),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.38,
+                color,
+                1,
+                cv2.LINE_AA,
+            )
+
+
 def _collect_quad(image_bgr, mid_img=None, right_img=None):
-    base = image_bgr.copy();
+    display_scale = _annotation_display_scale(image_bgr)
+    base = _resize_for_annotation_display(image_bgr, display_scale)
+    mid_display = _resize_for_annotation_display(mid_img, display_scale)
     h, w = base.shape[:2]
     right_help = _help_panel("quad", h)
     pts: List[Tuple[float, float]] = [];
@@ -694,16 +1346,36 @@ def _collect_quad(image_bgr, mid_img=None, right_img=None):
             tr = (max(x0, x1), min(y0, y1));
             br = (max(x0, x1), max(y0, y1));
             bl = (min(x0, x1), max(y0, y1))
-            for a, b in [(tl, tr), (tr, br), (br, bl), (bl, tl)]: cv2.line(vis, a, b, (255, 180, 60), 2, cv2.LINE_AA)
+            overlay = vis.copy()
+            cv2.rectangle(overlay, tl, br, (0, 170, 230), -1)
+            cv2.addWeighted(overlay, 0.18, vis, 0.82, 0, dst=vis)
+            cv2.rectangle(vis, tl, br, (0, 190, 255), 3, cv2.LINE_AA)
+            cx, cy = cur
+            cv2.line(vis, (cx, 0), (cx, h - 1), (0, 190, 255), 1, cv2.LINE_AA)
+            cv2.line(vis, (0, cy), (w - 1, cy), (0, 190, 255), 1, cv2.LINE_AA)
+            for p in (tl, tr, br, bl):
+                cv2.circle(vis, p, 5, (255, 255, 255), -1, cv2.LINE_AA)
+                cv2.circle(vis, p, 5, (0, 190, 255), 2, cv2.LINE_AA)
         if pts:
-            for i in range(4):
-                a = pts[i];
-                b = pts[(i + 1) % 4];
-                cv2.line(vis, (int(a[0]), int(a[1])), (int(b[0]), int(b[1])), (0, 200, 0), 2, cv2.LINE_AA)
-            for i, (u, v) in enumerate(pts):
-                cv2.circle(vis, (int(u), int(v)), 6, (0, 200, 0), -1);
-                cv2.putText(vis, str(i + 1), (int(u) + 6, int(v) - 6), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 200, 0), 1)
-        _show_dash(vis, mid_img, right_help)
+            _draw_corner_handles(vis, pts, color=(0, 210, 110))
+            _draw_annotation_banner(
+                vis,
+                [
+                    "Refine the four corners, then press ENTER.",
+                    "Drag handles. Hold SHIFT for axis lock. U undo, R reset.",
+                ],
+                accent=(0, 150, 92),
+            )
+        else:
+            _draw_annotation_banner(
+                vis,
+                [
+                    "Drag a rectangle around this face.",
+                    "Release to create four adjustable corners.",
+                ],
+                accent=(0, 140, 190),
+            )
+        _show_dash(vis, mid_display, right_help)
 
     def on_mouse(event, x, y, flags, _):
         nonlocal start, drag, cur, last_flags
@@ -741,12 +1413,14 @@ def _collect_quad(image_bgr, mid_img=None, right_img=None):
         if k in (ord('Q'), ord('X'), ord('x')): _quit_all()
         if k == ord('r'): pts.clear(); hist.clear(); start = None; draw()
         if k == ord('u') and hist: pts = hist.pop(); draw()
-        if k == 13 and len(pts) == 4: return [(float(u), float(v)) for (u, v) in pts]
+        if k == 13 and len(pts) == 4: return _display_pts_to_image_pts(pts, display_scale)
 
 
 def _collect_any4(image_bgr, mid_img=None, right_img=None):
     pts = [];
-    base = image_bgr.copy();
+    display_scale = _annotation_display_scale(image_bgr)
+    base = _resize_for_annotation_display(image_bgr, display_scale)
+    mid_display = _resize_for_annotation_display(mid_img, display_scale)
     h, w = base.shape[:2]
     right_help = _help_panel("any", h)
     cur = None;
@@ -760,17 +1434,29 @@ def _collect_any4(image_bgr, mid_img=None, right_img=None):
 
     def draw():
         vis = base.copy()
-        for i, (u, v) in enumerate(pts):
-            cv2.circle(vis, (int(u), int(v)), 4, (0, 200, 0), -1);
-            cv2.putText(vis, str(i + 1), (int(u) + 6, int(v) - 6), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 200, 0), 1)
-            if i > 0: cv2.line(vis, (int(pts[i - 1][0]), int(pts[i - 1][1])), (int(u), int(v)), (0, 200, 0), 1,
-                               cv2.LINE_AA)
+        if pts:
+            _draw_corner_handles(vis, pts, color=(0, 210, 110))
         if cur is not None and pts:
             u0, v0 = pts[-1];
             u1, v1 = snap((u0, v0), cur, last_flags)
             cv2.line(vis, (int(u0), int(v0)), (int(u1), int(v1)), (255, 180, 60), 2, cv2.LINE_AA)
             cv2.drawMarker(vis, (int(u1), int(v1)), (255, 180, 60), cv2.MARKER_TILTED_CROSS, 10, 1, cv2.LINE_AA)
-        _show_dash(vis, mid_img, right_help)
+        if len(pts) == 4:
+            _draw_annotation_banner(
+                vis,
+                ["Four corners selected. Press ENTER to solve pose."],
+                accent=(0, 150, 92),
+            )
+        else:
+            _draw_annotation_banner(
+                vis,
+                [
+                    f"Click visible face corners: {len(pts)}/4 selected.",
+                    "Hold SHIFT for axis lock. U undo, R reset.",
+                ],
+                accent=(0, 140, 190),
+            )
+        _show_dash(vis, mid_display, right_help)
 
     def on_mouse(event, x, y, flags, _):
         nonlocal cur, last_flags;
@@ -792,7 +1478,7 @@ def _collect_any4(image_bgr, mid_img=None, right_img=None):
         if k in (ord('Q'), ord('X'), ord('x')): _quit_all()
         if k == ord('u') and pts: pts.pop(); draw()
         if k == ord('r'): pts.clear(); draw()
-        if k == 13 and len(pts) == 4: return pts
+        if k == 13 and len(pts) == 4: return _display_pts_to_image_pts(pts, display_scale)
 
 
 def _assign_any_order(clicked_xy, face_names, pts3d_dict, K, dist):
@@ -816,16 +1502,35 @@ def _assign_any_order(clicked_xy, face_names, pts3d_dict, K, dist):
 
 
 def _review(anno_img, reproj_img, rms):
+    rating = "check fit" if rms > 5.0 else "good fit"
     lines = [
-        f"Review | RMS={rms:.2f}px",
-        "ENTER/y/s: accept",
-        "r/n/BACKSPACE: redo",
-        "ESC/q: abort this shot",
-        "Q/X: quit-all (batch stops)",
+        "Review",
+        f"RMS error  {rms:.2f}px",
+        f"Status     {rating}",
+        "",
+        "Overlay",
+        "cyan  clicked corners",
+        "green solved face corners",
+        "",
+        "Actions",
+        "ENTER / Y accept",
+        "R / BACKSPACE redo",
+        "ESC abort shot",
+        "Q quit batch",
     ]
-    right = _text_panel(lines, 360, anno_img.shape[0])
+    display_scale = _annotation_display_scale(anno_img)
+    left = _resize_for_annotation_display(anno_img, display_scale)
+    mid = _resize_for_annotation_display(reproj_img, display_scale)
+    right = _text_panel(
+        lines,
+        300,
+        left.shape[0],
+        scale=0.48,
+        color=(36, 52, 68),
+        bg=(248, 251, 253),
+    )
     while True:
-        _show_dash(anno_img, reproj_img, right, "")
+        _show_dash(left, mid, right, "")
         k = cv2.waitKey(50) & 0xFF
         if k in (13, ord('y'), ord('s')): return "accept"
         if k in (ord('r'), ord('n'), 8):  return "redo"
@@ -834,54 +1539,162 @@ def _review(anno_img, reproj_img, rms):
 
 
 def _render_list_faces(h, w, title, items, sel):
-    pan = np.full((h, w, 3), 245, np.uint8)
-    cv2.putText(pan, title, (12, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (35, 35, 35), 2, cv2.LINE_AA)
-    max_show = min(22, len(items));
+    pan = np.full((h, w, 3), (250, 252, 253), np.uint8)
+    header_h = 76
+    footer_h = 44
+    row_h = 42
+    cv2.rectangle(pan, (0, 0), (w, header_h), (238, 246, 250), -1)
+    cv2.putText(
+        pan,
+        "Faces",
+        (14, 28),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.66,
+        (22, 34, 48),
+        2,
+        cv2.LINE_AA,
+    )
+    subtitle = _ellipsize_middle(title.replace("Faces ", ""), w - 110, 0.42, 1)
+    cv2.putText(
+        pan,
+        subtitle,
+        (14, 50),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.42,
+        (89, 104, 118),
+        1,
+        cv2.LINE_AA,
+    )
+    progress = f"{sel + 1}/{len(items)}" if items else "0/0"
+    (pw, ph), _ = cv2.getTextSize(progress, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 1)
+    cv2.rectangle(pan, (w - pw - 34, 16), (w - 14, 40), (222, 238, 247), -1)
+    cv2.putText(
+        pan,
+        progress,
+        (w - pw - 24, 34),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.55,
+        (49, 79, 98),
+        1,
+        cv2.LINE_AA,
+    )
+    face_x = 14
+    rms_x = max(156, w - 212)
+    board_x = max(rms_x + 78, w - 126)
+    kp_x = max(board_x + 56, w - 62)
+    for label, x in (("Face", face_x), ("RMS", rms_x), ("Board", board_x), ("KP", kp_x)):
+        cv2.putText(
+            pan,
+            label,
+            (x, header_h - 10),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.38,
+            (86, 105, 122),
+            1,
+            cv2.LINE_AA,
+        )
+
+    max_show = max(1, min(len(items), (h - header_h - footer_h) // row_h))
     start = max(0, min(sel - max_show // 2, max(0, len(items) - max_show)))
-    y = 56
+    y = header_h + 4
     for i in range(start, start + max_show):
         if i >= len(items): break
         it = items[i]
+        selected = i == sel
 
-        # build right-aligned chips
-        chips = []
+        y0 = y
+        y1 = min(h - footer_h - 4, y0 + row_h - 4)
+        row_bg = (227, 243, 253) if selected else (255, 255, 255)
+        row_border = (11, 111, 143) if selected else (216, 229, 238)
+        cv2.rectangle(pan, (8, y0), (w - 10, y1), row_bg, -1)
+        cv2.rectangle(pan, (8, y0), (w - 10, y1), row_border, 2 if selected else 1)
+        cv2.rectangle(
+            pan,
+            (8, y0),
+            (12, y1),
+            (11, 111, 143) if selected else (183, 151, 86),
+            -1,
+        )
+
+        avail = max(60, rms_x - 22)
+        base_name = f"{it['object']}  {it['side']}"
+        name = _ellipsize_end(base_name, avail, scale=0.45, thk=1)
+        col = (22, 34, 48) if selected else (48, 63, 79)
+        cv2.putText(
+            pan,
+            name,
+            (20, y0 + 17),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.45,
+            col,
+            1,
+            cv2.LINE_AA,
+        )
+        sub = "annotated" if it["ann_ok"] else "missing transform"
+        cv2.putText(
+            pan,
+            sub,
+            (20, y0 + 33),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.35,
+            (95, 106, 118),
+            1,
+            cv2.LINE_AA,
+        )
+
         if it["ann_ok"]:
-            chips.append(
-                _pill(f"RMS {it['rms']:.2f}px", "info") if it.get("rms") is not None else _pill("ANN OK", "ok"))
+            if it.get("rms") is None:
+                rms_text = "OK"
+                rms_kind = "ok"
+            else:
+                rms_text = f"{it['rms']:.1f}px"
+                rms_kind = _rms_kind(it.get("rms"))
         else:
-            chips.append(_pill("no ann", "warn"))
-        chips.append(_pill("BOARD", "ok" if it["board_ok"] else "warn"))
-        chips.append(_pill("KP OK", "ok" if it["kp_ok"] else "warn"))
+            rms_text = "missing"
+            rms_kind = "warn"
+        chips = (
+            (rms_text, rms_kind, rms_x),
+            ("OK" if it["board_ok"] else "miss", "ok" if it["board_ok"] else "warn", board_x),
+            ("OK" if it["kp_ok"] else "miss", "ok" if it["kp_ok"] else "warn", kp_x),
+        )
+        for text, kind, x in chips:
+            chip = _pill(text, kind)
+            ch, cw = chip.shape[:2]
+            max_w = max(1, min(cw, w - x - 10))
+            chip_y = y0 + max(6, (row_h - ch) // 2 - 1)
+            pan[chip_y:chip_y + ch, x:x + max_w] = chip[:, :max_w]
+        y += row_h
 
-        x = w - 12
-        for c in reversed(chips):
-            ch, cw = c.shape[:2];
-            x -= (cw + 6)
-            pan[y - 16:y - 16 + ch, x:x + cw] = c
+    if len(items) > max_show:
+        track_top = header_h + 10
+        track_bottom = h - footer_h - 12
+        track_h = max(1, track_bottom - track_top)
+        thumb_h = max(24, int(track_h * max_show / max(1, len(items))))
+        max_start = max(1, len(items) - max_show)
+        thumb_y = track_top + int((track_h - thumb_h) * start / max_start)
+        cv2.rectangle(pan, (w - 8, track_top), (w - 4, track_bottom), (219, 231, 239), -1)
+        cv2.rectangle(pan, (w - 9, thumb_y), (w - 3, thumb_y + thumb_h), (85, 112, 138), -1)
 
-        avail = x - 14
-        base_name = f"{it['object']}  side{it['side']}"
-        name = base_name
-        (tw, th), _ = cv2.getTextSize("> " + name, cv2.FONT_HERSHEY_SIMPLEX, 0.78, 2)
-        while tw > avail and len(name) > 3:
-            name = name[:-4] + "..."
-            (tw, th), _ = cv2.getTextSize("> " + name, cv2.FONT_HERSHEY_SIMPLEX, 0.78, 2)
-        col = (20, 70, 180) if i == sel else (30, 30, 30);
-        thk = 2 if i == sel else 1
-        cv2.putText(pan, ("> " if i == sel else "  ") + name, (14, y), cv2.FONT_HERSHEY_SIMPLEX, 0.78, col, thk,
-                    cv2.LINE_AA)
-        y += 30
-
-    tips = "UP/DOWN or W/S select   ENTER annotate   A pts   C auto-scale   T check   F force   R reload   Q quit"
+    cv2.rectangle(pan, (0, h - footer_h), (w, h), (250, 252, 253), -1)
+    tips = "J/K, arrows, W/S select   ENTER annotate/redo   A mode   R reload   Q quit"
     tips_lines = _wrap_to_width(tips, w - 24, scale=0.46, thk=1)
     line_h = 18
     y0 = h - 10 - line_h * (len(tips_lines) - 1)
     for i, t in enumerate(tips_lines):
-        cv2.putText(pan, t, (12, y0 + i * line_h), cv2.FONT_HERSHEY_SIMPLEX, 0.46, (90, 90, 90), 1, cv2.LINE_AA)
+        cv2.putText(
+            pan,
+            t,
+            (12, y0 + i * line_h),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.46,
+            (89, 104, 118),
+            1,
+            cv2.LINE_AA,
+        )
     return pan
 
 
-def _render_raw_thumb(path: Path, target_h=UI_H, target_w=UI_W_LEFT):
+def _render_raw_thumb(path: Path, target_h=UI_H, target_w=UI_W_LEFT, label: str | None = None):
     if not path or not Path(path).exists():
         return np.full((target_h, target_w, 3), 32, np.uint8)
     img = cv2.imread(str(path), cv2.IMREAD_COLOR)
@@ -893,37 +1706,37 @@ def _render_raw_thumb(path: Path, target_h=UI_H, target_w=UI_W_LEFT):
     vis = cv2.resize(img, (nw, nh), interpolation=cv2.INTER_AREA)
     out = np.full((target_h, target_w, 3), 22, np.uint8)
     out[:nh, :nw] = vis
-    cv2.putText(out, Path(path).name, (12, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2, cv2.LINE_AA)
+    title = label or Path(path).name
+    title = _ellipsize_end(str(title), max(1, target_w - 24), scale=0.7, thk=2)
+    cv2.putText(out, title, (12, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2, cv2.LINE_AA)
     return out
 
 
 # -------------------------- Core per-shot flow --------------------------
-def _load_K_and_face(project_root: Path, meta_path: Path, row) -> tuple[np.ndarray, str, dict]:
+def _load_K_and_face(project_root: Path, meta_path: Path, row, *, meta_json: Optional[dict] = None) -> tuple[np.ndarray, str, dict]:
     """Return (K, face_yaml_abs, meta_json). Works with old and new meta."""
-    meta_json = {}
-    if meta_path.exists():
-        try:
-            meta_json = json.loads(meta_path.read_text())
-        except Exception:
-            pass
+    if meta_json is None:
+        meta_json = _load_json_mapping(meta_path, "Shot metadata JSON")
 
     # Camera intrinsics
-    if meta_json.get("camera"):
+    if isinstance(meta_json.get("camera"), Mapping):
         cam = meta_json["camera"]
-        fx, fy, cx, cy = cam["fx"], cam["fy"], cam["cx"], cam["cy"]
+        K = _camera_matrix_from_values(cam, f"metadata camera ({meta_path})")
     elif row and all(getattr(row, k) is not None for k in ("fx", "fy", "cx", "cy")):
-        fx, fy, cx, cy = row.fx, row.fy, row.cx, row.cy
+        K = _camera_matrix_from_values(
+            {"fx": row.fx, "fy": row.fy, "cx": row.cx, "cy": row.cy},
+            "shots manifest row",
+        )
     else:
         raise SystemExit("[!] Camera intrinsics not found (meta.camera or manifest columns).")
-    K = np.array([[fx, 0, cx], [0, fy, cy], [0, 0, 1]], float)
 
     # face_yaml (absolute)
     face_yaml = meta_json.get("face_yaml") or (row.face_yaml if row else None)
     if not face_yaml:
         raise SystemExit("[!] face_yaml missing (meta or manifest).")
-    fy_path = Path(face_yaml)
-    if not fy_path.is_absolute():
-        fy_path = (project_root / fy_path).resolve()
+    fy_path = _resolve_project_path(project_root, face_yaml)
+    if fy_path is None:
+        raise SystemExit("[!] face_yaml missing (meta or manifest).")
 
     return K, str(fy_path), meta_json
 
@@ -932,35 +1745,18 @@ def annotate_single_shot(project_root: Path, shot_raw_path: Path, *,
                          pts_type: str = "quad", calib: Optional[str] = None,
                          check_tag_scale: bool = False, auto_correct_scale: bool = False,
                          scale_tol: float = 0.02) -> Path:
-    if not shot_raw_path.exists():
-        raise SystemExit(f"[!] Shot not found: {shot_raw_path}")
-    if not shot_raw_path.name.endswith("_raw.png"):
-        raise SystemExit("Shot must end with _raw.png")
+    project_root = Path(project_root).expanduser().resolve()
+    preflight = preflight_annotation_shot(project_root, shot_raw_path, calib=calib)
+    shot_raw_path = preflight.shot_raw_path
+    K = preflight.K
+    face_yaml_path = str(preflight.board_yaml_path)
+    dist = _load_dist_from_calib(str(preflight.calib_path) if preflight.calib_path else None)
 
-    # Optional manifest row
-    manifest_path = project_root / "shots" / "manifest.csv"
-    row = None
-    if manifest_path.exists():
-        for r in _read_manifest(manifest_path):
-            if Path(r.path_raw) == shot_raw_path:
-                row = r;
-                break
-
-    # Meta path: prefer manifest's, else sibling
-    meta_path = Path(row.path_meta) if (row and row.path_meta) else Path(
-        str(shot_raw_path).replace("_raw.png", "_meta.json"))
-    K, face_yaml_path, meta_json = _load_K_and_face(project_root, meta_path, row)
-    dist = _load_dist_from_calib(calib)
-
-    # Infer object + side robustly
-    obj, side_letter = _infer_object_and_side(shot_raw_path, meta_json, row)
-    face_key = Path(face_yaml_path).stem
-
-    img_ann = (meta_json.get("image") or {}).get("path_ann") or (
-        row.path_ann if row and row.path_ann else str(shot_raw_path).replace("_raw.png", "_ann.png"))
-    img_ann = Path(img_ann)
-    # reprojection image path
-    img_reproj = img_ann.with_name(img_ann.name.replace("_ann", "_reproj"))
+    obj = preflight.object_base
+    face_label = preflight.side
+    face_key = preflight.face_key
+    img_ann = preflight.annotated_path
+    img_reproj = preflight.reprojection_path
 
     # Load image/gray
     img = cv2.imread(str(shot_raw_path), cv2.IMREAD_COLOR)
@@ -1023,27 +1819,54 @@ def annotate_single_shot(project_root: Path, shot_raw_path: Path, *,
     R, _ = cv2.Rodrigues(fit["rvec"]);
     T_cam_obj = se3(R, fit["tvec"].reshape(3))
 
-    # Visuals for review
-    def _project_named(names, col, rad=4, canvas=None):
-        X = np.vstack([pts3d_dict[n] for n in names]).astype(np.float32)
-        uv, _ = _reproj(X, T_cam_obj, K, img, draw=False, dist=dist)
-        for (u, v), name in zip(uv, names):
-            if 0 <= u < img.shape[1] and 0 <= v < img.shape[0]:
-                cv2.circle(canvas, (int(u), int(v)), rad, col, -1)
-                cv2.putText(canvas, name, (int(u) + 4, int(v) - 4), cv2.FONT_HERSHEY_SIMPLEX, 0.40, col, 1)
+    def _review_images(current_T_cam_obj, current_ordered2d):
+        face_X = np.vstack([pts3d_dict[n] for n in names_in_order]).astype(np.float32)
+        uv4, _ = _reproj(face_X, current_T_cam_obj, K, img, draw=False, dist=dist)
+        err = np.linalg.norm(uv4 - current_ordered2d, axis=1)
+        current_rms = float(np.sqrt((err ** 2).mean()))
 
-    anno = img.copy()
-    _project_named(names_in_order, (0, 220, 0), 4, anno)
-    others = [n for n in pts3d_dict.keys() if n not in names_in_order]
-    if others: _project_named(others, (0, 0, 255), 3, anno)
+        anno = img.copy()
+        _draw_review_corners(
+            anno,
+            current_ordered2d,
+            color=(255, 210, 0),
+            names=[f"C{i + 1}" for i in range(len(current_ordered2d))],
+            radius=4,
+        )
+        _draw_review_corners(
+            anno,
+            uv4,
+            color=(0, 210, 95),
+            names=names_in_order,
+            radius=5,
+        )
 
-    all3d = np.vstack([v for _, v in sorted(pts3d_dict.items())]).astype(np.float32)
-    _, mid = _reproj(all3d, T_cam_obj, K, img, draw=True, dist=dist)
+        mid = img.copy()
+        _draw_review_corners(
+            mid,
+            current_ordered2d,
+            color=(255, 210, 0),
+            names=[f"C{i + 1}" for i in range(len(current_ordered2d))],
+            radius=4,
+        )
+        _draw_review_corners(
+            mid,
+            uv4,
+            color=(0, 210, 95),
+            names=names_in_order,
+            radius=4,
+        )
+        _draw_annotation_banner(
+            mid,
+            [
+                f"RMS {current_rms:.2f}px",
+                "Cyan = clicked corners. Green = solved face projection.",
+            ],
+            accent=(0, 150, 92) if current_rms <= 5.0 else (0, 145, 220),
+        )
+        return anno, mid, uv4, current_rms
 
-    uv4, _ = _reproj(np.vstack([pts3d_dict[n] for n in names_in_order]).astype(np.float32),
-                     T_cam_obj, K, img, draw=False, dist=dist)
-    err = np.linalg.norm(uv4 - ordered2d, axis=1);
-    rms = float(np.sqrt((err ** 2).mean()))
+    anno, mid, uv4, rms = _review_images(T_cam_obj, ordered2d)
 
     _flush_keys(120)
     while True:
@@ -1053,21 +1876,14 @@ def annotate_single_shot(project_root: Path, shot_raw_path: Path, *,
             mapping, ordered2d, fit = _assign_any_order(clicked, names_in_order, pts3d_dict, K, dist)
             R, _ = cv2.Rodrigues(fit["rvec"]);
             T_cam_obj = se3(R, fit["tvec"].reshape(3))
-            anno = img.copy()
-            _project_named(names_in_order, (0, 220, 0), 4, anno)
-            if others: _project_named(others, (0, 0, 255), 3, anno)
-            _, mid = _reproj(all3d, T_cam_obj, K, img, draw=True, dist=dist)
-            uv4, _ = _reproj(np.vstack([pts3d_dict[n] for n in names_in_order]).astype(np.float32),
-                             T_cam_obj, K, img, draw=False, dist=dist)
-            err = np.linalg.norm(uv4 - ordered2d, axis=1);
-            rms = float(np.sqrt((err ** 2).mean()))
+            anno, mid, uv4, rms = _review_images(T_cam_obj, ordered2d)
             continue
         break
 
-    # Compose outputs: compute board-to-object transform and save YAML, images
-    T_board_obj = inv_se3(T_cam_board) @ T_cam_obj
+    # Compose outputs: compute board-to-object transform and save YAML, images.
+    # PoseTag runtime later composes T_cam_object = T_cam_board @ T_board_object.
 
-    out_yaml = _out_yaml_path(project_root, obj, side_letter)
+    out_yaml = _out_yaml_path(project_root, obj, face_label, face_key=face_key)
     out_yaml.parent.mkdir(parents=True, exist_ok=True)
     Path(img_ann).parent.mkdir(parents=True, exist_ok=True)
 
@@ -1076,27 +1892,23 @@ def annotate_single_shot(project_root: Path, shot_raw_path: Path, *,
     cv2.imwrite(str(img_reproj), mid)
 
     # Save YAML with all annotation data
-    out = {
-        "object": obj,
-        "face_key": face_key,
-        "board_yaml": face_yaml_path,
-        "image": str(shot_raw_path),
-        "rms_px": rms,
-        "T_board_object": {"matrix": T_board_obj.tolist()},
-        "corner_uv": {n: [float(mapping[n][0]), float(mapping[n][1])] for n in names_in_order},
-        "pnp": {"rvec": [float(x) for x in fit["rvec"].ravel()],
-                "tvec": [float(x) for x in fit["tvec"].ravel()]},
-        "clicked_uv_raw": [(float(u), float(v)) for (u, v) in clicked],
-        "face_corner_names": names_in_order,
-        "assignment": {n: [float(mapping[n][0]), float(mapping[n][1])] for n in names_in_order},
-        "notes": "Accepted.",
-        "diagnostics": {
-            "board_tag_size_mm": float(tag_size_m * 1000.0),
-            "tag_scale_ratio": float(s),
-            "tag_scale_pairs": int(n_pairs),
-            "tag_scale_auto_corrected": bool(auto_correct_scale and abs(s - 1.0) > scale_tol),
-        },
-    }
+    out = build_annotation_record(
+        object_name=obj,
+        face_key=face_key,
+        board_yaml_path=face_yaml_path,
+        shot_raw_path=shot_raw_path,
+        rms_px=rms,
+        T_cam_board=T_cam_board,
+        T_cam_object=T_cam_obj,
+        corner_mapping=mapping,
+        clicked_uv=clicked,
+        face_corner_names=names_in_order,
+        pnp_fit=fit,
+        tag_size_m=tag_size_m,
+        tag_scale_ratio=s,
+        tag_scale_pairs=n_pairs,
+        tag_scale_auto_corrected=bool(auto_correct_scale and abs(s - 1.0) > scale_tol),
+    )
     log.info("RMS=%.2f px  (%s)", rms, face_key)
     with out_yaml.open("w") as f:
         yaml.safe_dump(out, f, sort_keys=False)
@@ -1121,11 +1933,12 @@ def annotate_single_shot(project_root: Path, shot_raw_path: Path, *,
 def _latest_per_face(rows: List[ShotRow], object_filter: Optional[str], side: Optional[str]) -> List[ShotRow]:
     # key = (object_base, side, face_yaml)
     latest: Dict[Tuple[str, str, str], ShotRow] = {}
+    side_filter = _normalise_side_letter(side)
     for r in rows:
         if not r.path_raw: continue
         if object_filter and object_filter.lower() not in r.object_base.lower(): continue
-        if side and r.side.upper() != side.upper(): continue
-        key = (r.object_base, r.side.upper(), Path(r.face_yaml).stem)
+        if side_filter and _normalise_side_letter(r.side) != side_filter: continue
+        key = (r.object_base, _normalise_side_letter(r.side), Path(r.face_yaml).stem)
         prev = latest.get(key)
         if prev is None or r.timestamp > prev.timestamp:
             latest[key] = r
@@ -1145,9 +1958,9 @@ def _load_rms_if_any(yaml_path: Path) -> Optional[float]:
 
 # -------------------------- CLI --------------------------
 
-def main():
+def main(argv=None):
    # Parse command-line arguments for single-shot, batch, or browse modes
-    parser = argparse.ArgumentParser("Annotate ISC faces (single or batch via manifest).")
+    parser = argparse.ArgumentParser("Annotate PoseTag faces (single or batch via manifest).")
     parser.add_argument("--shot", type=str, help="Absolute path to *_raw.png (single-shot mode).")
     parser.add_argument("--batch", choices=["latest"], help="Batch mode from manifest.csv.")
     parser.add_argument("--manifest", type=str, help="Path to manifest.csv (default: <proj>/shots/manifest.csv).")
@@ -1156,15 +1969,21 @@ def main():
     parser.add_argument("--force", action="store_true", help="Overwrite existing YAML if present.")
     parser.add_argument("--pts-type", choices=["quad", "any"], default="quad", help="Corner input mode.")
     parser.add_argument("--calib", type=str, default=None, help="Optional ChArUco calib yaml for distortion.")
-    parser.add_argument("--dry-run", action="store_true", help="List actions then exit.")
+    parser.add_argument("--dry-run", action="store_true", help="List and validate actions then exit.")
     parser.add_argument("--check-tag-scale", action="store_true", help="Print scale ratio s from inter-tag distances.")
     parser.add_argument("--auto-correct-scale", action="store_true",
                         help="If |s-1|>tol, divide T_cam_board translation by s.")
-    parser.add_argument("--scale-tol", type=float, default=0.02, help="Relative tolerance (default 0.02 = 2%).")
+    parser.add_argument("--scale-tol", type=float, default=0.02, help="Relative tolerance (default 0.02 = 2%%).")
     parser.add_argument("--browse", action="store_true",
                         help="Interactive browser (arrow keys + ENTER) to pick which face to annotate.")
 
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
+
+    mode_count = int(bool(args.shot)) + int(bool(args.batch)) + int(bool(args.browse))
+    if mode_count == 0:
+        parser.error("choose one mode: --shot, --batch latest, or --browse")
+    if mode_count > 1:
+        parser.error("choose only one mode: --shot, --batch, or --browse")
 
     project_root = resolve_project_root(None)
     ensure_project_dirs(project_root)
@@ -1194,6 +2013,21 @@ def main():
         return
     elif args.shot:
         try:
+            if args.dry_run:
+                preflight = preflight_annotation_shot(project_root, Path(args.shot), calib=args.calib)
+                log.info("[i] Dry-run single-shot annotation:")
+                log.info(f"  raw image    : {preflight.shot_raw_path}")
+                log.info(f"  metadata     : {preflight.meta_path}")
+                log.info(f"  board YAML   : {preflight.board_yaml_path}")
+                log.info(f"  keypoints    : {preflight.keypoints_path}")
+                log.info(
+                    "  output YAML  : "
+                    f"{_out_yaml_path(project_root, preflight.object_base, preflight.side, face_key=preflight.face_key)}"
+                )
+                log.info(f"  review image : {preflight.annotated_path}")
+                log.info(f"  reprojection : {preflight.reprojection_path}")
+                log.info("[i] Dry-run only. Exiting.")
+                return
             annotate_single_shot(project_root, Path(args.shot), pts_type=args.pts_type, calib=args.calib,
                                  check_tag_scale=args.check_tag_scale, auto_correct_scale=args.auto_correct_scale,
                                  scale_tol=args.scale_tol)
@@ -1224,21 +2058,56 @@ def main():
         return
 
     log.info("[i] Batch plan:")
+    preflight_errors: list[str] = []
     for r in pick:
-        out_yaml = _out_yaml_path(project_root, r.object_base, r.side)
-        status = "(exists)" if (out_yaml.exists() and not args.force) else ""
-        log.info(f"  - {r.object_base} side{r.side}  ts={r.timestamp}  -> {out_yaml} {status}")
+        try:
+            preflight = preflight_annotation_shot(
+                project_root,
+                Path(r.path_raw),
+                row=r,
+                manifest_path=manifest,
+                calib=args.calib,
+            )
+            out_yaml = _out_yaml_path(
+                project_root,
+                preflight.object_base,
+                preflight.side,
+                face_key=preflight.face_key,
+            )
+            status = "(exists)" if (out_yaml.exists() and not args.force) else ""
+            log.info(
+                f"  - {preflight.object_base} {preflight.side}  "
+                f"ts={r.timestamp}  -> {out_yaml} {status}"
+            )
+        except SystemExit as e:
+            message = str(e) or "annotation preflight failed"
+            preflight_errors.append(f"{r.object_base} {r.side}: {message}")
+            log.error(f"  - {r.object_base} {r.side}  ts={r.timestamp}: {message}")
 
     if args.dry_run:
+        if preflight_errors:
+            sys.exit("[!] Dry-run found invalid annotation input(s).")
         log.info("[i] Dry-run only. Exiting.")
         return
 
     for r in pick:
-        out_yaml = _out_yaml_path(project_root, r.object_base, r.side)
-        if out_yaml.exists() and not args.force:
-            log.info(f"[i] Skip (already done): {out_yaml}")
-            continue
         try:
+            preflight = preflight_annotation_shot(
+                project_root,
+                Path(r.path_raw),
+                row=r,
+                manifest_path=manifest,
+                calib=args.calib,
+            )
+            out_yaml = _out_yaml_path(
+                project_root,
+                preflight.object_base,
+                preflight.side,
+                face_key=preflight.face_key,
+            )
+            if out_yaml.exists() and not args.force:
+                log.info(f"[i] Skip (already done): {out_yaml}")
+                continue
             annotate_single_shot(project_root, Path(r.path_raw), pts_type=args.pts_type, calib=args.calib,
                                  check_tag_scale=args.check_tag_scale, auto_correct_scale=args.auto_correct_scale,
                                  scale_tol=args.scale_tol)

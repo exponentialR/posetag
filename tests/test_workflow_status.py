@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import csv
 import subprocess
 import sys
 import unittest
@@ -181,6 +182,92 @@ def _write_valid_keypoints(project_root: Path, object_name: str) -> Path:
         ),
         encoding="utf-8",
     )
+    return path
+
+
+def _write_face_annotation(
+    project_root: Path,
+    *,
+    object_name: str,
+    side: str,
+    board_path: Path,
+    image_path: Path,
+    rms_px: float = 0.25,
+) -> Path:
+    face_key = f"{object_name}_{side}"
+    path = project_root / "faces" / object_name / side / f"{face_key}_T_board_object.yaml"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        yaml.safe_dump(
+            {
+                "object": object_name,
+                "face_key": face_key,
+                "board_yaml": str(board_path),
+                "image": str(image_path),
+                "rms_px": rms_px,
+                "T_board_object": {"matrix": np.eye(4).tolist()},
+                "corner_uv": {
+                    "p0": [10.0, 20.0],
+                    "p1": [30.0, 20.0],
+                    "p2": [30.0, 40.0],
+                    "p3": [10.0, 40.0],
+                },
+                "pnp": {"rvec": [0.0, 0.0, 0.0], "tvec": [0.0, 0.0, 1.0]},
+                "clicked_uv_raw": [[10.0, 20.0], [30.0, 20.0], [30.0, 40.0], [10.0, 40.0]],
+                "face_corner_names": ["p0", "p1", "p2", "p3"],
+                "assignment": {
+                    "p0": [10.0, 20.0],
+                    "p1": [30.0, 20.0],
+                    "p2": [30.0, 40.0],
+                    "p3": [10.0, 40.0],
+                },
+                "diagnostics": {
+                    "board_tag_size_mm": 80.0,
+                    "tag_scale_ratio": 1.0,
+                    "tag_scale_pairs": 1,
+                    "tag_scale_auto_corrected": False,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    return path
+
+
+def _write_face_manifest(project_root: Path, annotation_paths: list[Path]) -> Path:
+    path = project_root / "faces" / "face_manifest.csv"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=[
+                "timestamp",
+                "object",
+                "side",
+                "face_key",
+                "yaml_path",
+                "board_yaml",
+                "image",
+                "rms_px",
+                "tag_size_m",
+            ],
+        )
+        writer.writeheader()
+        for annotation_path in annotation_paths:
+            data = yaml.safe_load(annotation_path.read_text(encoding="utf-8"))
+            writer.writerow(
+                {
+                    "timestamp": "2026-06-06T12:00:00",
+                    "object": data["object"],
+                    "side": data["face_key"].rsplit("_", 1)[-1],
+                    "face_key": data["face_key"],
+                    "yaml_path": str(annotation_path.relative_to(project_root)),
+                    "board_yaml": data["board_yaml"],
+                    "image": data["image"],
+                    "rms_px": str(data["rms_px"]),
+                    "tag_size_m": "0.080000",
+                }
+            )
     return path
 
 
@@ -498,7 +585,120 @@ class WorkflowStatusTests(unittest.TestCase):
             self.assertIn("annotation-ready keypoints for 1 object", stage6.message)
             self.assertIn(str(keypoints_path), stage6.checked_paths)
             self.assertEqual(stage7.status, WorkflowStatus.MISSING)
-            self.assertIn("Face annotation status", stage7.message)
+            self.assertIn("Face annotations are incomplete: 0/2", stage7.message)
+            self.assertIn(
+                str(
+                    project_root
+                    / "faces"
+                    / "connection_plate_white"
+                    / "sideA"
+                    / "connection_plate_white_sideA_T_board_object.yaml"
+                ),
+                stage7.checked_paths,
+            )
+
+    def test_valid_face_annotations_after_keypoints_mark_stage7_complete(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            project_root = Path(tmpdir) / "project"
+            board_paths, _registry_path = _write_two_face_board_and_registry(project_root)
+            _write_face_capture(
+                project_root,
+                board_paths["sideA"],
+                timestamp="20260530_120000",
+            )
+            _write_face_capture(
+                project_root,
+                board_paths["sideB"],
+                timestamp="20260530_120100",
+            )
+            _write_valid_keypoints(project_root, "connection_plate_white")
+            side_a_image = (
+                project_root
+                / "shots"
+                / "connection_plate_white"
+                / "sideA"
+                / "connection_plate_white_sideA_20260530_120000_raw.png"
+            )
+            side_b_image = (
+                project_root
+                / "shots"
+                / "connection_plate_white"
+                / "sideB"
+                / "connection_plate_white_sideB_20260530_120100_raw.png"
+            )
+            annotation_paths = [
+                _write_face_annotation(
+                    project_root,
+                    object_name="connection_plate_white",
+                    side="sideA",
+                    board_path=board_paths["sideA"],
+                    image_path=side_a_image,
+                ),
+                _write_face_annotation(
+                    project_root,
+                    object_name="connection_plate_white",
+                    side="sideB",
+                    board_path=board_paths["sideB"],
+                    image_path=side_b_image,
+                ),
+            ]
+            manifest_path = _write_face_manifest(project_root, annotation_paths)
+
+            stage7 = _stage_by_id(project_root, 7)
+
+            self.assertEqual(stage7.status, WorkflowStatus.COMPLETE)
+            self.assertIn("valid board-to-object annotations for 2 faces", stage7.message)
+            self.assertIn(str(manifest_path), stage7.checked_paths)
+
+    def test_face_annotation_manifest_missing_needs_attention(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            project_root = Path(tmpdir) / "project"
+            board_paths, _registry_path = _write_two_face_board_and_registry(project_root)
+            _write_face_capture(
+                project_root,
+                board_paths["sideA"],
+                timestamp="20260530_120000",
+            )
+            _write_face_capture(
+                project_root,
+                board_paths["sideB"],
+                timestamp="20260530_120100",
+            )
+            _write_valid_keypoints(project_root, "connection_plate_white")
+            side_a_image = (
+                project_root
+                / "shots"
+                / "connection_plate_white"
+                / "sideA"
+                / "connection_plate_white_sideA_20260530_120000_raw.png"
+            )
+            side_b_image = (
+                project_root
+                / "shots"
+                / "connection_plate_white"
+                / "sideB"
+                / "connection_plate_white_sideB_20260530_120100_raw.png"
+            )
+            _write_face_annotation(
+                project_root,
+                object_name="connection_plate_white",
+                side="sideA",
+                board_path=board_paths["sideA"],
+                image_path=side_a_image,
+            )
+            _write_face_annotation(
+                project_root,
+                object_name="connection_plate_white",
+                side="sideB",
+                board_path=board_paths["sideB"],
+                image_path=side_b_image,
+            )
+
+            stage7 = _stage_by_id(project_root, 7)
+
+            self.assertEqual(stage7.status, WorkflowStatus.NEEDS_ATTENTION)
+            self.assertIn("outputs exist but need attention", stage7.message)
+            self.assertTrue(any("Face manifest was not found" in error for error in stage7.errors))
 
     def test_keypoints_missing_captured_side_keep_stage6_invalid(self) -> None:
         with TemporaryDirectory() as tmpdir:
