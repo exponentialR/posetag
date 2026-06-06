@@ -170,6 +170,8 @@ normal multi-select gestures, such as Shift-click or Command-click on macOS, to
 remove several transforms at once. It does not delete board YAMLs, face shots,
 object meshes, or keypoints.
 
+![Stage 7 annotation dashboard preview](assets/stage7_annotation_dashboard.png)
+
 The GUI does not reimplement corner selection or pose solving. Manual clicking,
 PnP, and YAML writing remain in the existing OpenCV annotator so the annotation
 math and output schema stay unchanged.
@@ -193,6 +195,8 @@ Controls:
 To redo an already annotated face in the OpenCV browser, select the row and
 press `ENTER`. Batch mode still skips existing annotation YAMLs unless
 `--force` is supplied.
+
+![OpenCV annotation face browser table](assets/stage7_annotation_browser_table.png)
 
 The face browser reports reprojection RMS in pixels. Low RMS indicates that
 the clicked corners, object keypoints, board pose, and calibration agree well.

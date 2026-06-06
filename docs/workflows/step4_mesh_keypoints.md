@@ -160,7 +160,7 @@ left-drag rotates, secondary-drag pans, and the mouse wheel zooms. Stage 6
 still reports missing until the annotation-ready `objects/<object>/keypoints.json`
 file exists and validates.
 
-![Stage 6 mesh-keypoint dashboard preview](assets/stage4_mesh_keypoints_dashboard.png)
+![Stage 6 mesh-keypoint dashboard preview](assets/stage6_mesh_keypoints_dashboard.png)
 
 The Stage 6 command card still previews `posetag-gen-keypoints` for
 reproducibility. The dashboard import and generation actions write only absent
