@@ -650,6 +650,82 @@ class WorkflowStatusTests(unittest.TestCase):
             self.assertIn("valid board-to-object annotations for 2 faces", stage7.message)
             self.assertIn(str(manifest_path), stage7.checked_paths)
 
+    def test_stale_face_manifest_row_needs_attention(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            project_root = Path(tmpdir) / "project"
+            board_paths, _registry_path = _write_two_face_board_and_registry(project_root)
+            _write_face_capture(
+                project_root,
+                board_paths["sideA"],
+                timestamp="20260530_120000",
+            )
+            _write_face_capture(
+                project_root,
+                board_paths["sideB"],
+                timestamp="20260530_120100",
+            )
+            _write_valid_keypoints(project_root, "connection_plate_white")
+            side_a_image = (
+                project_root
+                / "shots"
+                / "connection_plate_white"
+                / "sideA"
+                / "connection_plate_white_sideA_20260530_120000_raw.png"
+            )
+            side_b_image = (
+                project_root
+                / "shots"
+                / "connection_plate_white"
+                / "sideB"
+                / "connection_plate_white_sideB_20260530_120100_raw.png"
+            )
+            annotation_paths = [
+                _write_face_annotation(
+                    project_root,
+                    object_name="connection_plate_white",
+                    side="sideA",
+                    board_path=board_paths["sideA"],
+                    image_path=side_a_image,
+                ),
+                _write_face_annotation(
+                    project_root,
+                    object_name="connection_plate_white",
+                    side="sideB",
+                    board_path=board_paths["sideB"],
+                    image_path=side_b_image,
+                ),
+            ]
+            manifest_path = _write_face_manifest(project_root, annotation_paths)
+            with manifest_path.open("r", newline="", encoding="utf-8") as handle:
+                fieldnames = csv.DictReader(handle).fieldnames
+            self.assertIsNotNone(fieldnames)
+            with manifest_path.open("a", newline="", encoding="utf-8") as handle:
+                writer = csv.DictWriter(handle, fieldnames=fieldnames)
+                writer.writerow(
+                    {
+                        "timestamp": "2026-06-06T12:10:00",
+                        "object": "connection_plate_white",
+                        "side": "old",
+                        "face_key": "connection_plate_white_old",
+                        "yaml_path": (
+                            "faces/connection_plate_white/old/"
+                            "connection_plate_white_old_T_board_object.yaml"
+                        ),
+                        "board_yaml": str(board_paths["sideA"]),
+                        "image": str(side_a_image),
+                        "rms_px": "0.25",
+                        "tag_size_m": "0.080000",
+                    }
+                )
+
+            stage7 = _stage_by_id(project_root, 7)
+
+            self.assertEqual(stage7.status, WorkflowStatus.NEEDS_ATTENTION)
+            self.assertTrue(
+                any("stale annotation row" in error for error in stage7.errors),
+                stage7.errors,
+            )
+
     def test_face_annotation_manifest_missing_needs_attention(self) -> None:
         with TemporaryDirectory() as tmpdir:
             project_root = Path(tmpdir) / "project"

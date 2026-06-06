@@ -934,14 +934,16 @@ def _validate_face_manifest(
     project_root: Path,
     valid_annotation_paths: Iterable[Path],
 ) -> tuple[str, ...]:
-    expected_rel = set()
+    expected_by_path: dict[Path, str] = {}
     for path in valid_annotation_paths:
+        resolved = path.resolve()
         try:
-            expected_rel.add(str(path.relative_to(project_root)))
+            label = str(path.relative_to(project_root))
         except ValueError:
-            expected_rel.add(str(path))
+            label = str(path)
+        expected_by_path[resolved] = label
 
-    if not expected_rel:
+    if not expected_by_path:
         return ()
 
     if not manifest_path.exists():
@@ -956,14 +958,35 @@ def _validate_face_manifest(
     if not rows:
         return ("Face manifest has no annotation rows.",)
 
-    actual = {str(row.get("yaml_path", "")).strip() for row in rows}
-    missing = sorted(expected_rel - actual)
+    actual_paths: set[Path] = set()
+    stale_rows: list[str] = []
+    for row_number, row in enumerate(rows, start=2):
+        yaml_path = str(row.get("yaml_path", "")).strip()
+        if not yaml_path:
+            stale_rows.append(f"row {row_number}: <empty yaml_path>")
+            continue
+        resolved = _resolve_artifact_path(project_root, yaml_path).resolve()
+        actual_paths.add(resolved)
+        if resolved not in expected_by_path:
+            stale_rows.append(yaml_path)
+
+    missing = sorted(
+        label
+        for path, label in expected_by_path.items()
+        if path not in actual_paths
+    )
+    errors: list[str] = []
     if missing:
         shown = ", ".join(missing[:4])
         suffix = f", and {len(missing) - 4} more" if len(missing) > 4 else ""
-        return (f"Face manifest is missing annotation row(s): {shown}{suffix}",)
+        errors.append(f"Face manifest is missing annotation row(s): {shown}{suffix}")
 
-    return ()
+    if stale_rows:
+        shown = ", ".join(stale_rows[:4])
+        suffix = f", and {len(stale_rows) - 4} more" if len(stale_rows) > 4 else ""
+        errors.append(f"Face manifest has stale annotation row(s): {shown}{suffix}")
+
+    return tuple(errors)
 
 
 def _resolve_artifact_path(project_root: Path, value: str) -> Path:
