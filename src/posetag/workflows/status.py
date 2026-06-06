@@ -8,6 +8,7 @@ pose-estimation algorithms in their existing pipeline modules.
 
 from __future__ import annotations
 
+import csv
 import math
 import json
 from dataclasses import asdict, dataclass
@@ -137,10 +138,13 @@ def inspect_project(project_root: Union[Path, str]) -> list[StageSummary]:
         board_definitions,
         face_shots,
         mesh_keypoints,
+        inspect_face_annotations(
+            root,
+            mesh_keypoints_complete=mesh_keypoints.status == WorkflowStatus.COMPLETE,
+        ),
     ]
     summaries.extend(
         _placeholder_summaries(
-            mesh_keypoints_complete=mesh_keypoints.status == WorkflowStatus.COMPLETE
         )
     )
     return summaries
@@ -715,31 +719,107 @@ def inspect_mesh_keypoints(
     )
 
 
-def _placeholder_summaries(mesh_keypoints_complete: bool) -> list[StageSummary]:
-    stage7_status = (
-        WorkflowStatus.MISSING
-        if mesh_keypoints_complete
-        else WorkflowStatus.NOT_APPLICABLE
-    )
-    stage7_message = (
-        "Face annotation status validation is not implemented yet."
-        if mesh_keypoints_complete
-        else "Face annotation depends on mesh keypoints."
-    )
-    stage7_next_action = (
-        "Run the annotation workflow after confirming mesh keypoints."
-        if mesh_keypoints_complete
-        else "Complete Stage 6 before checking Stage 7."
+def inspect_face_annotations(
+    project_root: Union[Path, str],
+    *,
+    mesh_keypoints_complete: bool = False,
+) -> StageSummary:
+    """Inspect Stage 7 face annotation YAMLs and manifest."""
+
+    root = Path(project_root).expanduser()
+    expected = _expected_annotation_yaml_paths(root)
+    manifest_path = root / "faces" / "face_manifest.csv"
+    checked_paths = _path_tuple([*expected, manifest_path])
+
+    if not mesh_keypoints_complete:
+        return _stage(
+            stage_id=7,
+            status=WorkflowStatus.NOT_APPLICABLE,
+            message="Face annotation depends on completed mesh keypoints.",
+            checked_paths=checked_paths,
+            next_action="Complete Stage 6 before checking Stage 7.",
+        )
+
+    if not expected:
+        return _stage(
+            stage_id=7,
+            status=WorkflowStatus.NEEDS_ATTENTION,
+            message="Could not infer expected face annotations.",
+            checked_paths=checked_paths,
+            errors=(
+                "Expected object faces from boards, tag registry, or shots manifest.",
+            ),
+            next_action=(
+                "Repair board/shot metadata, then run posetag-annotate after "
+                "mesh keypoints are complete."
+            ),
+        )
+
+    errors: list[str] = []
+    valid_paths: list[Path] = []
+    missing_paths: list[Path] = []
+    for yaml_path in expected:
+        if not yaml_path.exists():
+            missing_paths.append(yaml_path)
+            continue
+        yaml_errors = _validate_annotation_yaml(yaml_path, root)
+        if yaml_errors:
+            errors.extend(f"{yaml_path}: {message}" for message in yaml_errors)
+            continue
+        valid_paths.append(yaml_path)
+
+    manifest_errors = _validate_face_manifest(manifest_path, root, valid_paths)
+    if errors or manifest_errors:
+        return _stage(
+            stage_id=7,
+            status=WorkflowStatus.NEEDS_ATTENTION,
+            message="Face annotation outputs exist but need attention.",
+            checked_paths=checked_paths,
+            errors=tuple([*errors, *manifest_errors]),
+            next_action=(
+                "Repair invalid annotation YAMLs or rerun posetag-annotate so "
+                "faces/face_manifest.csv is refreshed."
+            ),
+        )
+
+    if missing_paths:
+        annotated_count = len(valid_paths)
+        expected_count = len(expected)
+        status = (
+            WorkflowStatus.NEEDS_ATTENTION
+            if annotated_count
+            else WorkflowStatus.MISSING
+        )
+        return _stage(
+            stage_id=7,
+            status=status,
+            message=(
+                f"Face annotations are incomplete: {annotated_count}/"
+                f"{expected_count} expected face transform"
+                f"{'s' if expected_count != 1 else ''} exist."
+            ),
+            checked_paths=checked_paths,
+            next_action=(
+                "Run posetag-annotate for each captured face to write "
+                "faces/<object>/<side>/<face_key>_T_board_object.yaml."
+            ),
+        )
+
+    count = len(valid_paths)
+    return _stage(
+        stage_id=7,
+        status=WorkflowStatus.COMPLETE,
+        message=(
+            f"Found valid board-to-object annotations for {count} face"
+            f"{'s' if count != 1 else ''}."
+        ),
+        checked_paths=checked_paths,
+        next_action="Proceed to Stage 8 dataset collection.",
     )
 
+
+def _placeholder_summaries() -> list[StageSummary]:
     return [
-        _stage(
-            stage_id=7,
-            status=stage7_status,
-            message=stage7_message,
-            checked_paths=(),
-            next_action=stage7_next_action,
-        ),
         _stage(
             stage_id=8,
             status=WorkflowStatus.NOT_APPLICABLE,
@@ -758,6 +838,167 @@ def _placeholder_summaries(mesh_keypoints_complete: bool) -> list[StageSummary]:
             next_action="Complete Stage 8 before checking Stage 9.",
         ),
     ]
+
+
+def _expected_annotation_yaml_paths(project_root: Path) -> tuple[Path, ...]:
+    paths: list[Path] = []
+    for item in infer_known_objects(project_root):
+        for face in item.faces:
+            face_label = str(face).strip()
+            if not face_label:
+                continue
+            face_key = (
+                face_label
+                if face_label.startswith(f"{item.object_name}_")
+                else f"{item.object_name}_{face_label}"
+            )
+            paths.append(
+                project_root
+                / "faces"
+                / item.object_name
+                / face_label
+                / f"{face_key}_T_board_object.yaml"
+            )
+    return tuple(dict.fromkeys(paths))
+
+
+def _validate_annotation_yaml(path: Path, project_root: Path) -> tuple[str, ...]:
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            data = yaml.safe_load(handle)
+    except yaml.YAMLError as exc:
+        return (f"Malformed annotation YAML: {exc}",)
+    except OSError as exc:
+        return (f"Could not read annotation YAML: {exc}",)
+
+    if not isinstance(data, Mapping):
+        return ("Annotation YAML must contain a mapping.",)
+
+    errors: list[str] = []
+    for field in ("object", "face_key", "board_yaml", "image", "rms_px", "T_board_object"):
+        if field not in data:
+            errors.append(f"Annotation YAML is missing required field {field!r}.")
+
+    if errors:
+        return tuple(errors)
+
+    for field in ("object", "face_key", "board_yaml", "image"):
+        if not isinstance(data.get(field), str) or not data[field].strip():
+            errors.append(
+                f"Annotation YAML field {field!r} must be a non-empty string."
+            )
+
+    _require_number(data, "rms_px", errors, prefix="Annotation YAML")
+
+    transform = data.get("T_board_object")
+    if not isinstance(transform, Mapping):
+        errors.append("Annotation YAML field 'T_board_object' must be a mapping.")
+    elif "matrix" not in transform:
+        errors.append("Annotation YAML T_board_object is missing field 'matrix'.")
+    else:
+        _require_numeric_matrix(
+            transform["matrix"],
+            "Annotation YAML T_board_object.matrix",
+            rows=4,
+            cols=4,
+            errors=errors,
+        )
+        if _is_numeric_matrix(transform["matrix"], rows=4, cols=4):
+            last_row = [float(value) for value in transform["matrix"][3]]
+            if any(
+                abs(actual - expected) > 1e-9
+                for actual, expected in zip(last_row, (0.0, 0.0, 0.0, 1.0))
+            ):
+                errors.append(
+                    "Annotation YAML T_board_object.matrix must be a homogeneous "
+                    "4x4 transform with last row [0, 0, 0, 1]."
+                )
+
+    board_yaml = data.get("board_yaml")
+    if isinstance(board_yaml, str) and board_yaml.strip():
+        board_path = _resolve_artifact_path(project_root, board_yaml)
+        if not board_path.exists():
+            errors.append(f"Annotation board_yaml was not found: {board_path}")
+
+    image = data.get("image")
+    if isinstance(image, str) and image.strip():
+        image_path = _resolve_artifact_path(project_root, image)
+        if not image_path.exists():
+            errors.append(f"Annotation image was not found: {image_path}")
+
+    return tuple(errors)
+
+
+def _validate_face_manifest(
+    manifest_path: Path,
+    project_root: Path,
+    valid_annotation_paths: Iterable[Path],
+) -> tuple[str, ...]:
+    expected_by_path: dict[Path, str] = {}
+    for path in valid_annotation_paths:
+        resolved = path.resolve()
+        try:
+            label = str(path.relative_to(project_root))
+        except ValueError:
+            label = str(path)
+        expected_by_path[resolved] = label
+
+    if not expected_by_path:
+        return ()
+
+    if not manifest_path.exists():
+        return (f"Face manifest was not found: {manifest_path}",)
+
+    try:
+        with manifest_path.open("r", newline="", encoding="utf-8") as handle:
+            rows = list(csv.DictReader(handle))
+    except OSError as exc:
+        return (f"Could not read face manifest: {exc}",)
+
+    if not rows:
+        return ("Face manifest has no annotation rows.",)
+
+    actual_paths: set[Path] = set()
+    stale_rows: list[str] = []
+    for row_number, row in enumerate(rows, start=2):
+        yaml_path = str(row.get("yaml_path", "")).strip()
+        if not yaml_path:
+            stale_rows.append(f"row {row_number}: <empty yaml_path>")
+            continue
+        resolved = _resolve_artifact_path(project_root, yaml_path).resolve()
+        actual_paths.add(resolved)
+        if resolved not in expected_by_path:
+            stale_rows.append(yaml_path)
+
+    missing = sorted(
+        label
+        for path, label in expected_by_path.items()
+        if path not in actual_paths
+    )
+    errors: list[str] = []
+    if missing:
+        shown = ", ".join(missing[:4])
+        suffix = f", and {len(missing) - 4} more" if len(missing) > 4 else ""
+        errors.append(f"Face manifest is missing annotation row(s): {shown}{suffix}")
+
+    if stale_rows:
+        shown = ", ".join(stale_rows[:4])
+        suffix = f", and {len(stale_rows) - 4} more" if len(stale_rows) > 4 else ""
+        errors.append(f"Face manifest has stale annotation row(s): {shown}{suffix}")
+
+    return tuple(errors)
+
+
+def _resolve_artifact_path(project_root: Path, value: str) -> Path:
+    raw = Path(value).expanduser()
+    if raw.is_absolute():
+        return raw
+    candidate = project_root / raw
+    if candidate.exists():
+        return candidate
+    if raw.parts and raw.parts[0] == project_root.name:
+        return project_root.parent / raw
+    return candidate
 
 
 def _format_missing_faces(faces: tuple[str, ...]) -> str:
@@ -1056,3 +1297,21 @@ def _require_numeric_matrix(
             if not math.isfinite(numeric):
                 errors.append(f"{label} must contain only finite values.")
                 return
+
+
+def _is_numeric_matrix(value: Any, *, rows: int, cols: int) -> bool:
+    if not isinstance(value, list) or len(value) != rows:
+        return False
+    for row in value:
+        if not isinstance(row, list) or len(row) != cols:
+            return False
+        for item in row:
+            if isinstance(item, bool):
+                return False
+            try:
+                numeric = float(item)
+            except (TypeError, ValueError):
+                return False
+            if not math.isfinite(numeric):
+                return False
+    return True

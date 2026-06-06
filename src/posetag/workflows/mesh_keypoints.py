@@ -97,6 +97,25 @@ class MeshVertexPreview:
     bounds_max: tuple[float, float, float]
 
 
+@dataclass(frozen=True)
+class MeshKeypointGenerationResult:
+    """Summary of one generated annotation-ready keypoint file."""
+
+    object_name: str
+    mesh_path: Path
+    keypoints_path: Path
+    object_config_path: Optional[Path]
+
+
+@dataclass(frozen=True)
+class MeshKeypointRemovalResult:
+    """Summary of removed Stage 6 object-geometry artifacts."""
+
+    object_name: str
+    removed_paths: tuple[Path, ...]
+    skipped_paths: tuple[Path, ...]
+
+
 def supported_mesh_extensions() -> tuple[str, ...]:
     """Return mesh suffixes supported by the annotation-ready generator."""
 
@@ -137,14 +156,18 @@ def mesh_keypoint_command_for_object(
 
     root = Path(project_root).expanduser()
     name = validate_object_name(object_name)
-    mesh = Path(mesh_path).expanduser() if mesh_path is not None else default_mesh_path(root, name)
+    mesh = (
+        Path(mesh_path).expanduser()
+        if mesh_path is not None
+        else default_mesh_path(root, name)
+    )
     return shlex.join(
         (
             "posetag-gen-keypoints",
             "--project_root",
             str(root),
             "--mesh",
-            str(mesh),
+            str(_mesh_cli_argument(root, mesh)),
             "--object_name",
             name,
         )
@@ -157,6 +180,19 @@ def resolve_mesh_path(project_root: Union[Path, str], mesh: Union[Path, str]) ->
     root = Path(project_root).expanduser()
     raw = Path(mesh).expanduser()
     return raw if raw.is_absolute() else root / raw
+
+
+def _mesh_cli_argument(project_root: Path, mesh_path: Path) -> Path:
+    """Return a CLI mesh argument compatible with ``--project_root``."""
+
+    try:
+        root_abs = project_root.resolve(strict=False)
+        mesh_abs = mesh_path.resolve(strict=False)
+        return mesh_abs.relative_to(root_abs)
+    except ValueError:
+        return mesh_abs
+    except OSError:
+        return mesh_path
 
 
 def validate_mesh_path(project_root: Union[Path, str], mesh: Union[Path, str]) -> Path:
@@ -404,6 +440,218 @@ def inspect_keypoint_object_statuses(
             )
         )
     return tuple(statuses)
+
+
+def mesh_keypoint_generation_candidates(
+    project_root: Union[Path, str],
+) -> tuple[MeshKeypointObjectStatus, ...]:
+    """Return staged objects that can generate missing keypoints now."""
+
+    return tuple(
+        status
+        for status in inspect_keypoint_object_statuses(project_root)
+        if status.mesh_exists and not status.keypoints_exists
+    )
+
+
+def generate_missing_mesh_keypoints(
+    project_root: Union[Path, str],
+    *,
+    units_to_m: float = 1.0,
+) -> tuple[MeshKeypointGenerationResult, ...]:
+    """Generate keypoints for staged meshes whose canonical JSON is absent.
+
+    Existing ``keypoints.json`` files are never overwritten here. Invalid
+    existing keypoint files should be repaired deliberately or regenerated via
+    ``posetag-gen-keypoints --force`` so unit/schema changes remain explicit.
+    """
+
+    root = Path(project_root).expanduser()
+    if not _is_finite_number(units_to_m) or float(units_to_m) <= 0.0:
+        raise MeshKeypointWorkflowError("units_to_m must be finite and positive.")
+
+    statuses = inspect_keypoint_object_statuses(root)
+    candidates = tuple(
+        status
+        for status in statuses
+        if status.mesh_exists and not status.keypoints_exists
+    )
+    if not candidates:
+        invalid_existing = tuple(
+            status.object_name
+            for status in statuses
+            if status.keypoints_exists and not status.keypoints_valid
+        )
+        if invalid_existing:
+            names = ", ".join(invalid_existing)
+            raise MeshKeypointWorkflowError(
+                "Existing keypoints.json file(s) need attention and will not "
+                f"be overwritten automatically: {names}. Repair them or rerun "
+                "posetag-gen-keypoints with --force after confirming units."
+            )
+        missing_meshes = tuple(
+            status.object_name
+            for status in statuses
+            if not status.mesh_exists and not status.keypoints_valid
+        )
+        if missing_meshes:
+            joined = ", ".join(missing_meshes)
+            raise MeshKeypointWorkflowError(
+                "No keypoints can be generated until OBJ meshes are staged "
+                f"for: {joined}."
+            )
+        return ()
+
+    results: list[MeshKeypointGenerationResult] = []
+    for status in candidates:
+        results.append(_generate_keypoints_for_status(root, status, units_to_m))
+    return tuple(results)
+
+
+def generate_mesh_keypoints_for_object(
+    project_root: Union[Path, str],
+    object_name: str,
+    *,
+    units_to_m: float = 1.0,
+) -> Optional[MeshKeypointGenerationResult]:
+    """Generate keypoints for one staged object when its JSON is absent."""
+
+    root = Path(project_root).expanduser()
+    if not _is_finite_number(units_to_m) or float(units_to_m) <= 0.0:
+        raise MeshKeypointWorkflowError("units_to_m must be finite and positive.")
+
+    name = validate_object_name(object_name)
+    status = next(
+        (
+            item
+            for item in inspect_keypoint_object_statuses(root)
+            if item.object_name == name
+        ),
+        None,
+    )
+    if status is None:
+        raise MeshKeypointWorkflowError(f"Object is not inferred by Stage 6: {name}")
+    if status.keypoints_exists:
+        if status.keypoints_valid:
+            return None
+        raise MeshKeypointWorkflowError(
+            f"Existing keypoints.json needs attention and will not be overwritten "
+            f"automatically: {status.keypoints_path}. Repair it or rerun "
+            "posetag-gen-keypoints with --force after confirming units."
+        )
+    if not status.mesh_exists:
+        raise MeshKeypointWorkflowError(
+            f"No staged OBJ mesh is available for {name}: {status.mesh_path}"
+        )
+    return _generate_keypoints_for_status(root, status, units_to_m)
+
+
+def remove_mesh_keypoint_object_artifacts(
+    project_root: Union[Path, str],
+    object_name: str,
+) -> MeshKeypointRemovalResult:
+    """Remove Stage 6 mesh/keypoint artifacts for one inferred object.
+
+    This resets object geometry only. It does not remove board definitions,
+    face shots, tag registry entries, or any upstream source that inferred the
+    object identity.
+    """
+
+    root = Path(project_root).expanduser()
+    name = validate_object_name(object_name)
+    status = next(
+        (
+            item
+            for item in inspect_keypoint_object_statuses(root)
+            if item.object_name == name
+        ),
+        None,
+    )
+    if status is None:
+        raise MeshKeypointWorkflowError(f"Object is not inferred by Stage 6: {name}")
+
+    object_dir = root / "objects" / name
+    config_path = object_dir / "object_config.yaml"
+    candidates = (
+        status.keypoints_path,
+        config_path,
+        status.mesh_path,
+    )
+    removed: list[Path] = []
+    skipped: list[Path] = []
+    project_root_abs = root.resolve(strict=False)
+
+    for path in dict.fromkeys(candidates):
+        if not path.exists():
+            continue
+        if path == status.mesh_path and not _is_within(path, project_root_abs):
+            skipped.append(path)
+            continue
+        if not path.is_file():
+            skipped.append(path)
+            continue
+        try:
+            path.unlink()
+        except OSError as exc:
+            raise MeshKeypointWorkflowError(
+                f"Could not remove Stage 6 artifact {path}: {exc}"
+            ) from exc
+        removed.append(path)
+
+    for directory in (object_dir, root / "objects", root / "meshes"):
+        try:
+            directory.rmdir()
+        except OSError:
+            pass
+
+    return MeshKeypointRemovalResult(
+        object_name=name,
+        removed_paths=tuple(removed),
+        skipped_paths=tuple(skipped),
+    )
+
+
+def _generate_keypoints_for_status(
+    root: Path,
+    status: MeshKeypointObjectStatus,
+    units_to_m: float,
+) -> MeshKeypointGenerationResult:
+    from gen_keypoints import generate_keypoints_for_mesh
+
+    mesh_path = _mesh_generation_path(root, status.mesh_path)
+    generated = generate_keypoints_for_mesh(
+        root,
+        mesh_path,
+        object_name=status.object_name,
+        units_to_m=float(units_to_m),
+    )
+    object_config = generated.get("object_config_path")
+    return MeshKeypointGenerationResult(
+        object_name=str(generated["object_name"]),
+        mesh_path=Path(generated["mesh_path"]),
+        keypoints_path=Path(generated["keypoints_path"]),
+        object_config_path=(Path(object_config) if object_config else None),
+    )
+
+
+def _mesh_generation_path(project_root: Path, mesh_path: Path) -> Path:
+    """Return an existing mesh path without prefixing project root twice."""
+
+    path = Path(mesh_path).expanduser()
+    if path.is_absolute():
+        return path
+    if path.is_file():
+        return path.resolve()
+    candidate = project_root / path
+    return candidate.resolve() if candidate.is_file() else path
+
+
+def _is_within(path: Path, parent: Path) -> bool:
+    try:
+        path.resolve(strict=False).relative_to(parent)
+    except ValueError:
+        return False
+    return True
 
 
 def _configured_mesh_path(root: Path, object_name: str) -> Path:

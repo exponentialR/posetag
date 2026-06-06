@@ -172,9 +172,29 @@ from posetag.workflows.object_tags import (
 from posetag.workflows.mesh_keypoints import (
     MeshKeypointObjectStatus,
     MeshVertexPreview,
+    generate_mesh_keypoints_for_object,
+    generate_missing_mesh_keypoints,
     inspect_keypoint_object_statuses,
     load_obj_vertex_preview,
+    remove_mesh_keypoint_object_artifacts,
     supported_mesh_extensions,
+)
+from posetag.workflows.annotation import (
+    ANNOTATION_MODE_BATCH,
+    ANNOTATION_MODE_BROWSE,
+    ANNOTATION_MODE_DRY_RUN,
+    ANNOTATION_PROCESS_NOT_STARTED,
+    AnnotationProcessState,
+    AnnotationReadiness,
+    annotation_command_preview,
+    annotation_process_failed,
+    annotation_process_not_started,
+    annotation_process_running,
+    build_annotation_launch,
+    face_labels_from_annotation_paths,
+    inspect_annotation_readiness,
+    remove_annotation_output,
+    summarize_annotation_process_result,
 )
 
 CAPTURE_FACE_QUEUE_LABEL = "All missing registered faces"
@@ -266,6 +286,66 @@ def build_main_window(qt: Any, project_root: Path) -> Any:
         layout.addWidget(label)
         layout.addWidget(field)
         return wrapper
+
+    def _make_annotation_face_widget(
+        label_text: str,
+        *,
+        annotated: bool,
+        path: Path,
+    ) -> Any:
+        object_name, separator, face_name = label_text.partition(" / ")
+        if not separator:
+            object_name = label_text
+            face_name = ""
+
+        row = QtWidgets.QFrame()
+        row.setObjectName(
+            "AnnotationFaceItemDone" if annotated else "AnnotationFaceItemMissing"
+        )
+        row.setAttribute(
+            QtCore.Qt.WidgetAttribute.WA_TransparentForMouseEvents,
+            True,
+        )
+        row.setMinimumHeight(46)
+        layout = QtWidgets.QHBoxLayout(row)
+        layout.setContentsMargins(8, 6, 8, 6)
+        layout.setSpacing(8)
+
+        status = QtWidgets.QLabel("Done" if annotated else "Missing")
+        status.setObjectName(
+            "AnnotationStatusPillDone"
+            if annotated
+            else "AnnotationStatusPillMissing"
+        )
+        status.setAlignment(
+            QtCore.Qt.AlignmentFlag.AlignCenter
+            | QtCore.Qt.AlignmentFlag.AlignVCenter
+        )
+        status.setMinimumWidth(58)
+
+        text_column = QtWidgets.QVBoxLayout()
+        text_column.setContentsMargins(0, 0, 0, 0)
+        text_column.setSpacing(2)
+        object_label = QtWidgets.QLabel(object_name)
+        object_label.setObjectName("AnnotationFaceObject")
+        face_label = QtWidgets.QLabel(face_name or "face")
+        face_label.setObjectName("AnnotationFaceSide")
+        text_column.addWidget(object_label)
+        text_column.addWidget(face_label)
+
+        output_label = QtWidgets.QLabel("T_board_object")
+        output_label.setObjectName("AnnotationFacePath")
+        output_label.setAlignment(
+            QtCore.Qt.AlignmentFlag.AlignRight
+            | QtCore.Qt.AlignmentFlag.AlignVCenter
+        )
+        output_label.setMinimumWidth(96)
+        output_label.setToolTip(_display_path(path))
+
+        layout.addWidget(status)
+        layout.addLayout(text_column, 1)
+        layout.addWidget(output_label, 1)
+        return row
 
     def _make_collapsible_group(
         title: str,
@@ -2025,6 +2105,10 @@ def build_main_window(qt: Any, project_root: Path) -> Any:
             self._capture_previous_manifest_mtime_ns: Optional[int] = None
             self._capture_manifest_existed_at_launch = False
             self._capture_manifest_seen = False
+            self._annotation_process: Any = None
+            self._annotation_process_state = annotation_process_not_started()
+            self._annotation_running_expected_face_manifest: Optional[Path] = None
+            self._annotation_running_mode = ANNOTATION_MODE_BROWSE
             self._mesh_keypoint_viewer_windows: list[Any] = []
 
             self._calibration_output_timer = QtCore.QTimer(self)
@@ -4136,9 +4220,9 @@ def build_main_window(qt: Any, project_root: Path) -> Any:
             mesh_keypoints_title.setObjectName("CardTitle")
             mesh_keypoints_note = QtWidgets.QLabel(
                 "Match each inferred PoseTag object to one OBJ mesh, then "
-                "generate the annotation-ready keypoints JSON. Mesh import "
-                "stages the input; Stage 6 completes only after "
-                "objects/<object>/keypoints.json exists and validates."
+                "generate the annotation-ready keypoints JSON. The generator "
+                "uses the selected units-to-metre scale and Stage 6 completes "
+                "only after objects/<object>/keypoints.json exists and validates."
             )
             mesh_keypoints_note.setObjectName("MutedText")
             mesh_keypoints_note.setWordWrap(True)
@@ -4174,6 +4258,32 @@ def build_main_window(qt: Any, project_root: Path) -> Any:
             self._mesh_keypoint_detach_view_button.clicked.connect(
                 self._open_detached_mesh_keypoint_viewer
             )
+            self._mesh_keypoint_import_button = QtWidgets.QPushButton("Import OBJ")
+            self._mesh_keypoint_import_button.setObjectName("PrimaryActionButton")
+            self._mesh_keypoint_import_button.clicked.connect(
+                self._import_mesh_for_selected_object
+            )
+            self._mesh_keypoint_remove_button = QtWidgets.QPushButton(
+                "Remove Object"
+            )
+            self._mesh_keypoint_remove_button.setObjectName("SecondaryActionButton")
+            self._mesh_keypoint_remove_button.setToolTip(
+                "Remove the selected object's Stage 6 mesh and keypoint files."
+            )
+            self._mesh_keypoint_remove_button.clicked.connect(
+                self._remove_selected_mesh_keypoint_object
+            )
+            self._mesh_keypoint_generate_button = QtWidgets.QPushButton(
+                "Generate Mesh Keypoints"
+            )
+            self._mesh_keypoint_generate_button.setObjectName("PrimaryActionButton")
+            self._mesh_keypoint_generate_button.setToolTip(
+                "Generate keypoints.json for staged OBJ meshes that do not "
+                "already have keypoints."
+            )
+            self._mesh_keypoint_generate_button.clicked.connect(
+                self._generate_mesh_keypoints
+            )
 
             self._mesh_keypoint_object_command = QtWidgets.QLineEdit()
             self._mesh_keypoint_object_command.setObjectName("CommandPreview")
@@ -4202,12 +4312,24 @@ def build_main_window(qt: Any, project_root: Path) -> Any:
             mesh_object_command_widget = QtWidgets.QWidget()
             mesh_object_command_widget.setLayout(mesh_object_command_row)
 
+            self._mesh_keypoint_units_to_m = QtWidgets.QDoubleSpinBox()
+            self._mesh_keypoint_units_to_m.setDecimals(9)
+            self._mesh_keypoint_units_to_m.setRange(0.000000001, 1000000.0)
+            self._mesh_keypoint_units_to_m.setSingleStep(0.001)
+            self._mesh_keypoint_units_to_m.setValue(1.0)
+            self._mesh_keypoint_units_to_m.setToolTip(
+                "Scale raw OBJ coordinates into metres before writing keypoints."
+            )
+
             mesh_preview_label = QtWidgets.QLabel("Object preview")
             mesh_preview_label.setObjectName("FieldLabel")
             mesh_preview_header = QtWidgets.QHBoxLayout()
             mesh_preview_header.setContentsMargins(0, 0, 0, 0)
             mesh_preview_header.addWidget(mesh_preview_label)
             mesh_preview_header.addStretch(1)
+            mesh_preview_header.addWidget(self._mesh_keypoint_import_button)
+            mesh_preview_header.addWidget(self._mesh_keypoint_generate_button)
+            mesh_preview_header.addWidget(self._mesh_keypoint_remove_button)
             mesh_preview_header.addWidget(self._mesh_keypoint_detach_view_button)
             mesh_preview_column = QtWidgets.QWidget()
             mesh_preview_layout = QtWidgets.QVBoxLayout(mesh_preview_column)
@@ -4238,11 +4360,6 @@ def build_main_window(qt: Any, project_root: Path) -> Any:
             mesh_keypoints_body.addWidget(mesh_keypoint_side_panel, 0)
             mesh_keypoints_body.addWidget(mesh_preview_column, 1)
 
-            self._mesh_keypoint_import_button = QtWidgets.QPushButton("Import OBJ")
-            self._mesh_keypoint_import_button.setObjectName("PrimaryActionButton")
-            self._mesh_keypoint_import_button.clicked.connect(
-                self._import_mesh_for_selected_object
-            )
             self._mesh_keypoint_open_meshes_button = QtWidgets.QPushButton(
                 "Open Meshes Folder"
             )
@@ -4275,7 +4392,6 @@ def build_main_window(qt: Any, project_root: Path) -> Any:
             mesh_keypoints_refresh_button.setObjectName("SecondaryActionButton")
             mesh_keypoints_refresh_button.clicked.connect(self._refresh)
             mesh_keypoints_action_row = QtWidgets.QHBoxLayout()
-            mesh_keypoints_action_row.addWidget(self._mesh_keypoint_import_button)
             mesh_keypoints_action_row.addWidget(
                 self._mesh_keypoint_open_meshes_button
             )
@@ -4290,9 +4406,211 @@ def build_main_window(qt: Any, project_root: Path) -> Any:
             mesh_keypoints_layout.addWidget(mesh_keypoints_note)
             mesh_keypoints_layout.addLayout(mesh_keypoints_body, 1)
             mesh_keypoints_layout.addWidget(
+                _make_field("units to metre", self._mesh_keypoint_units_to_m)
+            )
+            mesh_keypoints_layout.addWidget(
                 _make_field("Selected command", mesh_object_command_widget)
             )
             mesh_keypoints_layout.addLayout(mesh_keypoints_action_row)
+
+            self._annotation_card = QtWidgets.QFrame()
+            self._annotation_card.setObjectName("ActionCard")
+            annotation_layout = QtWidgets.QVBoxLayout(self._annotation_card)
+            annotation_layout.setContentsMargins(14, 12, 14, 12)
+            annotation_layout.setSpacing(9)
+
+            self._annotation_open_button = QtWidgets.QPushButton("Open Annotator")
+            self._annotation_open_button.setObjectName("PrimaryActionButton")
+            self._annotation_open_button.clicked.connect(
+                lambda: self._run_annotation(ANNOTATION_MODE_BROWSE)
+            )
+            self._annotation_batch_button = QtWidgets.QPushButton("Run Batch")
+            self._annotation_batch_button.setObjectName("SecondaryActionButton")
+            self._annotation_batch_button.clicked.connect(
+                lambda: self._run_annotation(ANNOTATION_MODE_BATCH)
+            )
+            self._annotation_dry_run_button = QtWidgets.QPushButton("Dry Run")
+            self._annotation_dry_run_button.setObjectName("SecondaryActionButton")
+            self._annotation_dry_run_button.clicked.connect(
+                lambda: self._run_annotation(ANNOTATION_MODE_DRY_RUN)
+            )
+            self._annotation_remove_button = QtWidgets.QPushButton(
+                "Remove Transform"
+            )
+            self._annotation_remove_button.setObjectName("SecondaryActionButton")
+            self._annotation_remove_button.setToolTip(
+                "Remove the selected *_T_board_object.yaml annotation output "
+                "and refresh face_manifest.csv."
+            )
+            self._annotation_remove_button.clicked.connect(
+                self._remove_selected_annotation_output
+            )
+            annotation_refresh_button = QtWidgets.QPushButton("Refresh Status")
+            annotation_refresh_button.setObjectName("SecondaryActionButton")
+            annotation_refresh_button.clicked.connect(self._refresh)
+
+            self._annotation_pts_type = QtWidgets.QComboBox()
+            self._annotation_pts_type.addItem("Quad rectangle", "quad")
+            self._annotation_pts_type.addItem("Any 4 corners", "any")
+            self._annotation_pts_type.setToolTip(
+                "Quad rectangle draws a box then lets you refine four corners; "
+                "Any 4 corners accepts four clicked points in any order."
+            )
+            self._annotation_pts_type.currentIndexChanged.connect(
+                lambda _index: self._update_annotation_flow()
+            )
+            self._annotation_check_tag_scale = QtWidgets.QCheckBox(
+                "Check tag scale"
+            )
+            self._annotation_check_tag_scale.setToolTip(
+                "Report whether detected inter-tag distances agree with the "
+                "board definition."
+            )
+            self._annotation_auto_correct_scale = QtWidgets.QCheckBox(
+                "Auto-correct scale"
+            )
+            self._annotation_auto_correct_scale.setToolTip(
+                "Apply the annotator's existing board-translation scale "
+                "correction when the measured tag scale is outside tolerance."
+            )
+            self._annotation_force = QtWidgets.QCheckBox("Force overwrite")
+            self._annotation_force.setToolTip(
+                "Allow the annotator to replace existing board-to-object "
+                "transform YAMLs."
+            )
+            for checkbox in (
+                self._annotation_check_tag_scale,
+                self._annotation_auto_correct_scale,
+                self._annotation_force,
+            ):
+                checkbox.toggled.connect(
+                    lambda _checked: self._update_annotation_flow()
+                )
+
+            annotation_title = QtWidgets.QLabel("Face annotation queue")
+            annotation_title.setObjectName("CardTitle")
+            annotation_title_row = QtWidgets.QHBoxLayout()
+            annotation_title_row.setContentsMargins(0, 0, 0, 0)
+            annotation_title_row.setSpacing(8)
+            annotation_title_row.addWidget(annotation_title)
+            annotation_title_row.addStretch(1)
+            annotation_title_row.addWidget(self._annotation_open_button)
+            annotation_title_row.addWidget(self._annotation_batch_button)
+            annotation_title_row.addWidget(self._annotation_dry_run_button)
+            annotation_title_row.addWidget(self._annotation_remove_button)
+            annotation_title_row.addWidget(annotation_refresh_button)
+
+            annotation_note = QtWidgets.QLabel(
+                "Launch the existing annotator, draw a face rectangle, refine "
+                "four corners, and accept the reprojection review."
+            )
+            annotation_note.setObjectName("MutedText")
+            annotation_note.setWordWrap(True)
+
+            annotation_options = QtWidgets.QHBoxLayout()
+            annotation_options.setContentsMargins(0, 0, 0, 0)
+            annotation_options.setSpacing(14)
+            annotation_options.addWidget(
+                _make_field("Corner mode", self._annotation_pts_type)
+            )
+            annotation_options.addWidget(self._annotation_check_tag_scale)
+            annotation_options.addWidget(self._annotation_auto_correct_scale)
+            annotation_options.addWidget(self._annotation_force)
+            annotation_options.addStretch(1)
+
+            self._annotation_queue = QtWidgets.QListWidget()
+            self._annotation_queue.setObjectName("AnnotationFaceQueue")
+            self._annotation_queue.setMinimumHeight(360)
+            self._annotation_queue.setMaximumHeight(430)
+            self._annotation_queue.setSpacing(4)
+            self._annotation_queue.setVerticalScrollMode(
+                QtWidgets.QAbstractItemView.ScrollMode.ScrollPerPixel
+            )
+            self._annotation_queue.setSelectionMode(
+                QtWidgets.QAbstractItemView.SelectionMode.ExtendedSelection
+            )
+            self._annotation_queue.itemSelectionChanged.connect(
+                self._annotation_queue_selection_changed
+            )
+
+            self._annotation_readiness = QtWidgets.QLabel()
+            self._annotation_readiness.setObjectName("AnnotationStatusText")
+            self._annotation_readiness.setWordWrap(True)
+            self._annotation_readiness.setTextInteractionFlags(
+                QtCore.Qt.TextInteractionFlag.TextSelectableByMouse
+            )
+            self._annotation_outputs = QtWidgets.QLabel()
+            self._annotation_outputs.setObjectName("AnnotationStatusText")
+            self._annotation_outputs.setWordWrap(True)
+            self._annotation_outputs.setTextInteractionFlags(
+                QtCore.Qt.TextInteractionFlag.TextSelectableByMouse
+            )
+            self._annotation_process_state_label = QtWidgets.QLabel()
+            self._annotation_process_state_label.setObjectName(
+                "AnnotationStatusText"
+            )
+            self._annotation_process_state_label.setWordWrap(True)
+            self._annotation_process_state_label.setTextInteractionFlags(
+                QtCore.Qt.TextInteractionFlag.TextSelectableByMouse
+            )
+            self._annotation_log = QtWidgets.QPlainTextEdit()
+            self._annotation_log.setObjectName("CalibrationLog")
+            self._annotation_log.setReadOnly(True)
+            self._annotation_log.setMaximumHeight(64)
+            self._annotation_log.setPlaceholderText(
+                "Annotation stdout/stderr will appear here after launch."
+            )
+            self._annotation_log.document().setMaximumBlockCount(250)
+            self._annotation_log_field = _make_field(
+                "Process log",
+                self._annotation_log,
+            )
+            self._annotation_log_field.setVisible(False)
+
+            annotation_status_panel = QtWidgets.QWidget()
+            annotation_status_layout = QtWidgets.QVBoxLayout(annotation_status_panel)
+            annotation_status_layout.setContentsMargins(0, 0, 0, 0)
+            annotation_status_layout.setSpacing(8)
+            annotation_status_layout.addWidget(
+                _make_field("Progress", self._annotation_outputs)
+            )
+            annotation_status_layout.addWidget(
+                _make_field("Readiness", self._annotation_readiness)
+            )
+            annotation_status_layout.addWidget(
+                _make_field("Process state", self._annotation_process_state_label)
+            )
+
+            annotation_body = QtWidgets.QGridLayout()
+            annotation_body.setContentsMargins(0, 0, 0, 0)
+            annotation_body.setHorizontalSpacing(12)
+            annotation_body.setVerticalSpacing(8)
+            annotation_body.addWidget(
+                _make_field("Annotation queue", self._annotation_queue),
+                0,
+                0,
+                QtCore.Qt.AlignmentFlag.AlignTop,
+            )
+            annotation_body.addWidget(
+                annotation_status_panel,
+                0,
+                1,
+                QtCore.Qt.AlignmentFlag.AlignTop,
+            )
+            annotation_body.addWidget(
+                self._annotation_log_field,
+                1,
+                0,
+                1,
+                2,
+            )
+            annotation_body.setColumnStretch(0, 5)
+            annotation_body.setColumnStretch(1, 4)
+
+            annotation_layout.addLayout(annotation_title_row)
+            annotation_layout.addWidget(annotation_note)
+            annotation_layout.addLayout(annotation_options)
+            annotation_layout.addLayout(annotation_body)
 
             detail_content = QtWidgets.QWidget()
             detail_content_layout = QtWidgets.QVBoxLayout(detail_content)
@@ -4300,6 +4618,7 @@ def build_main_window(qt: Any, project_root: Path) -> Any:
             detail_content_layout.setSpacing(10)
             detail_content_layout.addLayout(title_row)
             detail_content_layout.addWidget(self._message_label)
+            detail_content_layout.addWidget(self._annotation_card)
             detail_content_layout.addLayout(cards_grid)
             detail_content_layout.addWidget(self._charuco_card)
             detail_content_layout.addWidget(self._calibration_card)
@@ -4465,7 +4784,8 @@ def build_main_window(qt: Any, project_root: Path) -> Any:
             self.statusBar().showMessage(
                 "Dashboard can generate ChArUco board files and prepare "
                 "camera-calibration, object-tag, board-building, and "
-                "face-shot capture workflows, plus preview mesh-keypoint commands."
+                "face-shot capture workflows, plus guide mesh-keypoint and "
+                "annotation launches."
             )
 
             self._render_board_batch_rows()
@@ -5364,6 +5684,7 @@ def build_main_window(qt: Any, project_root: Path) -> Any:
             self._board_building_card.setVisible(model.stage_id == 4)
             self._capture_face_card.setVisible(model.stage_id == 5)
             self._mesh_keypoints_card.setVisible(model.stage_id == 6)
+            self._annotation_card.setVisible(model.stage_id == 7)
             if model.stage_id == 2:
                 self._sync_calibration_from_project_metadata()
                 self._update_calibration_flow()
@@ -5376,6 +5697,8 @@ def build_main_window(qt: Any, project_root: Path) -> Any:
                 self._update_capture_face_flow()
             if model.stage_id == 6:
                 self._update_mesh_keypoint_flow()
+            if model.stage_id == 7:
+                self._update_annotation_flow()
             self._render_side_panel_calibration_result()
             self._render_stage_rail_selection()
 
@@ -5479,6 +5802,7 @@ def build_main_window(qt: Any, project_root: Path) -> Any:
             self._board_building_card.setVisible(False)
             self._capture_face_card.setVisible(False)
             self._mesh_keypoints_card.setVisible(False)
+            self._annotation_card.setVisible(False)
             self._render_health()
 
         def _render_stage_rail_selection(self) -> None:
@@ -5772,6 +6096,12 @@ def build_main_window(qt: Any, project_root: Path) -> Any:
             previous = self._selected_mesh_keypoint_status()
             previous_name = previous.object_name if previous is not None else ""
             statuses = inspect_keypoint_object_statuses(self._current_project_root())
+            can_generate = any(
+                status.mesh_exists and not status.keypoints_exists
+                for status in statuses
+            )
+            if hasattr(self, "_mesh_keypoint_generate_button"):
+                self._mesh_keypoint_generate_button.setEnabled(can_generate)
 
             self._mesh_keypoint_objects.blockSignals(True)
             self._mesh_keypoint_objects.clear()
@@ -5828,6 +6158,153 @@ def build_main_window(qt: Any, project_root: Path) -> Any:
                 )
             )
 
+        def _update_annotation_flow(self) -> None:
+            if not hasattr(self, "_annotation_queue"):
+                return
+
+            readiness = inspect_annotation_readiness(self._current_project_root())
+            self._update_annotation_queue(readiness)
+            self._annotation_readiness.setText(
+                _format_annotation_readiness(readiness)
+            )
+            self._annotation_outputs.setText(
+                _format_annotation_outputs(readiness)
+            )
+            if (
+                self._annotation_process_state.state
+                == ANNOTATION_PROCESS_NOT_STARTED
+            ):
+                self._set_annotation_process_state(
+                    annotation_process_not_started(
+                        readiness.output_status.face_manifest_path
+                    )
+                )
+            self._update_annotation_action_buttons(
+                readiness.ready,
+                self._annotation_process_is_running(),
+            )
+
+            model = self._model_by_stage_id(self._selected_stage_id)
+            if model is None or model.stage_id != 7:
+                return
+
+            command_preview = annotation_command_preview(
+                self._current_project_root(),
+                ANNOTATION_MODE_BROWSE,
+                **self._annotation_launch_options(),
+            )
+            self._command_preview.setText(command_preview)
+            self._command_preview.setCursorPosition(0)
+            self._copy_button.setEnabled(bool(command_preview))
+            self._command_note.setText(
+                _annotation_command_card_note(readiness, model)
+            )
+            self._copy_feedback.setText(
+                _annotation_command_ready_message(
+                    readiness,
+                    stage_complete=model.status == "complete",
+                )
+            )
+
+        def _update_annotation_queue(
+            self,
+            readiness: AnnotationReadiness,
+        ) -> None:
+            output = readiness.output_status
+            expected = output.expected_yaml_paths
+            existing = set(output.existing_yaml_paths)
+            labels = face_labels_from_annotation_paths(
+                self._current_project_root(),
+                expected,
+            )
+            selected_paths = set(self._selected_annotation_yaml_paths())
+            self._annotation_queue.blockSignals(True)
+            try:
+                self._annotation_queue.clear()
+                for path, label in zip(expected, labels):
+                    annotated = path in existing
+                    item = QtWidgets.QListWidgetItem(
+                        _annotation_queue_item_label(label, annotated=annotated)
+                    )
+                    item.setData(QtCore.Qt.ItemDataRole.UserRole, path)
+                    item.setToolTip(_display_path(path))
+                    self._annotation_queue.addItem(item)
+                    widget = _make_annotation_face_widget(
+                        label,
+                        annotated=annotated,
+                        path=path,
+                    )
+                    item.setSizeHint(QtCore.QSize(0, 46))
+                    self._annotation_queue.setItemWidget(item, widget)
+                    if path in selected_paths:
+                        item.setSelected(True)
+                if not expected:
+                    item = QtWidgets.QListWidgetItem(
+                        "No annotation outputs are expected yet."
+                    )
+                    item.setFlags(QtCore.Qt.ItemFlag.NoItemFlags)
+                    self._annotation_queue.addItem(item)
+            finally:
+                self._annotation_queue.blockSignals(False)
+
+        def _annotation_launch_options(self) -> dict[str, Any]:
+            pts_type = "quad"
+            if hasattr(self, "_annotation_pts_type"):
+                pts_type = str(self._annotation_pts_type.currentData() or "quad")
+            return {
+                "pts_type": pts_type,
+                "check_tag_scale": bool(
+                    getattr(self, "_annotation_check_tag_scale", None)
+                    and self._annotation_check_tag_scale.isChecked()
+                ),
+                "auto_correct_scale": bool(
+                    getattr(self, "_annotation_auto_correct_scale", None)
+                    and self._annotation_auto_correct_scale.isChecked()
+                ),
+                "force": bool(
+                    getattr(self, "_annotation_force", None)
+                    and self._annotation_force.isChecked()
+                ),
+            }
+
+        def _selected_annotation_yaml_paths(self) -> tuple[Path, ...]:
+            if not hasattr(self, "_annotation_queue"):
+                return ()
+            paths: list[Path] = []
+            for item in self._annotation_queue.selectedItems():
+                payload = item.data(QtCore.Qt.ItemDataRole.UserRole)
+                if isinstance(payload, Path):
+                    paths.append(payload)
+                elif isinstance(payload, str):
+                    paths.append(Path(payload))
+            return tuple(paths)
+
+        def _annotation_queue_selection_changed(self) -> None:
+            self._update_annotation_action_buttons(
+                inspect_annotation_readiness(self._current_project_root()).ready,
+                self._annotation_process_is_running(),
+            )
+
+        def _update_annotation_action_buttons(
+            self,
+            ready: bool,
+            process_running: bool,
+        ) -> None:
+            if not hasattr(self, "_annotation_open_button"):
+                return
+            enabled = bool(ready) and not process_running
+            self._annotation_open_button.setEnabled(enabled)
+            self._annotation_batch_button.setEnabled(enabled)
+            self._annotation_dry_run_button.setEnabled(enabled)
+            self._annotation_open_button.setText(
+                _annotation_run_button_label(self._annotation_process_state)
+            )
+            if hasattr(self, "_annotation_remove_button"):
+                selected = self._selected_annotation_yaml_paths()
+                self._annotation_remove_button.setEnabled(
+                    any(path.exists() for path in selected) and not process_running
+                )
+
         def _selected_mesh_keypoint_status(
             self,
         ) -> Optional[MeshKeypointObjectStatus]:
@@ -5865,6 +6342,7 @@ def build_main_window(qt: Any, project_root: Path) -> Any:
                 self._mesh_keypoint_preview.show_status(None)
                 self._mesh_keypoint_object_command.clear()
                 self._mesh_keypoint_import_button.setEnabled(False)
+                self._mesh_keypoint_remove_button.setEnabled(False)
                 self._mesh_keypoint_reset_view_button.setEnabled(False)
                 self._mesh_keypoint_detach_view_button.setEnabled(False)
                 self._mesh_keypoint_copy_object_button.setEnabled(False)
@@ -5878,6 +6356,7 @@ def build_main_window(qt: Any, project_root: Path) -> Any:
             self._mesh_keypoint_object_command.setText(status.command_preview)
             self._mesh_keypoint_object_command.setCursorPosition(0)
             self._mesh_keypoint_import_button.setEnabled(True)
+            self._mesh_keypoint_remove_button.setEnabled(True)
             self._mesh_keypoint_reset_view_button.setEnabled(status.mesh_exists)
             self._mesh_keypoint_detach_view_button.setEnabled(True)
             self._mesh_keypoint_copy_object_button.setEnabled(True)
@@ -6004,6 +6483,64 @@ def build_main_window(qt: Any, project_root: Path) -> Any:
                 3000,
             )
 
+        def _generate_mesh_keypoints(self) -> None:
+            statuses = self._mesh_keypoint_statuses_from_list()
+            candidates = tuple(
+                status
+                for status in statuses
+                if status.mesh_exists and not status.keypoints_exists
+            )
+            if not candidates:
+                message = (
+                    "No staged OBJ meshes have missing keypoints to generate."
+                )
+                self._copy_feedback.setText(message)
+                self.statusBar().showMessage(message, 4000)
+                return
+
+            units_to_m = float(self._mesh_keypoint_units_to_m.value())
+            names = ", ".join(status.object_name for status in candidates)
+            answer = QtWidgets.QMessageBox.question(
+                self,
+                "Generate Mesh Keypoints",
+                (
+                    f"Generate keypoints.json for {len(candidates)} object"
+                    f"{'s' if len(candidates) != 1 else ''} using "
+                    f"units to metre = {units_to_m:g}?\n\n{names}"
+                ),
+            )
+            if answer != QtWidgets.QMessageBox.StandardButton.Yes:
+                self.statusBar().showMessage("Keypoint generation cancelled.", 3000)
+                return
+
+            try:
+                results = generate_missing_mesh_keypoints(
+                    self._current_project_root(),
+                    units_to_m=units_to_m,
+                )
+            except Exception as exc:
+                message = f"Keypoint generation failed: {exc}"
+                self._copy_feedback.setText(message)
+                QtWidgets.QMessageBox.warning(
+                    self,
+                    "Keypoint Generation Failed",
+                    message,
+                )
+                self.statusBar().showMessage(message, 7000)
+                self._update_mesh_keypoint_flow()
+                return
+
+            if not results:
+                message = "No mesh keypoints were generated."
+            else:
+                message = (
+                    f"Generated keypoints for {len(results)} object"
+                    f"{'s' if len(results) != 1 else ''}."
+                )
+            self._copy_feedback.setText(message)
+            self.statusBar().showMessage(message, 6000)
+            self._refresh()
+
         def _open_meshes_folder(self) -> None:
             meshes_dir = self._current_project_root() / "meshes"
             try:
@@ -6058,6 +6595,7 @@ def build_main_window(qt: Any, project_root: Path) -> Any:
                 return
 
             destination = status.mesh_path
+            copied = False
             try:
                 destination.parent.mkdir(parents=True, exist_ok=True)
                 if source.resolve() == destination.resolve():
@@ -6065,29 +6603,127 @@ def build_main_window(qt: Any, project_root: Path) -> Any:
                         "Selected mesh is already in the expected project slot.",
                         4000,
                     )
-                    self._refresh()
-                    return
-                if destination.exists():
-                    answer = QtWidgets.QMessageBox.question(
-                        self,
-                        "Replace Existing Mesh",
-                        (
-                            f"{destination.name} already exists for "
-                            f"{status.object_name}. Replace it?"
-                        ),
-                    )
-                    if answer != QtWidgets.QMessageBox.StandardButton.Yes:
-                        self.statusBar().showMessage("Mesh import cancelled.", 3000)
-                        return
-                shutil.copy2(source, destination)
+                else:
+                    if destination.exists():
+                        answer = QtWidgets.QMessageBox.question(
+                            self,
+                            "Replace Existing Mesh",
+                            (
+                                f"{destination.name} already exists for "
+                                f"{status.object_name}. Replace it?"
+                            ),
+                        )
+                        if answer != QtWidgets.QMessageBox.StandardButton.Yes:
+                            self.statusBar().showMessage("Mesh import cancelled.", 3000)
+                            return
+                    shutil.copy2(source, destination)
+                    copied = True
             except OSError as exc:
                 self.statusBar().showMessage(f"Mesh import failed: {exc}", 5000)
                 return
 
-            self.statusBar().showMessage(
-                f"Imported OBJ mesh for {status.object_name}.",
-                4000,
+            generated = self._generate_mesh_keypoints_for_object_after_import(
+                status.object_name
             )
+            if generated is not None:
+                message = (
+                    f"Imported OBJ and generated keypoints for {status.object_name}."
+                    if copied
+                    else f"Generated keypoints for {status.object_name}."
+                )
+            else:
+                message = (
+                    f"Imported OBJ for {status.object_name}."
+                    if copied
+                    else "Selected mesh is already in the expected project slot."
+                )
+            self.statusBar().showMessage(message, 5000)
+            self._refresh()
+
+        def _generate_mesh_keypoints_for_object_after_import(
+            self,
+            object_name: str,
+        ) -> Optional[Any]:
+            try:
+                result = generate_mesh_keypoints_for_object(
+                    self._current_project_root(),
+                    object_name,
+                    units_to_m=float(self._mesh_keypoint_units_to_m.value()),
+                )
+            except Exception as exc:
+                message = f"Mesh imported, but keypoint generation failed: {exc}"
+                self._copy_feedback.setText(message)
+                QtWidgets.QMessageBox.warning(
+                    self,
+                    "Keypoint Generation Failed",
+                    message,
+                )
+                return None
+            if result is None:
+                message = (
+                    f"Mesh imported for {object_name}. Existing keypoints were "
+                    "left unchanged."
+                )
+            else:
+                message = (
+                    f"Generated keypoints for {object_name}: "
+                    f"{_display_path(result.keypoints_path)}"
+                )
+            self._copy_feedback.setText(message)
+            return result
+
+        def _remove_selected_mesh_keypoint_object(self) -> None:
+            status = self._selected_mesh_keypoint_status()
+            if status is None:
+                self.statusBar().showMessage(
+                    "Select an inferred object before removing Stage 6 files.",
+                    4000,
+                )
+                return
+
+            answer = QtWidgets.QMessageBox.question(
+                self,
+                "Remove Object Geometry",
+                (
+                    f"Remove Stage 6 geometry files for {status.object_name}?\n\n"
+                    "This removes the project OBJ, keypoints.json, and "
+                    "object_config.yaml when present. Board definitions, shots, "
+                    "and tag registry entries are left unchanged."
+                ),
+            )
+            if answer != QtWidgets.QMessageBox.StandardButton.Yes:
+                self.statusBar().showMessage("Object removal cancelled.", 3000)
+                return
+
+            try:
+                result = remove_mesh_keypoint_object_artifacts(
+                    self._current_project_root(),
+                    status.object_name,
+                )
+            except Exception as exc:
+                message = f"Could not remove object geometry: {exc}"
+                self._copy_feedback.setText(message)
+                QtWidgets.QMessageBox.warning(
+                    self,
+                    "Remove Object Failed",
+                    message,
+                )
+                self.statusBar().showMessage(message, 7000)
+                return
+
+            if result.removed_paths:
+                message = (
+                    f"Removed Stage 6 geometry for {result.object_name}: "
+                    f"{len(result.removed_paths)} file"
+                    f"{'s' if len(result.removed_paths) != 1 else ''}."
+                )
+            else:
+                message = f"No Stage 6 geometry files found for {result.object_name}."
+            if result.skipped_paths:
+                skipped = ", ".join(_display_path(path) for path in result.skipped_paths)
+                message += f" Skipped non-project or non-file path(s): {skipped}."
+            self._copy_feedback.setText(message)
+            self.statusBar().showMessage(message, 7000)
             self._refresh()
 
         def _sync_capture_face_choices(
@@ -6831,6 +7467,261 @@ def build_main_window(qt: Any, project_root: Path) -> Any:
 
         def _capture_face_process_is_running(self) -> bool:
             process = self._capture_face_process
+            if process is None:
+                return False
+            return process.state() != QtCore.QProcess.ProcessState.NotRunning
+
+        def _remove_selected_annotation_output(self) -> None:
+            selected = tuple(
+                path for path in self._selected_annotation_yaml_paths()
+                if path.exists()
+            )
+            if not selected:
+                self.statusBar().showMessage(
+                    "Select one or more annotated faces before removing transforms.",
+                    4000,
+                )
+                return
+            count = len(selected)
+            listed = "\n".join(
+                f"- {_display_path(path)}" for path in selected[:8]
+            )
+            if count > 8:
+                listed += f"\n- ... {count - 8} more"
+
+            answer = QtWidgets.QMessageBox.question(
+                self,
+                "Remove Board-To-Object Transform",
+                (
+                    f"Remove {count} selected Stage 7 board-to-object "
+                    f"transform{'s' if count != 1 else ''}?\n\n"
+                    f"{listed}\n\n"
+                    "Board YAMLs, face shots, object meshes, and keypoints are "
+                    "left unchanged."
+                ),
+            )
+            if answer != QtWidgets.QMessageBox.StandardButton.Yes:
+                self.statusBar().showMessage("Annotation removal cancelled.", 3000)
+                return
+
+            removed_count = 0
+            failures: list[str] = []
+            for path in selected:
+                try:
+                    result = remove_annotation_output(
+                        self._current_project_root(),
+                        path,
+                    )
+                    removed_count += int(result.removed)
+                except Exception as exc:
+                    failures.append(f"{_display_path(path)}: {exc}")
+
+            if failures:
+                message = (
+                    f"Removed {removed_count} transform"
+                    f"{'s' if removed_count != 1 else ''}, but "
+                    f"{len(failures)} removal"
+                    f"{'s' if len(failures) != 1 else ''} failed: "
+                    + "; ".join(failures[:3])
+                )
+                self._copy_feedback.setText(message)
+                QtWidgets.QMessageBox.warning(
+                    self,
+                    "Remove Transform Failed",
+                    message,
+                )
+                self.statusBar().showMessage(message, 7000)
+                if removed_count:
+                    self._refresh()
+                return
+
+            if removed_count:
+                message = (
+                    f"Removed {removed_count} annotation transform"
+                    f"{'s' if removed_count != 1 else ''}."
+                )
+            else:
+                message = "No selected transform files were found."
+            self._copy_feedback.setText(message)
+            self.statusBar().showMessage(message, 5000)
+            self._refresh()
+
+        def _run_annotation(self, mode: str = ANNOTATION_MODE_BROWSE) -> None:
+            if self._annotation_process_is_running():
+                message = "Annotation is already running."
+                self.statusBar().showMessage(message, 3000)
+                return
+
+            readiness = inspect_annotation_readiness(self._current_project_root())
+            if not readiness.ready:
+                message = "Resolve annotation readiness messages before running."
+                self._copy_feedback.setText(message)
+                self.statusBar().showMessage(message, 5000)
+                self._update_annotation_flow()
+                return
+
+            try:
+                launch = build_annotation_launch(
+                    self._current_project_root(),
+                    mode=mode,
+                    **self._annotation_launch_options(),
+                )
+            except Exception as exc:
+                message = f"Could not prepare annotation launch: {exc}"
+                self._set_annotation_process_state(
+                    annotation_process_failed(
+                        message,
+                        expected_face_manifest=(
+                            readiness.output_status.face_manifest_path
+                        ),
+                    )
+                )
+                self._append_annotation_log(f"[gui] {message}")
+                self.statusBar().showMessage(message, 6000)
+                self._update_annotation_flow()
+                return
+
+            process = QtCore.QProcess(self)
+            process.setProgram(launch.program)
+            process.setArguments(list(launch.arguments))
+            process.setProcessChannelMode(
+                QtCore.QProcess.ProcessChannelMode.SeparateChannels
+            )
+            if hasattr(QtCore, "QProcessEnvironment"):
+                env = QtCore.QProcessEnvironment.systemEnvironment()
+                env.insert("PYTHONUNBUFFERED", "1")
+                env.insert("POSETAG_PROJECT", str(launch.project_root))
+                process.setProcessEnvironment(env)
+            process.readyReadStandardOutput.connect(self._read_annotation_stdout)
+            process.readyReadStandardError.connect(self._read_annotation_stderr)
+            process.finished.connect(self._annotation_process_finished)
+            process.errorOccurred.connect(self._annotation_process_error)
+
+            self._annotation_process = process
+            self._annotation_running_expected_face_manifest = (
+                launch.expected_face_manifest
+            )
+            self._annotation_running_mode = launch.mode
+            self._annotation_log.clear()
+            if hasattr(self, "_annotation_log_field"):
+                self._annotation_log_field.setVisible(True)
+            self._append_annotation_log(f"$ {launch.display_command}")
+            self._append_annotation_log(
+                "[gui] Launching with the current Python interpreter."
+            )
+            if launch.mode == ANNOTATION_MODE_BROWSE:
+                self._append_annotation_log(
+                    "[gui] Use the OpenCV browser: J/K, arrows, or W/S select, "
+                    "ENTER opens a face, q quits."
+                )
+            elif launch.mode == ANNOTATION_MODE_BATCH:
+                self._append_annotation_log(
+                    "[gui] Batch mode will step through the latest saved "
+                    "shot for each face."
+                )
+            else:
+                self._append_annotation_log(
+                    "[gui] Dry-run validates annotation inputs and exits "
+                    "without opening the click UI."
+                )
+            self._set_annotation_process_state(
+                annotation_process_running(
+                    launch.expected_face_manifest,
+                    mode=launch.mode,
+                )
+            )
+            self._update_annotation_flow()
+            process.start()
+            self.statusBar().showMessage("Annotation process started.", 4000)
+
+        def _read_annotation_stdout(self) -> None:
+            process = self._annotation_process
+            if process is None:
+                return
+            self._append_annotation_output(process.readAllStandardOutput(), "")
+
+        def _read_annotation_stderr(self) -> None:
+            process = self._annotation_process
+            if process is None:
+                return
+            self._append_annotation_output(process.readAllStandardError(), "stderr")
+
+        def _annotation_process_finished(
+            self,
+            exit_code: int,
+            exit_status: Any,
+        ) -> None:
+            self._read_annotation_stdout()
+            self._read_annotation_stderr()
+            crashed = exit_status == QtCore.QProcess.ExitStatus.CrashExit
+            state = summarize_annotation_process_result(
+                exit_code=int(exit_code),
+                crashed=crashed,
+                expected_face_manifest=(
+                    self._annotation_running_expected_face_manifest
+                ),
+            )
+            self._annotation_process = None
+            self._set_annotation_process_state(state)
+            self._append_annotation_log(f"[gui] {state.message}")
+            self._refresh()
+            self.statusBar().showMessage(state.message, 7000)
+
+        def _annotation_process_error(self, error: Any) -> None:
+            process = self._annotation_process
+            error_name = _qt_enum_name(error)
+            detail = process.errorString() if process is not None else error_name
+            self._append_annotation_log(f"[gui] Process error: {detail}")
+            failed_to_start = QtCore.QProcess.ProcessError.FailedToStart
+            if error != failed_to_start:
+                return
+
+            state = annotation_process_failed(
+                f"Annotation process failed to start: {detail}",
+                expected_face_manifest=(
+                    self._annotation_running_expected_face_manifest
+                ),
+            )
+            self._annotation_process = None
+            self._set_annotation_process_state(state)
+            self._update_annotation_flow()
+            self.statusBar().showMessage(state.message, 7000)
+
+        def _append_annotation_output(self, data: Any, prefix: str) -> None:
+            text = bytes(data).decode("utf-8", errors="replace")
+            if not text:
+                return
+            if prefix:
+                for line in text.rstrip().splitlines():
+                    self._append_annotation_log(f"[{prefix}] {line}")
+            else:
+                self._append_annotation_log(text.rstrip())
+
+        def _append_annotation_log(self, text: str) -> None:
+            if not text:
+                return
+            if hasattr(self, "_annotation_log_field"):
+                self._annotation_log_field.setVisible(True)
+            self._annotation_log.appendPlainText(text)
+            scrollbar = self._annotation_log.verticalScrollBar()
+            scrollbar.setValue(scrollbar.maximum())
+
+        def _set_annotation_process_state(
+            self,
+            state: AnnotationProcessState,
+        ) -> None:
+            self._annotation_process_state = state
+            if hasattr(self, "_annotation_process_state_label"):
+                self._annotation_process_state_label.setText(
+                    _format_annotation_process_state(state)
+                )
+            if hasattr(self, "_annotation_open_button"):
+                self._annotation_open_button.setText(
+                    _annotation_run_button_label(state)
+                )
+
+        def _annotation_process_is_running(self) -> bool:
+            process = self._annotation_process
             if process is None:
                 return False
             return process.state() != QtCore.QProcess.ProcessState.NotRunning
@@ -7687,6 +8578,58 @@ def _format_capture_face_process_state(
     return "\n".join(lines)
 
 
+def _format_annotation_readiness(readiness: AnnotationReadiness) -> str:
+    lines = [
+        (
+            "Ready to annotate captured faces."
+            if readiness.ready
+            else "Not ready yet."
+        )
+    ]
+    if readiness.errors:
+        lines.extend(["", "Errors", *_format_items(readiness.errors)])
+    if readiness.warnings:
+        lines.extend(["", "Warnings", *_format_items(readiness.warnings)])
+    return "\n".join(lines)
+
+
+def _format_annotation_outputs(readiness: AnnotationReadiness) -> str:
+    output = readiness.output_status
+    missing_count = len(output.missing_yaml_paths)
+    lines = [
+        f"Shots manifest: {'present' if output.manifest_path.exists() else 'missing'}",
+        f"Face manifest: {'present' if output.face_manifest_path.exists() else 'missing'}",
+        f"{output.existing_count}/{output.expected_count} annotation YAMLs",
+    ]
+    if output.expected_count:
+        lines.append(f"{missing_count} face{'s' if missing_count != 1 else ''} left")
+    if output.missing_yaml_paths:
+        lines.append("Missing faces are listed in the queue.")
+    return "\n".join(lines)
+
+
+def _format_annotation_process_state(
+    state: AnnotationProcessState,
+) -> str:
+    lines = [state.label, "", state.message]
+    if state.expected_face_manifest is not None:
+        lines.extend(
+            [
+                "",
+                f"Expected manifest: {_display_path(state.expected_face_manifest)}",
+            ]
+        )
+    if state.exit_code is not None:
+        lines.append(f"Exit code: {state.exit_code}")
+    return "\n".join(lines)
+
+
+def _annotation_queue_item_label(label: str, *, annotated: bool) -> str:
+    marker = "[x]" if annotated else "[ ]"
+    status = "annotated" if annotated else "missing"
+    return f"{marker} {label}\n{status}"
+
+
 def _format_id_summary(ids: tuple[int, ...]) -> str:
     if not ids:
         return "none"
@@ -7945,6 +8888,14 @@ def _capture_face_run_button_label(state: CaptureFaceProcessState) -> str:
     return "Start Batch"
 
 
+def _annotation_run_button_label(state: AnnotationProcessState) -> str:
+    if state.running:
+        return "Annotation Running..."
+    if state.success:
+        return "Open Annotator Again"
+    return "Open Annotator"
+
+
 def _qt_enum_name(value: Any) -> str:
     return str(getattr(value, "name", value))
 
@@ -8084,13 +9035,15 @@ def _mesh_keypoint_command_card_note(
     if model.status == "complete":
         return (
             "All inferred objects have annotation-ready keypoints. Import OBJ "
-            "only if you need to replace a mesh and regenerate keypoints."
+            "only if you need to replace a mesh; forced regeneration remains "
+            "a deliberate CLI action."
         )
     return (
-        "Import OBJ copies the selected mesh into meshes/<object>.obj. Copy "
-        "Object Command or Copy Missing Commands prepares the "
-        "posetag-gen-keypoints runs that write objects/<object>/keypoints.json. "
-        "Stage 6 remains missing until that JSON exists and validates."
+        "Import OBJ copies the selected mesh into meshes/<object>.obj and "
+        "generates keypoints for that object when keypoints.json is absent. "
+        "Generate Mesh Keypoints writes absent objects/<object>/keypoints.json "
+        "files for staged meshes using the selected units-to-metre scale; existing "
+        "keypoint files are not overwritten here."
     )
 
 
@@ -8130,7 +9083,8 @@ def _command_card_note(model: StageViewModel) -> str:
     if model.key == "generate_mesh_keypoints":
         return (
             "Use the object geometry inputs panel to import OBJ meshes, then "
-            "copy the selected posetag-gen-keypoints command."
+            "generate mesh keypoints or copy the selected "
+            "posetag-gen-keypoints command."
         )
     if model.status == "complete" and model.command_preview:
         return (
@@ -8306,6 +9260,40 @@ def _capture_face_command_ready_message(
     return "Ready to open guided capture or copy a face-shot capture command."
 
 
+def _annotation_command_card_note(
+    readiness: AnnotationReadiness,
+    model: StageViewModel,
+) -> str:
+    if not readiness.ready:
+        return (
+            "Resolve the annotation readiness messages above before opening "
+            "the annotator."
+        )
+    if model.status == "complete":
+        return (
+            "Board-to-object annotation YAMLs already pass the current checks. "
+            "Open the annotator only if you need to replace a face transform."
+        )
+    return (
+        "Open Annotator starts the existing posetag-annotate browser with "
+        "POSETAG_PROJECT set for this project. Dry Run validates the selected "
+        "batch inputs without opening the click UI, and Run Batch steps through "
+        "the latest saved shot for each missing face."
+    )
+
+
+def _annotation_command_ready_message(
+    readiness: AnnotationReadiness,
+    *,
+    stage_complete: bool = False,
+) -> str:
+    if not readiness.ready:
+        return "No runnable annotation command is available yet."
+    if stage_complete:
+        return "Annotation outputs exist. Copy only if you need to rerun it."
+    return "Ready to open the annotator, dry-run, run batch, or copy the command."
+
+
 def _project_root_hint(root: Path) -> str:
     if root.is_dir():
         return (
@@ -8314,7 +9302,7 @@ def _project_root_hint(root: Path) -> str:
             "3 object tag generation. Stage 4 can launch the existing "
             "board-building workflow, and Stage 5 can open guided face-shot "
             "capture. Stage 6 can stage OBJ mesh inputs and preview "
-            "mesh-keypoint generation before annotation."
+            "mesh-keypoint generation before Stage 7 launches annotation."
         )
     if root.exists():
         return "Selected path exists but is not a folder."
@@ -8543,6 +9531,14 @@ QLabel#OutputText {
     font-family: "Menlo", "Consolas", "Courier New", monospace;
     font-size: 11px;
 }
+QLabel#AnnotationStatusText {
+    color: #263545;
+    background: #f9fcfd;
+    border: 1px solid #d4e1ea;
+    border-radius: 6px;
+    padding: 6px 8px;
+    line-height: 125%;
+}
 QLabel#CharucoPreviewCanvas,
 QLabel#MeshKeypointPreview {
     color: #5c6b7b;
@@ -8586,30 +9582,79 @@ QListWidget#WorkflowRail {
     padding: 0;
 }
 QListWidget#BatchCaptureQueue,
-QListWidget#MeshKeypointObjectList {
+QListWidget#MeshKeypointObjectList,
+QListWidget#AnnotationFaceQueue {
     background: #ffffff;
     border: 1px solid #b8ccda;
     border-radius: 7px;
     padding: 5px;
 }
 QListWidget#BatchCaptureQueue::item,
-QListWidget#MeshKeypointObjectList::item {
+QListWidget#MeshKeypointObjectList::item,
+QListWidget#AnnotationFaceQueue::item {
     padding: 7px 8px;
     border: 1px solid transparent;
     border-radius: 6px;
 }
 QListWidget#BatchCaptureQueue::item:hover,
-QListWidget#MeshKeypointObjectList::item:hover {
+QListWidget#MeshKeypointObjectList::item:hover,
+QListWidget#AnnotationFaceQueue::item:hover {
     background: #eff7fb;
     border: 1px solid #bad7e7;
 }
 QListWidget#BatchCaptureQueue::item:selected,
 QListWidget#BatchCaptureQueue::item:selected:!active,
 QListWidget#MeshKeypointObjectList::item:selected,
-QListWidget#MeshKeypointObjectList::item:selected:!active {
+QListWidget#MeshKeypointObjectList::item:selected:!active,
+QListWidget#AnnotationFaceQueue::item:selected,
+QListWidget#AnnotationFaceQueue::item:selected:!active {
     background: #d9efff;
     color: #08253d;
     border: 2px solid #0b6f8f;
+}
+QFrame#AnnotationFaceItemDone,
+QFrame#AnnotationFaceItemMissing {
+    background: #fbfdff;
+    border: 1px solid #d9e6ef;
+    border-radius: 7px;
+}
+QFrame#AnnotationFaceItemMissing {
+    border-left: 4px solid #b97800;
+}
+QFrame#AnnotationFaceItemDone {
+    border-left: 4px solid #087966;
+}
+QLabel#AnnotationStatusPillDone,
+QLabel#AnnotationStatusPillMissing {
+    border-radius: 5px;
+    padding: 3px 6px;
+    font-size: 10px;
+    font-weight: 800;
+}
+QLabel#AnnotationStatusPillDone {
+    color: #075c36;
+    background: #dff3e9;
+    border: 1px solid #b9dfca;
+}
+QLabel#AnnotationStatusPillMissing {
+    color: #7b4b00;
+    background: #fff3d9;
+    border: 1px solid #ebd09b;
+}
+QLabel#AnnotationFaceObject {
+    color: #102235;
+    font-size: 12px;
+    font-weight: 800;
+}
+QLabel#AnnotationFaceSide {
+    color: #516274;
+    font-size: 11px;
+    font-weight: 600;
+}
+QLabel#AnnotationFacePath {
+    color: #607284;
+    font-family: "Menlo", "Consolas", "Courier New", monospace;
+    font-size: 9px;
 }
 QListWidget#FaceShotGallery {
     background: #ffffff;

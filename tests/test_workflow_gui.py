@@ -50,6 +50,9 @@ from posetag.gui.main_window import (
     _format_capture_face_readiness,
     _format_capture_face_saved_shot_group_details,
     _format_capture_face_saved_shot_details,
+    _format_annotation_outputs,
+    _format_annotation_process_state,
+    _format_annotation_readiness,
     _format_charuco_outputs,
     _format_health_counts,
     _format_mesh_keypoint_details,
@@ -61,6 +64,10 @@ from posetag.gui.main_window import (
     _mesh_keypoint_command_card_note,
     _mesh_keypoint_command_ready_message,
     _mesh_keypoint_list_item,
+    _annotation_command_card_note,
+    _annotation_command_ready_message,
+    _annotation_queue_item_label,
+    _annotation_run_button_label,
     _project_root_hint,
     _stage_list_label,
     _stage_rail_dot_style,
@@ -93,6 +100,17 @@ from posetag.workflows.capture_face import (
     CaptureFaceSavedShot,
     capture_face_process_not_started,
     capture_face_process_running,
+)
+from posetag.workflows.annotation import (
+    ANNOTATION_MODE_BATCH,
+    ANNOTATION_MODE_DRY_RUN,
+    AnnotationOutputStatus,
+    AnnotationProcessState,
+    AnnotationReadiness,
+    annotation_process_not_started,
+    annotation_process_running,
+    build_annotation_launch,
+    remove_annotation_output,
 )
 from posetag.workflows.object_tags import (
     ObjectTagGenerationReadiness,
@@ -294,6 +312,137 @@ class WorkflowGuiTests(unittest.TestCase):
         self.assertIn("env 'POSETAG_PROJECT=/tmp/PoseTag project'", collect_preview)
         self.assertIn("posetag-collect --mode live", collect_preview)
 
+    def test_annotation_launch_uses_project_environment(self) -> None:
+        project_root = Path("/tmp/PoseTag project")
+
+        launch = build_annotation_launch(
+            project_root,
+            mode=ANNOTATION_MODE_DRY_RUN,
+        )
+
+        self.assertIn("python", Path(launch.program).name)
+        self.assertEqual(
+            launch.arguments,
+            ("-m", "posetag.cli.annotate", "--batch", "latest", "--dry-run"),
+        )
+        self.assertIn(
+            "env 'POSETAG_PROJECT=/tmp/PoseTag project'",
+            launch.display_command,
+        )
+        self.assertIn("posetag-annotate --batch latest --dry-run", launch.display_command)
+        self.assertEqual(launch.expected_face_manifest, project_root / "faces" / "face_manifest.csv")
+
+    def test_annotation_launch_includes_selected_options(self) -> None:
+        project_root = Path("/tmp/PoseTag project")
+
+        launch = build_annotation_launch(
+            project_root,
+            mode=ANNOTATION_MODE_BATCH,
+            pts_type="any",
+            check_tag_scale=True,
+            auto_correct_scale=True,
+            force=True,
+            scale_tol=0.05,
+        )
+
+        self.assertEqual(
+            launch.arguments,
+            (
+                "-m",
+                "posetag.cli.annotate",
+                "--batch",
+                "latest",
+                "--pts-type",
+                "any",
+                "--check-tag-scale",
+                "--auto-correct-scale",
+                "--force",
+                "--scale-tol",
+                "0.05",
+            ),
+        )
+        self.assertIn("--pts-type any", launch.display_command)
+        self.assertIn("--check-tag-scale", launch.display_command)
+        self.assertIn("--auto-correct-scale", launch.display_command)
+        self.assertIn("--force", launch.display_command)
+
+    def test_remove_annotation_output_refreshes_face_manifest(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            project_root = Path(tmpdir) / "project"
+            yaml_path = (
+                project_root
+                / "faces"
+                / "column_white"
+                / "front"
+                / "column_white_front_T_board_object.yaml"
+            )
+            yaml_path.parent.mkdir(parents=True)
+            yaml_path.write_text(
+                yaml.safe_dump(
+                    {
+                        "object": "column_white",
+                        "face_key": "column_white_front",
+                        "board_yaml": "boards/column_white_front.yaml",
+                        "image": "shots/front_raw.png",
+                        "rms_px": 1.25,
+                        "T_board_object": {"matrix": [[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, 0], [0, 0, 0, 1]]},
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            result = remove_annotation_output(project_root, yaml_path)
+
+            self.assertTrue(result.removed)
+            self.assertFalse(yaml_path.exists())
+            self.assertTrue(result.face_manifest_path.exists())
+            self.assertNotIn(
+                "column_white_front_T_board_object.yaml",
+                result.face_manifest_path.read_text(encoding="utf-8"),
+            )
+
+    def test_remove_annotation_output_accepts_project_prefixed_relative_path(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            workspace = Path(tmpdir)
+            project_root = workspace / "my_project"
+            yaml_path = (
+                project_root
+                / "faces"
+                / "column_white"
+                / "back"
+                / "column_white_back_T_board_object.yaml"
+            )
+            yaml_path.parent.mkdir(parents=True)
+            yaml_path.write_text(
+                yaml.safe_dump(
+                    {
+                        "object": "column_white",
+                        "face_key": "column_white_back",
+                        "board_yaml": "boards/column_white_back.yaml",
+                        "image": "shots/back_raw.png",
+                        "rms_px": 2.0,
+                        "T_board_object": {"matrix": [[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, 0], [0, 0, 0, 1]]},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            old_cwd = Path.cwd()
+            try:
+                os.chdir(workspace)
+                result = remove_annotation_output(
+                    project_root,
+                    Path("my_project")
+                    / "faces"
+                    / "column_white"
+                    / "back"
+                    / "column_white_back_T_board_object.yaml",
+                )
+            finally:
+                os.chdir(old_cwd)
+
+            self.assertTrue(result.removed)
+            self.assertFalse(yaml_path.exists())
+
     def test_mesh_keypoint_command_preview_uses_inferred_object(self) -> None:
         with TemporaryDirectory() as tmpdir:
             project_root = Path(tmpdir) / "project"
@@ -419,8 +568,10 @@ class WorkflowGuiTests(unittest.TestCase):
             details,
         )
         self.assertIn("Import OBJ", note)
+        self.assertIn("Generate Mesh Keypoints", note)
+        self.assertIn("units-to-metre", note)
         self.assertIn("objects/<object>/keypoints.json", note)
-        self.assertIn("Stage 6 remains missing", note)
+        self.assertIn("not overwritten", note)
         self.assertEqual(
             ready,
             "1 object needs OBJ mesh input; 1 object needs keypoints JSON.",
@@ -439,6 +590,7 @@ class WorkflowGuiTests(unittest.TestCase):
             staged_ready,
             "0 objects need OBJ mesh input; 1 object needs keypoints JSON.",
         )
+        self.assertIn("generate mesh keypoints", _command_card_note(model))
 
     def test_mesh_keypoint_preview_has_detachable_large_viewer(self) -> None:
         source = inspect.getsource(build_main_window)
@@ -453,6 +605,40 @@ class WorkflowGuiTests(unittest.TestCase):
         self.assertIn("setMinimumSize(900, 640)", source)
         self.assertIn("_open_detached_mesh_keypoint_viewer", source)
         self.assertIn("showMaximized", source)
+        self.assertIn("Generate Mesh Keypoints", source)
+        self.assertIn("_generate_mesh_keypoints", source)
+        self.assertIn("Remove Object", source)
+        self.assertIn("_remove_selected_mesh_keypoint_object", source)
+        self.assertIn("units to metre", source)
+        self.assertIn("QDoubleSpinBox", source)
+        self.assertLess(
+            source.index(
+                "mesh_preview_header.addWidget(self._mesh_keypoint_import_button)"
+            ),
+            source.index(
+                "mesh_preview_header.addWidget(self._mesh_keypoint_generate_button)"
+            ),
+        )
+        self.assertLess(
+            source.index(
+                "mesh_preview_header.addWidget(self._mesh_keypoint_generate_button)"
+            ),
+            source.index(
+                "mesh_preview_header.addWidget(self._mesh_keypoint_remove_button)"
+            ),
+        )
+        self.assertLess(
+            source.index(
+                "mesh_preview_header.addWidget(self._mesh_keypoint_remove_button)"
+            ),
+            source.index(
+                "mesh_preview_header.addWidget(self._mesh_keypoint_detach_view_button)"
+            ),
+        )
+        self.assertLess(
+            source.index("_make_field(\"Selected command\", mesh_object_command_widget)"),
+            source.index("mesh_keypoints_layout.addLayout(mesh_keypoints_action_row)"),
+        )
 
     def test_project_root_hint_does_not_create_empty_project(self) -> None:
         with TemporaryDirectory() as tmpdir:
@@ -892,6 +1078,99 @@ class WorkflowGuiTests(unittest.TestCase):
             _capture_face_command_ready_message(readiness),
             "Ready to open guided capture or copy a face-shot capture command.",
         )
+
+    def test_annotation_command_note_and_process_state(self) -> None:
+        project_root = Path("/tmp/project")
+        output = AnnotationOutputStatus(
+            manifest_path=project_root / "shots" / "manifest.csv",
+            face_manifest_path=project_root / "faces" / "face_manifest.csv",
+            expected_yaml_paths=(
+                project_root
+                / "faces"
+                / "column_white"
+                / "front"
+                / "column_white_front_T_board_object.yaml",
+                project_root
+                / "faces"
+                / "column_white"
+                / "back"
+                / "column_white_back_T_board_object.yaml",
+            ),
+            existing_yaml_paths=(
+                project_root
+                / "faces"
+                / "column_white"
+                / "front"
+                / "column_white_front_T_board_object.yaml",
+            ),
+            missing_yaml_paths=(
+                project_root
+                / "faces"
+                / "column_white"
+                / "back"
+                / "column_white_back_T_board_object.yaml",
+            ),
+            checked_paths=(),
+        )
+        readiness = AnnotationReadiness(
+            ready=True,
+            command_preview="env POSETAG_PROJECT=/tmp/project posetag-annotate --browse",
+            dry_run_command_preview=(
+                "env POSETAG_PROJECT=/tmp/project "
+                "posetag-annotate --batch latest --dry-run"
+            ),
+            batch_command_preview=(
+                "env POSETAG_PROJECT=/tmp/project posetag-annotate --batch latest"
+            ),
+            output_status=output,
+            checked_paths=(),
+        )
+        active = SimpleNamespace(status="missing")
+        complete = SimpleNamespace(status="complete")
+
+        note = _annotation_command_card_note(readiness, active)
+        complete_note = _annotation_command_card_note(readiness, complete)
+        outputs = _format_annotation_outputs(readiness)
+        queue_label = _annotation_queue_item_label(
+            "column_white / front",
+            annotated=True,
+        )
+        idle = annotation_process_not_started(output.face_manifest_path)
+        running = annotation_process_running(output.face_manifest_path)
+        success = AnnotationProcessState(
+            state="finished",
+            label="finished",
+            message="Annotation process exited.",
+            success=True,
+            expected_face_manifest=output.face_manifest_path,
+            exit_code=0,
+        )
+
+        self.assertIn("Open Annotator", note)
+        self.assertIn("POSETAG_PROJECT", note)
+        self.assertIn("Dry Run", note)
+        self.assertIn("replace a face transform", complete_note)
+        self.assertEqual(
+            _annotation_command_ready_message(readiness),
+            "Ready to open the annotator, dry-run, run batch, or copy the command.",
+        )
+        self.assertIn("Ready to annotate", _format_annotation_readiness(readiness))
+        self.assertIn("1/2 annotation YAMLs", outputs)
+        self.assertIn("1 face left", outputs)
+        self.assertIn("listed in the queue", outputs)
+        self.assertIn("[x] column_white / front", queue_label)
+        self.assertEqual(_annotation_run_button_label(idle), "Open Annotator")
+        self.assertEqual(
+            _annotation_run_button_label(running),
+            "Annotation Running...",
+        )
+        self.assertEqual(
+            _annotation_run_button_label(success),
+            "Open Annotator Again",
+        )
+        self.assertIn("not started", _format_annotation_process_state(idle))
+        self.assertIn("Expected manifest:", _format_annotation_process_state(idle))
+        self.assertIn("OpenCV browser", _format_annotation_process_state(running))
 
     def test_capture_face_process_state_text_and_run_button_labels(self) -> None:
         manifest = Path("/tmp/project/shots/manifest.csv")

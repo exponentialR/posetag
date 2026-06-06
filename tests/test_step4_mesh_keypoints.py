@@ -17,10 +17,14 @@ from posetag.workflows.mesh_keypoints import (
     default_mesh_path,
     expected_face_keys,
     expected_keypoints_path,
+    generate_mesh_keypoints_for_object,
+    generate_missing_mesh_keypoints,
     infer_known_objects,
     inspect_keypoint_object_statuses,
     load_obj_vertex_preview,
+    mesh_keypoint_generation_candidates,
     mesh_keypoint_command_for_object,
+    remove_mesh_keypoint_object_artifacts,
     resolve_object_identity,
     split_object_face,
     supported_mesh_extensions,
@@ -190,11 +194,167 @@ class MeshKeypointWorkflowTests(unittest.TestCase):
             self.assertFalse(statuses[0].mesh_exists)
             self.assertFalse(statuses[0].keypoints_exists)
             self.assertFalse(statuses[0].keypoints_valid)
-            self.assertIn("meshes/column_white.obj", statuses[0].command_preview)
+            self.assertIn("--mesh meshes/column_white.obj", statuses[0].command_preview)
             self.assertIn("--object_name column_white", statuses[0].command_preview)
             self.assertEqual(
                 statuses[0].command_preview,
                 mesh_keypoint_command_for_object(project_root, "column_white"),
+            )
+            self.assertEqual(
+                mesh_keypoint_command_for_object(Path("my_project"), "column_white"),
+                (
+                    "posetag-gen-keypoints --project_root my_project "
+                    "--mesh meshes/column_white.obj --object_name column_white"
+                ),
+            )
+
+    def test_generate_missing_keypoints_for_staged_meshes(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            project_root = Path(tmpdir) / "project"
+            _write_board(project_root, "column_white_front", (10, 11))
+            mesh_path = _write_box_obj(project_root / "meshes" / "column_white.obj")
+
+            candidates = mesh_keypoint_generation_candidates(project_root)
+            self.assertEqual([item.object_name for item in candidates], ["column_white"])
+
+            results = generate_missing_mesh_keypoints(project_root, units_to_m=0.001)
+
+            self.assertEqual(len(results), 1)
+            self.assertEqual(results[0].object_name, "column_white")
+            self.assertEqual(results[0].mesh_path, mesh_path)
+            self.assertEqual(
+                results[0].keypoints_path,
+                project_root / "objects" / "column_white" / "keypoints.json",
+            )
+            payload = json.loads(results[0].keypoints_path.read_text(encoding="utf-8"))
+            self.assertEqual(payload["units_to_m"], 0.001)
+            self.assertEqual(validate_keypoint_payload(payload), ())
+            self.assertEqual(mesh_keypoint_generation_candidates(project_root), ())
+
+    def test_generate_mesh_keypoints_for_one_object_after_import(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            project_root = Path(tmpdir) / "project"
+            _write_board(project_root, "column_white_front", (10, 11))
+            _write_board(project_root, "connection_plate_white_sideA", (20, 21))
+            _write_box_obj(project_root / "meshes" / "column_white.obj")
+            _write_box_obj(project_root / "meshes" / "connection_plate_white.obj")
+
+            result = generate_mesh_keypoints_for_object(
+                project_root,
+                "column_white",
+                units_to_m=1.0,
+            )
+
+            self.assertIsNotNone(result)
+            assert result is not None
+            self.assertEqual(result.object_name, "column_white")
+            self.assertTrue(result.keypoints_path.is_file())
+            self.assertFalse(
+                (
+                    project_root
+                    / "objects"
+                    / "connection_plate_white"
+                    / "keypoints.json"
+                ).exists()
+            )
+            self.assertIsNone(
+                generate_mesh_keypoints_for_object(
+                    project_root,
+                    "column_white",
+                    units_to_m=1.0,
+                )
+            )
+
+    def test_remove_mesh_keypoint_artifacts_resets_selected_object_geometry(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            project_root = Path(tmpdir) / "project"
+            _write_board(project_root, "column_white_front", (10, 11))
+            mesh_path = _write_box_obj(project_root / "meshes" / "column_white.obj")
+            result = generate_mesh_keypoints_for_object(
+                project_root,
+                "column_white",
+                units_to_m=1.0,
+            )
+            self.assertIsNotNone(result)
+            assert result is not None
+            config_path = project_root / "objects" / "column_white" / "object_config.yaml"
+            self.assertTrue(result.keypoints_path.is_file())
+            self.assertTrue(config_path.is_file())
+
+            removed = remove_mesh_keypoint_object_artifacts(
+                project_root,
+                "column_white",
+            )
+
+            self.assertEqual(removed.object_name, "column_white")
+            self.assertEqual(removed.skipped_paths, ())
+            self.assertIn(mesh_path, removed.removed_paths)
+            self.assertIn(result.keypoints_path, removed.removed_paths)
+            self.assertIn(config_path, removed.removed_paths)
+            statuses = inspect_keypoint_object_statuses(project_root)
+            self.assertEqual([item.object_name for item in statuses], ["column_white"])
+            self.assertFalse(statuses[0].mesh_exists)
+            self.assertFalse(statuses[0].keypoints_exists)
+
+    def test_generate_missing_keypoints_accepts_relative_project_root(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            previous_cwd = Path.cwd()
+            os.chdir(tmpdir)
+            try:
+                project_root = Path("project")
+                _write_board(project_root, "column_white_front", (10, 11))
+                _write_box_obj(project_root / "meshes" / "column_white.obj")
+
+                results = generate_missing_mesh_keypoints(
+                    project_root,
+                    units_to_m=1.0,
+                )
+            finally:
+                os.chdir(previous_cwd)
+
+            self.assertEqual([result.object_name for result in results], ["column_white"])
+            self.assertTrue(
+                (
+                    Path(tmpdir)
+                    / "project"
+                    / "objects"
+                    / "column_white"
+                    / "keypoints.json"
+                ).is_file()
+            )
+
+    def test_generate_missing_keypoints_does_not_overwrite_invalid_existing_json(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            project_root = Path(tmpdir) / "project"
+            _write_board(project_root, "column_white_front", (10, 11))
+            _write_box_obj(project_root / "meshes" / "column_white.obj")
+            keypoints_path = project_root / "objects" / "column_white" / "keypoints.json"
+            keypoints_path.parent.mkdir(parents=True, exist_ok=True)
+            keypoints_path.write_text("{}", encoding="utf-8")
+
+            with self.assertRaises(MeshKeypointWorkflowError) as ctx:
+                generate_missing_mesh_keypoints(project_root, units_to_m=1.0)
+
+            self.assertIn("will not be overwritten automatically", str(ctx.exception))
+            self.assertEqual(keypoints_path.read_text(encoding="utf-8"), "{}")
+
+    def test_generate_missing_keypoints_skips_invalid_existing_json(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            project_root = Path(tmpdir) / "project"
+            _write_board(project_root, "column_white_front", (10, 11))
+            _write_board(project_root, "connection_plate_white_sideA", (20, 21))
+            _write_box_obj(project_root / "meshes" / "column_white.obj")
+            _write_box_obj(project_root / "meshes" / "connection_plate_white.obj")
+            invalid_path = project_root / "objects" / "column_white" / "keypoints.json"
+            invalid_path.parent.mkdir(parents=True, exist_ok=True)
+            invalid_path.write_text("{}", encoding="utf-8")
+
+            results = generate_missing_mesh_keypoints(project_root, units_to_m=1.0)
+
+            self.assertEqual([result.object_name for result in results], ["connection_plate_white"])
+            self.assertEqual(invalid_path.read_text(encoding="utf-8"), "{}")
+            self.assertTrue(
+                (project_root / "objects" / "connection_plate_white" / "keypoints.json").is_file()
             )
 
     def test_obj_vertex_preview_reports_bounds_and_vertex_sample(self) -> None:

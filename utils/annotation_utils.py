@@ -9,19 +9,21 @@ os.environ.setdefault("OMP_NUM_THREADS", "1")
 os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
 os.environ.setdefault("MKL_NUM_THREADS", "1")
 
-# at top of file (after the Detector import)
-try:
-    from pupil_apriltags import Detector
-except Exception as e:
-    raise SystemExit("Please install pupil-apriltags: pip install pupil-apriltags") from e
 _DET_CACHE = {}
 
 
 def _get_detector(family: str, nthreads: int = 1,
-                  quad_decimate: float = 1.0, refine_edges: bool = True) -> Detector:
+                  quad_decimate: float = 1.0, refine_edges: bool = True):
     key = (family, nthreads, quad_decimate, refine_edges)
     det = _DET_CACHE.get(key)
     if det is None:
+        try:
+            from pupil_apriltags import Detector
+        except Exception as exc:
+            raise SystemExit(
+                "pupil-apriltags is not available; install PoseTag with the "
+                "'apriltags' extra or run `python -m pip install pupil-apriltags`."
+            ) from exc
         det = Detector(families=family,
                        nthreads=nthreads,
                        quad_decimate=quad_decimate,
@@ -170,18 +172,59 @@ def load_keypoints(obj_name: str, repo_root: Path):
     return pts, faces
 
 def load_board(board_yaml_path: Path):
-    y = yaml.safe_load(open(board_yaml_path, "r"))
-    origin = int(y["origin_id"])
-    tag_size_m = float(y.get("tag_size_m", 0.08))
+    path = Path(board_yaml_path)
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            y = yaml.safe_load(handle)
+    except FileNotFoundError as exc:
+        raise FileNotFoundError(f"Board YAML not found: {path}") from exc
+    except yaml.YAMLError as exc:
+        raise ValueError(f"Malformed board YAML {path}: {exc}") from exc
+    except OSError as exc:
+        raise ValueError(f"Could not read board YAML {path}: {exc}") from exc
+
+    if not isinstance(y, dict):
+        raise ValueError(f"Malformed board YAML {path}: expected a mapping.")
+    if "origin_id" not in y:
+        raise ValueError(f"Malformed board YAML {path}: missing origin_id.")
+    try:
+        origin = int(y["origin_id"])
+    except Exception as exc:
+        raise ValueError(f"Malformed board YAML {path}: origin_id must be an integer.") from exc
+    try:
+        tag_size_m = float(y.get("tag_size_m", 0.08))
+    except Exception as exc:
+        raise ValueError(f"Malformed board YAML {path}: tag_size_m must be numeric.") from exc
+    if not np.isfinite(tag_size_m) or tag_size_m <= 0:
+        raise ValueError(f"Malformed board YAML {path}: tag_size_m must be positive.")
+
+    tags = y.get("tags", [])
+    if not isinstance(tags, list) or not tags:
+        raise ValueError(f"Malformed board YAML {path}: tags must be a non-empty list.")
+
     # Build T_board_tag for each tag id
     tb = {}
-    for e in y.get("tags", []):
-        tid = int(e["id"]); cx = float(e["cx"]); cy = float(e["cy"]); yaw_deg = float(e.get("yaw_deg", 0.0))
+    for index, e in enumerate(tags):
+        if not isinstance(e, dict):
+            raise ValueError(f"Malformed board YAML {path}: tags[{index}] must be a mapping.")
+        try:
+            tid = int(e["id"])
+            cx = float(e["cx"])
+            cy = float(e["cy"])
+            yaw_deg = float(e.get("yaw_deg", 0.0))
+        except KeyError as exc:
+            raise ValueError(f"Malformed board YAML {path}: tags[{index}] missing {exc.args[0]}.") from exc
+        except Exception as exc:
+            raise ValueError(f"Malformed board YAML {path}: tags[{index}] has non-numeric values.") from exc
+        if not all(np.isfinite(v) for v in (cx, cy, yaw_deg)):
+            raise ValueError(f"Malformed board YAML {path}: tags[{index}] values must be finite.")
         Y = math.radians(yaw_deg)
         T = np.eye(4, dtype=float)
         T[:3,:3] = rz(Y)
         T[:3,3] = np.array([cx, cy, 0.0], float)
         tb[tid] = T
+    if origin not in tb:
+        raise ValueError(f"Malformed board YAML {path}: origin_id {origin} is not listed in tags.")
     # Origin must be identity
     tb[origin] = np.eye(4, dtype=float)
     return origin, tag_size_m, tb
