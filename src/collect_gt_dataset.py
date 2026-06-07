@@ -2,16 +2,17 @@
 """
 collect_gt_dataset.py
 =====================
-Collect a ground-truth dataset (multi-object, multi-face) from Intel RealSense
-(live or .bag) or any OpenCV-readable video. For each frame, estimate a pose
-for every face whose board has at least one visible AprilTag. A review UI is
-provided, with optional continuous capture.
+Collect a ground-truth dataset (multi-object, multi-face) from an OpenCV
+webcam, Intel RealSense (live or .bag), or any OpenCV-readable video. For each
+frame, estimate a pose for every face whose board has at least one visible
+AprilTag. A review UI is provided, with optional continuous capture.
 
 What's new vs. previous script
 ------------------------------
 - Project layout via `resolve_project_root(...)`.
-- Scans faces from <project_root>/faces/**/<face_key>_T_board_object.yaml
-  (or faces/face_manifest.csv if present).
+- Validates required inputs before capture: calib/calib_color.yaml,
+  boards/tag_registry.yaml, faces/face_manifest.csv, board YAMLs, and
+  annotation YAMLs containing T_board_object.
 - Writes session metadata and per-frame annotations in a **blueprint-style schema**.
 - Camera extrinsics now use `rotation` (quaternion [x,y,z,w]); optional `rpy_deg`
   is added for readability.
@@ -74,10 +75,19 @@ Per-frame JSON schema (blueprint-style)
 
   "objects": [
     {
+      "object_name": "<str>",
+      "selected_face": "<face_key>",
+      "selected_board": "<board_yaml>",
       "class_id": <int>,
       "class_name": "<str>",
       "2D_center": [cx, cy],            # normalized [0..1]
       "width": <float>, "height": <float>,  # normalized box size
+      "transforms": {
+        "T_cam_board": {"matrix": [[...]]},
+        "T_board_object": {"matrix": [[...]]},
+        "T_cam_object": {"matrix": [[...]]}
+      },
+      "quality": {...},
       "6DOF_pose": {
         "position":   [tx, ty, tz],     # camera->object translation (meters)
         "orientation":[roll, pitch, yaw],# degrees, for readability
@@ -102,18 +112,36 @@ Notes on interpretation
 
 Usage examples
 --------------
+  # Preflight without opening a camera or writing dataset outputs
+  python -m src.collect_gt_dataset --mode opencv --session run01 --dry-run
+
+  # OpenCV webcam
+  python -m src.collect_gt_dataset --mode opencv --cam 0 --session run01 --calib calib_color.yaml
+
   # RealSense live (RGB + depth if available)
-  python -m src.collect_gt_dataset --mode live --session run01 --calib calib_color.yaml
+  python -m src.collect_gt_dataset --mode live --session run02 --calib calib_color.yaml
 
   # RealSense playback from a .bag
-  python -m src.collect_gt_dataset --mode bag --bag path/to/recording.bag --session run02 --calib calib_color.yaml
+  python -m src.collect_gt_dataset --mode bag --bag path/to/recording.bag --session run03 --calib calib_color.yaml
 
   # Any video readable by OpenCV
-  python -m src.collect_gt_dataset --mode video --video sample.mp4 --session run03 --calib calib_color.yaml
+  python -m src.collect_gt_dataset --mode video --video sample.mp4 --session run04 --calib calib_color.yaml
 
 Common options
 --------------
-  --continuous                   Save every frame automatically
+  --project_root PATH            Project root (default resolver/env/config)
+  --registry PATH                Tag registry (default boards/tag_registry.yaml)
+  --face_manifest PATH           Face manifest (default faces/face_manifest.csv)
+  --dry-run                      Validate inputs without capture/output writes
+  --continuous                   Save every frame automatically (crude legacy mode)
+  --auto-capture                 Quality-gated smart auto-capture
+  --auto-stable-frames N         Stable frames before smart save (default 5)
+  --auto-cooldown-sec FLOAT      Delay between smart saves (default 1.0)
+  --auto-min-tags N              Minimum visible tags for smart save (default 1)
+  --auto-min-bbox-area FLOAT     Minimum smart-save bbox area in pixels
+  --auto-max-tag-scale-error F   Max relative tag-scale error when available
+  --auto-grid ROWSxCOLS          Image coverage grid for smart diversity
+  --auto-distance-bin-m FLOAT    Distance-bin size for smart diversity
   --max_frames N                 Stop after N frames
   --rs_w/--rs_h/--rs_fps         Live RealSense stream parameters
   --save_depth                   Save aligned depth as .npy
@@ -125,29 +153,26 @@ Common options
   --check-tag-scale              Report tag scale ratio s
   --auto-correct-scale           Apply 1/s to T_cam_board translation if |s-1|>tol
   --scale-tol FLOAT              Relative tolerance (default 0.02)
-  --tag-cover-margin-m FLOAT     Extra paper allowance around tag (default 0.015 m)
-  --tag-sample-extra-m FLOAT     Ring thickness for background color sample (default 0.015 m)
+  --tag-cover-margin-m FLOAT     Extra paper allowance around tag (default 0.010 m)
+  --tag-sample-extra-m FLOAT     Ring thickness for background color sample (default 0.008 m)
 
 Keys
 ----
-  ENTER / y / s     accept & save frame
+  ENTER / y / s     accept / force-save frame
   r / n / BACKSPACE reject / skip frame
-  ESC / q           abort current frame (continue stream)
-  Q / X             quit all immediately
+  ESC / q / Q       close capture window cleanly
+  x / X             close capture window cleanly
   SPACE or p        pause/resume stream (continuous keeps saving)
   h                 toggle help panel
 """
 
 from __future__ import annotations
-import argparse, json, os, sys, time, math, logging
+import argparse, csv, json, os, sys, time, logging
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional
 import numpy as np
 import cv2, yaml
-
-import csv
-import logging
 
 log: logging.Logger
 
@@ -161,24 +186,34 @@ except Exception:
     rs = None  # optional
 
 # --- repo utils ---
-from utils.project_config import resolve_project_root, ensure_project_dirs
+from utils.project_config import ensure_project_dirs
 from utils.logger import init_project_logger
 from utils.annotation_utils import (
     detect_tags, load_board, se3, inv_se3, load_keypoints_fuzzy
 )
-from utils.gt_pose_utils import rotation_to_quat
-from utils.collect_gt_utils import rpy_from_R, _estimate_tag_scale, _text_panel, _show_dash, _ts_tag_from_epoch, \
-    _map_class_id_and_name, _dominant_color_near_polygon
-
-try:
-    from scipy.spatial.transform import Rotation as Rot
-
-
-    def to_quat(R):
-        return Rot.from_matrix(R).as_quat()  # [x,y,z,w]
-except Exception:
-    def to_quat(R):
-        return rotation_to_quat(R)
+from utils.collect_gt_utils import rpy_from_R, _estimate_tag_scale, _show_dash, _ts_tag_from_epoch, \
+    _capture_key_requests_quit, _capture_status_panel, _dominant_color_near_polygon, \
+    _normalize_capture_key
+from posetag.pipelines.collect_dataset import (
+    AutoCaptureConfig,
+    AutoCaptureState,
+    CollectDatasetError,
+    Intrinsics,
+    auto_capture_candidates_from_results,
+    build_frame_annotation_record,
+    build_session_metadata,
+    evaluate_auto_capture,
+    load_intrinsics_from_calibration,
+    parse_auto_capture_grid,
+    preview_project_root,
+    record_auto_capture_save,
+    resolve_calibration_path,
+    resolve_dataset_root,
+    resolve_face_manifest_path,
+    resolve_registry_path,
+    validate_collection_inputs,
+    validate_source_args,
+)
 
 try:
     cv2.ocl.setUseOpenCL(False)
@@ -186,56 +221,15 @@ try:
 except Exception:
     pass
 
-EXIT_QUIT_ALL = 99
-DATASET_VERSION = "1.0"
-
-log: logging.Logger  # set in main()
-
-
-def _quit_all():
-    try:
-        cv2.destroyAllWindows()
-        try:
-            sys.stdout.flush()
-        except:
-            pass
-        try:
-            sys.stderr.flush()
-        except:
-            pass
-    finally:
-        os._exit(EXIT_QUIT_ALL)
+log = logging.getLogger(__name__)
+log.addHandler(logging.NullHandler())
 
 
 # --------------------------- Camera / Sources --------------------------------
-@dataclass
-class Intrinsics:
-    fx: float;
-    fy: float;
-    cx: float;
-    cy: float
-    width: int;
-    height: int
-    dist: Optional[np.ndarray] = None  # (1,5) if available
-
-
-def _load_dist_from_calib(calib_path: Path) -> np.ndarray:
-    try:
-        y = yaml.safe_load(open(calib_path, "r"))
-        dc = y.get("distortion_coefficients", {})
-        return np.array([[dc.get("k1", 0), dc.get("k2", 0), dc.get("p1", 0), dc.get("p2", 0), dc.get("k3", 0)]], float)
-    except Exception:
-        return np.zeros((1, 5), float)
-
-
 def load_intrinsics_from_calib(calib_path: Path) -> Intrinsics:
-    y = yaml.safe_load(open(calib_path, "r"))
-    cam = y["camera_matrix"]
-    fx, fy, cx, cy = cam["fx"], cam["fy"], cam["cx"], cam["cy"]
-    w = int(y.get("image_width", 640))
-    h = int(y.get("image_height", 480))
-    dist = _load_dist_from_calib(calib_path)
-    return Intrinsics(fx, fy, cx, cy, w, h, dist)
+    """Compatibility wrapper for the validated collection calibration loader."""
+
+    return load_intrinsics_from_calibration(calib_path)
 
 
 class FrameSource:
@@ -251,7 +245,11 @@ class FrameSource:
 
 class VideoSource(FrameSource):
     def __init__(self, path: Path, fps_hint: float = 30.0):
+        if not Path(path).expanduser().exists():
+            raise RuntimeError(f"Could not open video: {path}")
         self.cap = cv2.VideoCapture(str(path))
+        if not self.cap.isOpened():
+            raise RuntimeError(f"Could not open video: {path}")
         fps = float(self.cap.get(cv2.CAP_PROP_FPS)) or fps_hint
         self.fps_delay = 1.0 / max(1e-6, fps)
 
@@ -262,6 +260,39 @@ class VideoSource(FrameSource):
         return bgr, None, time.time()
 
     def stop(self): self.cap.release()
+
+
+class OpenCVWebcamSource(FrameSource):
+    def __init__(self, cam: int = 0, width: int = 0, height: int = 0, fps: int = 30):
+        self.cam = int(cam)
+        self.width = int(width)
+        self.height = int(height)
+        self.fps = int(fps)
+        self.cap = None
+
+    def start(self):
+        self.cap = cv2.VideoCapture(self.cam)
+        if not self.cap.isOpened():
+            raise RuntimeError(f"Could not open OpenCV camera index {self.cam}")
+        if self.width > 0:
+            self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
+        if self.height > 0:
+            self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
+        if self.fps > 0:
+            self.cap.set(cv2.CAP_PROP_FPS, self.fps)
+
+    def read(self):
+        ok, bgr = self.cap.read()
+        if not ok:
+            return None, None, time.time()
+        return bgr, None, time.time()
+
+    def stop(self):
+        if self.cap is not None:
+            self.cap.release()
+
+    def camera_kind(self) -> str:
+        return "opencv_webcam"
 
 
 class RealSenseLive(FrameSource):
@@ -397,12 +428,17 @@ def _scan_faces_yaml(project_root: Path) -> List[Path]:
     return list((project_root / "faces").glob("*/*/*_T_board_object.yaml"))
 
 
-def load_face_registry(project_root: Path) -> Dict[str, FaceEntry]:
+def load_face_registry(
+        project_root: Path,
+        *,
+        face_manifest_path: Optional[Path] = None,
+        allow_face_scan: bool = False,
+) -> Dict[str, FaceEntry]:
     """
     Build registry from faces/face_manifest.csv when present; otherwise scan faces/*.
     """
     reg: Dict[str, FaceEntry] = {}
-    manifest_rows = _read_faces_manifest(project_root)
+    manifest_rows = _read_faces_manifest(project_root, face_manifest_path)
 
     yaml_paths: List[Tuple[str, Optional[float], Path, Optional[
         Path]]] = []  # (face_key, tag_size_m_hint, yaml_path, board_yaml_from_manifest)
@@ -414,6 +450,12 @@ def load_face_registry(project_root: Path) -> Dict[str, FaceEntry]:
                 continue
             yaml_paths.append((r.face_key, r.tag_size_m, r.yaml_path, r.board_yaml))
     else:
+        if not allow_face_scan:
+            manifest_path = face_manifest_path or _faces_manifest_path(project_root)
+            raise SystemExit(
+                f"[!] Face manifest not found: {manifest_path}. Run posetag-annotate "
+                "so faces/face_manifest.csv lists T_board_object YAMLs."
+            )
         # Fallback scan
         for y in _scan_faces_yaml(project_root):
             face_key = y.stem.replace("_T_board_object", "")
@@ -480,12 +522,14 @@ class FaceManifestRow:
     tag_size_m: Optional[float]
 
 
-def _faces_manifest_path(project_root: Path) -> Path:
+def _faces_manifest_path(project_root: Path, face_manifest_path: Optional[Path] = None) -> Path:
+    if face_manifest_path is not None:
+        return Path(face_manifest_path).expanduser()
     return project_root / "faces" / "face_manifest.csv"
 
 
-def _read_faces_manifest(project_root: Path) -> List[FaceManifestRow]:
-    p = _faces_manifest_path(project_root)
+def _read_faces_manifest(project_root: Path, face_manifest_path: Optional[Path] = None) -> List[FaceManifestRow]:
+    p = _faces_manifest_path(project_root, face_manifest_path)
     rows: List[FaceManifestRow] = []
     if not p.exists():
         log.warning("[faces-manifest] Not found: %s (will fall back to scanning faces/*)", p)
@@ -760,6 +804,7 @@ def estimate_poses_multi(
             "bbox_xywh": bbox_xywh,
             "bbox_source": bbox_source,
             "T_cam_board": {"matrix": T_cam_board.tolist()},
+            "T_board_object": {"matrix": fe.T_board_object.tolist()},
             "T_cam_object": {"matrix": T_cam_obj.tolist()},
             "overlay_bgr": [int(overlay_bgr[0]), int(overlay_bgr[1]), int(overlay_bgr[2])],
             "diagnostics": {
@@ -793,6 +838,7 @@ def save_frame(
         dataset_name: str,
         pts3d_by_object: Optional[Dict[str, np.ndarray]] = None,
         anno_img: Optional[np.ndarray] = None,  # <- NEW: annotated image
+        capture_metadata: Optional[dict] = None,
 ):
     # --- folder layout ---
     images_dir = out_dir / "images"  # raw rgb only
@@ -828,121 +874,20 @@ def save_frame(
     if save_depth and depth is not None:
         np.save(str(depth_path), depth)
 
-    W = float(intr.width)
-    H = float(intr.height)
-
-    K = np.array([[intr.fx, 0, intr.cx], [0, intr.fy, intr.cy], [0, 0, 1]], float)
-
-    # ---- camera extrinsics (camera pose in the frame of the most reliable board) ----
-    camera_pos = [0.0, 0.0, 0.0]
-    cam_quat = [0.0, 0.0, 0.0, 1.0]
-
-    # pick the entry with the most tags, then score
-    if results:
-        ref = max(results.values(), key=lambda r: (r.get("num_tags_visible", 0), r.get("score", 0.0)))
-        T_cam_board = np.array(ref["T_cam_board"]["matrix"], float)
-        try:
-            T_board_cam = np.linalg.inv(T_cam_board)
-            Rbc, tbc = T_board_cam[:3, :3], T_board_cam[:3, 3]
-            camera_pos = [float(tbc[0]), float(tbc[1]), float(tbc[2])]
-            cam_quat = [float(q) for q in to_quat(Rbc)]
-            try:
-                roll, pitch, yaw = rpy_from_R(Rbc)
-                cam_rpy = [float(roll), float(pitch), float(yaw)]
-            except Exception:
-                cam_rpy = None
-        except Exception:
-            pass
-
-    # ----- build objects list (best per object already computed upstream) -----
-    objects_out = []
-    for r in results.values():
-        obj_name = r["object"]
-        cls_id, cls_name = _map_class_id_and_name(obj_name)
-        x0, y0, w_px, h_px = r["bbox_xywh"]
-        cx = (x0 + 0.5 * w_px) / float(W)
-        cy = (y0 + 0.5 * h_px) / float(H)
-        ww = w_px / float(W)
-        hh = h_px / float(H)
-
-        # pose (camera -> object)
-        M = np.array(r["T_cam_object"]["matrix"], float)
-        R, t = M[:3, :3], M[:3, 3]
-        roll, pitch, yaw = rpy_from_R(R)
-        q_xyzw = to_quat(R)
-
-        # dimensions (from keypoints)
-        dimensions = None
-        mins, maxs = None, None
-        if pts3d_by_object and obj_name in pts3d_by_object:
-            P = pts3d_by_object[obj_name].astype(float)
-            if P.size > 0:
-                mins = P.min(axis=0)
-                maxs = P.max(axis=0)
-                d = (maxs - mins)
-                dimensions = [float(d[0]), float(d[1]), float(d[2])]
-
-        obb_corners_cam = None
-        obb_corners_img = None
-        if mins is not None:
-            # 8 corners in the object frame
-            xs = [mins[0], maxs[0]]
-            ys = [mins[1], maxs[1]]
-            zs = [mins[2], maxs[2]]
-            C_obj = np.array([[x, y, z] for x in xs for y in ys for z in zs], float)  # (8,3)
-            # transform to camera frame
-            C_cam = (R @ C_obj.T + t.reshape(3, 1)).T  # (8,3)
-            obb_corners_cam = C_cam.tolist()
-            # project to image (for visual losses or debugging)
-            uv = project_points(C_obj.astype(np.float32), M, K, intr.dist)
-            obb_corners_img = uv.tolist()
-
-        entry = {
-            "class_id": int(cls_id),
-            "class_name": cls_name,
-            "2D_center": [float(cx), float(cy)],
-            "width": float(ww),
-            "height": float(hh),
-            "6DOF_pose": {
-                "position": [float(t[0]), float(t[1]), float(t[2])],
-                "orientation": [float(roll), float(pitch), float(yaw)],
-                "rotation": [float(q_xyzw[0]), float(q_xyzw[1]), float(q_xyzw[2]), float(q_xyzw[3])],
-                **({"dimensions": dimensions} if dimensions is not None else {}),
-                **({"obb_corners_cam": obb_corners_cam, "obb_corners_img": obb_corners_img}
-                   if obb_corners_cam is not None else {}),
-            },
-        }
-        objects_out.append(entry)
-
-    # ---- final annotation record ----
-    record = {
-        "version": DATASET_VERSION,
-        "metadata": {
-            "dataset_name": dataset_name,
-            "frame_index": int(idx),
-            "timestamp": float(ts),
-            "tag_family": family,
-        },
-        "image_filename": rgb_name,
-        "objects": objects_out,
-        "annotated_image": (annoimg_path.name if anno_img is not None else None),
-        "reproj_image": (reproj_path.name if reproj_img is not None else None),
-        "depth": (depth_path.name if (save_depth and depth is not None) else None),
-        "camera_intrinsics": {
-            "fx": float(intr.fx),
-            "fy": float(intr.fy),
-            "cx": float(intr.cx),
-            "cy": float(intr.cy),
-            "width": int(intr.width),
-            "height": int(intr.height),
-        },
-        "camera_extrinsics": {
-            "position": camera_pos,
-            "orientation": cam_quat,  # xyzw
-            **({"rpy_deg": cam_rpy} if cam_rpy is not None else {}),
-        },
-
-    }
+    record = build_frame_annotation_record(
+        dataset_name=dataset_name,
+        frame_index=idx,
+        timestamp=ts,
+        tag_family=family,
+        image_filename=rgb_name,
+        annotated_image=(annoimg_path.name if anno_img is not None else None),
+        reproj_image=(reproj_path.name if reproj_img is not None else None),
+        depth=(depth_path.name if (save_depth and depth is not None) else None),
+        intrinsics=intr,
+        results=results,
+        pts3d_by_object=pts3d_by_object,
+        capture_metadata=capture_metadata,
+    )
     ann_path.write_text(json.dumps(record, indent=5))
 
     log_entry = {
@@ -955,31 +900,73 @@ def save_frame(
         "tag_family": family,
         "objects": sorted({r["object"] for r in results.values()}),
     }
+    if capture_metadata:
+        log_entry["capture"] = capture_metadata
     with open(log_path, "a", encoding="utf-8") as f:
         f.write(json.dumps(log_entry) + "\n")
 
 
 # ------------------------------- Main loop -----------------------------------
 
-def main():
-    project_root = resolve_project_root(None)
-    ensure_project_dirs(project_root)
-    # Logger
-    global log
-    log = init_project_logger(project_root / "logs" / "collect_gt_dataset.log",
-                              level="INFO", console=True)
+class _HelpFmt(argparse.ArgumentDefaultsHelpFormatter, argparse.RawTextHelpFormatter):
+    """Show defaults while preserving multiline help."""
 
-    parser = argparse.ArgumentParser("Collect multi-object/multi-face GT dataset with review UI")
-    parser.add_argument("--mode", choices=["live", "bag", "video"], required=True)
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="posetag-collect",
+        description="Collect multi-object/multi-face GT dataset with review UI",
+        formatter_class=_HelpFmt,
+    )
+    parser.add_argument("--project_root", type=Path, default=None,
+                        help="Root for boards/faces/objects/datasets (default: resolver/env/config).")
+    parser.add_argument("--mode", choices=["live", "opencv", "bag", "video"], required=True,
+                        help="Frame source: RealSense live, OpenCV webcam, RealSense bag, or video file.")
     parser.add_argument("--bag", type=str, help="Path to RealSense .bag (for mode=bag)")
     parser.add_argument("--video", type=str, help="Path to a video file (for mode=video)")
     parser.add_argument("--session", required=True, help="Dataset session name (folder under datasets/)")
-    parser.add_argument("--dataset_root", type=str, default=str(project_root / "datasets"))
-    parser.add_argument("--calib", default="calib_color.yaml", help="Calibration YAML (fx,fy,cx,cy,dist)")
+    parser.add_argument("--dataset_root", type=str, default=None,
+                        help="Dataset root directory (default: <project_root>/datasets)")
+    parser.add_argument("--calib", default="calib_color.yaml",
+                        help="Calibration YAML (default resolves to calib/calib_color.yaml)")
+    parser.add_argument("--registry", default=None,
+                        help="Tag registry YAML (default: <project_root>/boards/tag_registry.yaml)")
+    parser.add_argument("--face_manifest", default=None,
+                        help="Face manifest CSV (default: <project_root>/faces/face_manifest.csv)")
+    parser.add_argument("--allow-face-scan", action="store_true",
+                        help="Legacy fallback: scan faces/**/*_T_board_object.yaml if face_manifest is missing.")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="Validate inputs and print a summary without opening a camera or writing outputs.")
     parser.add_argument("--family", default="tag36h11")
     parser.add_argument("--continuous", action="store_true",
                         help="Do not prompt per frame; save all automatically")
+    parser.add_argument("--auto-capture", action="store_true",
+                        help="Quality-gated smart auto-capture; saves stable, useful views automatically.")
+    parser.add_argument("--auto-stable-frames", type=int, default=5,
+                        help="Consecutive stable frames required before smart auto-capture can save.")
+    parser.add_argument("--auto-cooldown-sec", type=float, default=1.0,
+                        help="Minimum time between smart auto-capture saves.")
+    parser.add_argument("--auto-min-tags", type=int, default=1,
+                        help="Minimum visible tags for a smart auto-capture candidate.")
+    parser.add_argument("--auto-min-bbox-area", type=float, default=12000.0,
+                        help="Minimum candidate bbox area in pixels for smart auto-capture.")
+    parser.add_argument("--auto-max-tag-scale-error", type=float, default=0.08,
+                        help="Maximum allowed relative tag-scale error when scale diagnostics are available.")
+    parser.add_argument("--auto-min-translation-delta-m", type=float, default=0.04,
+                        help="Translation threshold used for stability and pose-diversity gating.")
+    parser.add_argument("--auto-min-rotation-delta-deg", type=float, default=8.0,
+                        help="Rotation threshold used for stability and pose-diversity gating.")
+    parser.add_argument("--auto-grid", default="3x3",
+                        help="Image coverage grid for smart auto-capture, formatted ROWSxCOLS.")
+    parser.add_argument("--auto-distance-bin-m", type=float, default=0.25,
+                        help="Distance-bin size used for smart auto-capture diversity.")
+    parser.add_argument("--auto-max-frames-per-object", type=int, default=0,
+                        help="Maximum smart auto-captured frames per object (0=unlimited).")
     parser.add_argument("--max_frames", type=int, default=0, help="Stop after N frames (0=unlimited)")
+    parser.add_argument("--cam", type=int, default=0, help="OpenCV camera index when --mode=opencv")
+    parser.add_argument("--width", type=int, default=0, help="OpenCV webcam width; 0=calibration width")
+    parser.add_argument("--height", type=int, default=0, help="OpenCV webcam height; 0=calibration height")
+    parser.add_argument("--fps", type=int, default=30, help="OpenCV webcam FPS request")
     parser.add_argument("--rs_w", type=int, default=0, help="Color width; 0=auto")
     parser.add_argument("--rs_h", type=int, default=0, help="Color height; 0=auto")
     parser.add_argument("--rs_fps", type=int, default=30, help="FPS for live mode")
@@ -993,7 +980,7 @@ def main():
     parser.add_argument("--auto-correct-scale", action="store_true",
                         help="If |s-1|>tol, divide T_cam_board translation by s")
     parser.add_argument("--scale-tol", type=float, default=0.02,
-                        help="Relative tolerance (default 0.02 = 2%)")
+                        help="Relative tolerance (default 0.02 = 2%%)")
     parser.add_argument("--bbox-mode", choices=["auto", "face", "object"], default="auto",
                         help="Which 3D points drive the bbox: 'face' (4 corners), 'object' (all kps), or 'auto' (larger).")
     parser.add_argument("--bbox-tag-mult", type=float, default=5.0,
@@ -1001,45 +988,115 @@ def main():
     parser.add_argument("--bbox-min-area", type=int, default=12000,
                         help="If bbox area < this, use tag fallback (default 12000 px^2).")
     parser.add_argument("--bbox-pad-frac", type=float, default=0.06,
-                        help="Pad final bbox by this fraction of its size (default 6%).")
+                        help="Pad final bbox by this fraction of its size (default 6%%).")
     parser.add_argument("--tag-cover-margin-m", type=float, default=0.010)
     parser.add_argument("--tag-sample-extra-m", type=float, default=0.008)
+    return parser
 
-    args = parser.parse_args()
 
-    # Intrinsics calibration data
-    calib_path = project_root / args.calib
-    intr = load_intrinsics_from_calib(calib_path)
-    K = np.array([[intr.fx, 0, intr.cx], [0, intr.fy, intr.cy], [0, 0, 1]], float)
+def main(argv=None):
+    args = build_parser().parse_args(argv)
+
+    try:
+        if args.continuous and args.auto_capture:
+            raise CollectDatasetError("--continuous and --auto-capture are mutually exclusive.")
+        auto_grid_rows, auto_grid_cols = parse_auto_capture_grid(args.auto_grid)
+        if args.auto_stable_frames <= 0:
+            raise CollectDatasetError("--auto-stable-frames must be positive.")
+        if args.auto_cooldown_sec < 0.0:
+            raise CollectDatasetError("--auto-cooldown-sec must be non-negative.")
+        if args.auto_min_tags <= 0:
+            raise CollectDatasetError("--auto-min-tags must be positive.")
+        if args.auto_min_bbox_area < 0.0:
+            raise CollectDatasetError("--auto-min-bbox-area must be non-negative.")
+        if args.auto_max_tag_scale_error < 0.0:
+            raise CollectDatasetError("--auto-max-tag-scale-error must be non-negative.")
+        if args.auto_min_translation_delta_m < 0.0:
+            raise CollectDatasetError("--auto-min-translation-delta-m must be non-negative.")
+        if args.auto_min_rotation_delta_deg < 0.0:
+            raise CollectDatasetError("--auto-min-rotation-delta-deg must be non-negative.")
+        if args.auto_distance_bin_m <= 0.0:
+            raise CollectDatasetError("--auto-distance-bin-m must be positive.")
+        if args.auto_max_frames_per_object < 0:
+            raise CollectDatasetError("--auto-max-frames-per-object must be non-negative.")
+        project_root = preview_project_root(args.project_root)
+        calib_path = resolve_calibration_path(project_root, args.calib)
+        intr = load_intrinsics_from_calib(calib_path)
+        registry_path = resolve_registry_path(project_root, args.registry)
+        face_manifest_path = resolve_face_manifest_path(project_root, args.face_manifest)
+        datasets_root = resolve_dataset_root(project_root, args.dataset_root)
+
+        validate_source_args(
+            mode=args.mode,
+            video=args.video,
+            bag=args.bag,
+            realsense_module=rs,
+            video_capture_factory=cv2.VideoCapture if args.mode == "video" else None,
+        )
+        input_summary = validate_collection_inputs(
+            project_root=project_root,
+            calib_path=calib_path,
+            registry_path=registry_path,
+            face_manifest_path=face_manifest_path,
+            allow_face_scan=args.allow_face_scan,
+        )
+    except CollectDatasetError as exc:
+        raise SystemExit(str(exc)) from exc
+
+    if args.dry_run:
+        print("Dataset collection dry run OK")
+        print(f"  project_root: {project_root}")
+        print(f"  calibration : {input_summary.calibration_path}")
+        print(f"  registry    : {input_summary.registry_path}")
+        print(f"  manifest    : {input_summary.face_manifest_path}")
+        print(f"  annotations : {len(input_summary.annotations)}")
+        print(f"  source mode : {args.mode}")
+        if input_summary.missing_keypoints:
+            print("  optional keypoints missing:")
+            for path in input_summary.missing_keypoints:
+                print(f"    - {path}")
+        return 0
+
+    ensure_project_dirs(project_root)
+
+    # Logger
+    global log
+    log = init_project_logger(project_root / "logs" / "collect_gt_dataset.log",
+                              level="INFO", console=True)
 
     # Face registry (from <project_root>/faces)
-    faces = load_face_registry(project_root)
+    faces = load_face_registry(
+        project_root,
+        face_manifest_path=face_manifest_path,
+        allow_face_scan=args.allow_face_scan,
+    )
     log.info("[i] Faces loaded: %d", len(faces))
-
-    # Output layout
-    datasets_root = Path(args.dataset_root) if args.dataset_root else (project_root / "datasets")
-    out_dir = datasets_root / args.session
-    ensure_dir(datasets_root)
-    ensure_dir(out_dir)
 
     # Choose frame source
     if args.mode == "live":
         w = args.rs_w or intr.width
         h = args.rs_h or intr.height
         src = RealSenseLive(width=w, height=h, fps=args.rs_fps)
+    elif args.mode == "opencv":
+        w = args.width or intr.width
+        h = args.height or intr.height
+        src = OpenCVWebcamSource(cam=args.cam, width=w, height=h, fps=args.fps)
     elif args.mode == "bag":
-        if not args.bag: sys.exit("--bag is required for mode=bag")
-        src = RealSenseBag(Path(args.bag))
+        src = RealSenseBag(Path(args.bag).expanduser())
     else:
-        if not args.video: sys.exit("--video is required for mode=video")
-        src = VideoSource(Path(args.video))
+        src = VideoSource(Path(args.video).expanduser())
 
     # Start source
     src.start()
     cam_kind = src.camera_kind()
 
+    # Output layout
+    out_dir = datasets_root / args.session
+    ensure_dir(datasets_root)
+    ensure_dir(out_dir)
+
     cv2.namedWindow("GT Capture", cv2.WINDOW_NORMAL | cv2.WINDOW_KEEPRATIO)
-    cv2.resizeWindow("GT Capture", 1920, 480)
+    cv2.resizeWindow("GT Capture", 1640, 520)
 
     # Preload face keypoints for bbox projection
     pts3d_by_face: Dict[str, np.ndarray] = {}
@@ -1058,29 +1115,58 @@ def main():
         except Exception as e:
             log.warning("[warn] keypoints for %s not fully available: %s", fk, e)
 
+    auto_capture_config = AutoCaptureConfig(
+        enabled=bool(args.auto_capture),
+        stable_frames=int(args.auto_stable_frames),
+        cooldown_sec=float(args.auto_cooldown_sec),
+        min_tags_visible=int(args.auto_min_tags),
+        min_bbox_area_px=float(args.auto_min_bbox_area),
+        max_tag_scale_error=float(args.auto_max_tag_scale_error),
+        min_translation_delta_m=float(args.auto_min_translation_delta_m),
+        min_rotation_delta_deg=float(args.auto_min_rotation_delta_deg),
+        grid_rows=int(auto_grid_rows),
+        grid_cols=int(auto_grid_cols),
+        distance_bin_m=float(args.auto_distance_bin_m),
+        max_frames_per_object=int(args.auto_max_frames_per_object),
+    )
+    auto_capture_state = AutoCaptureState()
+
     # Session metadata scaffold
-    session_meta = {
-        "version": DATASET_VERSION,
-        "name": args.session,
-        "created": time.strftime("%Y-%m-%d %H:%M:%S"),
-        "project_root": str(project_root),
-        "paths": {"root": str(datasets_root), "session_dir": str(out_dir)},
-        "camera": {
-            "kind": cam_kind,  # "intel_realsense" or "generic"
-            "fx": intr.fx, "fy": intr.fy, "cx": intr.cx, "cy": intr.cy,
-            "width": intr.width, "height": intr.height,
-            "distortion_coefficients": None if intr.dist is None else intr.dist.reshape(-1).tolist(),
-        },
-        "tag_family": args.family,
-        "tag_scale_controls": {
+    faces_index = {fk: {"object": fe.object_name, "board_yaml": str(fe.board_yaml)} for fk, fe in faces.items()}
+    session_meta = build_session_metadata(
+        session_name=args.session,
+        project_root=project_root,
+        dataset_root=datasets_root,
+        session_dir=out_dir,
+        intrinsics=intr,
+        tag_family=args.family,
+        camera_kind=cam_kind,
+        mode=args.mode,
+        tag_scale_controls={
             "check_tag_scale": bool(args.check_tag_scale),
             "auto_correct_scale": bool(args.auto_correct_scale),
             "scale_tol": float(args.scale_tol),
         },
-        "faces_index": {fk: {"object": fe.object_name, "board_yaml": str(fe.board_yaml)} for fk, fe in faces.items()},
-        "objects_available": sorted({fe.object_name for fe in faces.values()}),
-        "objects_seen_counts": {},  # filled as we save frames
-        "frames_captured": 0,
+        faces_index=faces_index,
+        missing_keypoints=input_summary.missing_keypoints,
+    )
+    session_meta["created"] = time.strftime("%Y-%m-%d %H:%M:%S")
+    session_meta["capture_policy"] = {
+        "mode": "smart_auto" if args.auto_capture else ("continuous" if args.continuous else "review"),
+        "continuous": bool(args.continuous),
+        "auto_capture": {
+            "enabled": bool(auto_capture_config.enabled),
+            "stable_frames": int(auto_capture_config.stable_frames),
+            "cooldown_sec": float(auto_capture_config.cooldown_sec),
+            "min_tags_visible": int(auto_capture_config.min_tags_visible),
+            "min_bbox_area_px": float(auto_capture_config.min_bbox_area_px),
+            "max_tag_scale_error": float(auto_capture_config.max_tag_scale_error),
+            "min_translation_delta_m": float(auto_capture_config.min_translation_delta_m),
+            "min_rotation_delta_deg": float(auto_capture_config.min_rotation_delta_deg),
+            "grid": f"{int(auto_capture_config.grid_rows)}x{int(auto_capture_config.grid_cols)}",
+            "distance_bin_m": float(auto_capture_config.distance_bin_m),
+            "max_frames_per_object": int(auto_capture_config.max_frames_per_object),
+        },
     }
     (out_dir / "session.yaml").write_text(yaml.safe_dump(session_meta, sort_keys=False))
 
@@ -1152,55 +1238,81 @@ def main():
                 if (obj not in best_by_object) or (r["score"] > best_by_object[obj]["score"]):
                     best_by_object[obj] = r
 
-            # right panel text
-            lines = [
-                "GT Capture",
-                f"session: {args.session}",
-                f"faces visible: {len(results)}   (saved: {idx})",
-                "",
-                "Panels:",
-                "  Left  = Annotation (axes, bbox, labels)",
-                "  Middle= Reprojection / tag debug",
-                "  Right = Status, legend, capture feedback",
-                "",
-                "Keys: ENTER/y/s=accept, r/n/BACK=reject",
-                "      ESC/q=abort  Q/X=quit-all",
-                "      SPACE/p=cont/pause  h=help",
-                "",
-            ]
-            if show_help:
-                for obj, r in best_by_object.items():
-                    M = np.array(r["T_cam_object"]["matrix"], float)
-                    R, t = M[:3, :3], M[:3, 3]
-                    roll, pitch, yaw = rpy_from_R(R)
-                    lines.append(f"- {obj} [{r['face_key']}]")
-                    lines.append(f"   t (m): [{t[0]:.3f}, {t[1]:.3f}, {t[2]:.3f}]  | dist={np.linalg.norm(t):.3f} m")
-                    lines.append(f"   rpy deg : [{roll:.1f}, {pitch:.1f}, {yaw:.1f}]")
-                    lines.append(f"   tag_used: {r['tag_used']}  bbox: {r['bbox_source']}")
-                    diag = r.get("diagnostics", {})
-                    lines.append(f"   tag_scale s={diag.get('tag_scale_ratio', 1.0):.3f} "
-                                 f"pairs={diag.get('tag_scale_pairs', 0)} "
-                                 f"{'AUTO' if diag.get('tag_scale_auto_corrected', False) else ''}")
-                    lines.append("")
-
             now = time.time()
-            if capture_msg and now < capture_msg_until:
-                lines.append(f"*** {capture_msg} ***")
+            auto_candidates = auto_capture_candidates_from_results(best_by_object)
+            auto_capture_decision = None
+            auto_capture_message = ""
+            if args.auto_capture and not paused:
+                auto_capture_decision = evaluate_auto_capture(
+                    auto_candidates,
+                    auto_capture_state,
+                    auto_capture_config,
+                    frame_width=intr.width,
+                    frame_height=intr.height,
+                    timestamp=now,
+                )
+                auto_capture_message = auto_capture_decision.message
+            elif args.auto_capture:
+                auto_capture_message = "Auto: paused"
 
-            right = _text_panel(lines, width=640, height=480)
+            object_summaries = []
+            for obj, r in best_by_object.items():
+                M = np.array(r["T_cam_object"]["matrix"], float)
+                R, t = M[:3, :3], M[:3, 3]
+                roll, pitch, yaw = rpy_from_R(R)
+                diag = r.get("diagnostics", {})
+                object_summaries.append(
+                    {
+                        "object": obj,
+                        "face_key": r["face_key"],
+                        "translation_m": tuple(float(v) for v in t),
+                        "distance_m": float(np.linalg.norm(t)),
+                        "rpy_deg": (float(roll), float(pitch), float(yaw)),
+                        "tag_used": r.get("tag_used", "?"),
+                        "bbox_source": r.get("bbox_source", "?"),
+                        "tag_scale_ratio": diag.get("tag_scale_ratio", 1.0),
+                        "tag_scale_pairs": diag.get("tag_scale_pairs", 0),
+                        "tag_scale_auto_corrected": diag.get(
+                            "tag_scale_auto_corrected",
+                            False,
+                        ),
+                    }
+                )
+
+            right = _capture_status_panel(
+                session=args.session,
+                faces_visible=len(results),
+                saved_count=idx,
+                object_summaries=object_summaries,
+                paused=paused,
+                continuous=args.continuous,
+                auto_capture_enabled=args.auto_capture,
+                auto_capture_status=auto_capture_message,
+                show_help=show_help,
+                capture_message=capture_msg if capture_msg and now < capture_msg_until else "",
+            )
             _show_dash(last_anno, last_reproj, right)
 
             # decide
-            k = cv2.waitKey(1) & 0xFF
-            if k in (ord('Q'), ord('X'), ord('x')): _quit_all()
+            raw_key = cv2.waitKeyEx(1) if hasattr(cv2, "waitKeyEx") else cv2.waitKey(1)
+            k = _normalize_capture_key(raw_key)
+            try:
+                if cv2.getWindowProperty("GT Capture", cv2.WND_PROP_VISIBLE) < 1:
+                    log.info("[i] GT Capture window closed.")
+                    break
+            except cv2.error:
+                log.info("[i] GT Capture window closed.")
+                break
+            if _capture_key_requests_quit(raw_key):
+                log.info("[i] Quit requested from GT Capture window.")
+                break
             if k == ord('h'): show_help = not show_help
             if k in (ord('p'), 32): paused = not paused  # pause/resume
-            if k in (27, ord('q')):  # abort current frame (skip)
-                continue
 
-            def _capture_now():
+            def _capture_now(capture_metadata: Optional[dict] = None) -> bool:
                 nonlocal idx, capture_msg, capture_msg_until, objects_seen_counts
-                if last_bgr is None: return
+                if last_bgr is None or last_ts is None or last_cov is None:
+                    return False
                 save_frame(
                     out_dir, idx, last_ts,
                     bgr_raw=last_cov,  # <- was last_anno; now the pure frame
@@ -1213,29 +1325,68 @@ def main():
                     dataset_name=args.session,
                     pts3d_by_object=pts3d_by_object,
                     anno_img=last_anno,  # <- annotated goes to its own folder
+                    capture_metadata=capture_metadata,
                 )
 
                 # update counters
                 for r in best_by_object.values():
                     objects_seen_counts[r["object"]] = objects_seen_counts.get(r["object"], 0) + 1
-                capture_msg = f"Frame #{idx:03d} captured [OK]"
+                mode = (capture_metadata or {}).get("mode", "manual")
+                reason = (capture_metadata or {}).get("reason")
+                suffix = f" {reason}" if reason else ""
+                capture_msg = f"Frame #{idx:03d} captured [{mode}]{suffix}"
                 capture_msg_until = time.time() + 2.0
                 idx += 1
+                return True
 
             if k in (13, ord('y'), ord('s')):  # accept
-                _capture_now()
+                if _capture_now({"mode": "manual_review", "trigger": "key"}):
+                    if args.auto_capture and auto_candidates:
+                        try:
+                            record_auto_capture_save(
+                                auto_capture_state,
+                                auto_candidates[0],
+                                auto_capture_config,
+                                frame_width=intr.width,
+                                frame_height=intr.height,
+                                timestamp=now,
+                            )
+                        except CollectDatasetError as exc:
+                            log.warning("[auto-capture] manual save bookkeeping skipped: %s", exc)
+            elif (
+                args.auto_capture
+                and not paused
+                and auto_capture_decision is not None
+                and auto_capture_decision.should_save
+            ):
+                if _capture_now(auto_capture_decision.metadata()):
+                    for candidate in auto_candidates:
+                        if (
+                            candidate.object_name == auto_capture_decision.trigger_object
+                            and candidate.face_key == auto_capture_decision.trigger_face
+                        ):
+                            record_auto_capture_save(
+                                auto_capture_state,
+                                candidate,
+                                auto_capture_config,
+                                frame_width=intr.width,
+                                frame_height=intr.height,
+                                timestamp=now,
+                            )
+                            break
             if args.continuous and not paused:
-                _capture_now()
+                _capture_now({"mode": "continuous"})
 
             if args.max_frames and idx >= args.max_frames:
                 log.info("[i] Reached max_frames=%d.", args.max_frames)
                 break
 
     except SystemExit as e:
-        if e.code != EXIT_QUIT_ALL:
-            log.error("Exited: %s", e)
+        log.error("Exited: %s", e)
+        raise
     except BaseException as e:
         log.error("[!] Error: %s", e, exc_info=True)
+        raise
     finally:
         # finalize session metadata
         session_meta["frames_captured"] = int(idx)
@@ -1247,7 +1398,8 @@ def main():
         except:
             pass
         cv2.destroyAllWindows()
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

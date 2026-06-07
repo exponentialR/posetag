@@ -196,6 +196,29 @@ from posetag.workflows.annotation import (
     remove_annotation_output,
     summarize_annotation_process_result,
 )
+from posetag.workflows.collect_dataset import (
+    COLLECT_PROCESS_NOT_STARTED,
+    COLLECT_SOURCE_CHOICES,
+    COLLECT_SOURCE_LABELS,
+    DEFAULT_CAMERA_INDEX as DEFAULT_DATASET_CAMERA_INDEX,
+    DEFAULT_FAMILY as DEFAULT_DATASET_FAMILY,
+    DEFAULT_FPS as DEFAULT_DATASET_FPS,
+    DEFAULT_SESSION_NAME as DEFAULT_DATASET_SESSION,
+    SOURCE_BAG as DATASET_SOURCE_BAG,
+    SOURCE_LIVE as DATASET_SOURCE_LIVE,
+    SOURCE_OPENCV as DATASET_SOURCE_OPENCV,
+    SOURCE_VIDEO as DATASET_SOURCE_VIDEO,
+    DatasetCollectionConfig,
+    DatasetCollectionProcessState,
+    DatasetCollectionReadiness,
+    build_dataset_collection_launch,
+    collect_dataset_process_failed,
+    collect_dataset_process_not_started,
+    collect_dataset_process_running,
+    inspect_dataset_collection_readiness,
+    normalize_source as normalize_dataset_source,
+    summarize_dataset_collection_process_result,
+)
 
 CAPTURE_FACE_QUEUE_LABEL = "All missing registered faces"
 MESH_PREVIEW_TOOLTIP = (
@@ -2109,6 +2132,11 @@ def build_main_window(qt: Any, project_root: Path) -> Any:
             self._annotation_process_state = annotation_process_not_started()
             self._annotation_running_expected_face_manifest: Optional[Path] = None
             self._annotation_running_mode = ANNOTATION_MODE_BROWSE
+            self._dataset_process: Any = None
+            self._dataset_process_state = collect_dataset_process_not_started()
+            self._dataset_running_expected_session_dir: Optional[Path] = None
+            self._dataset_running_previous_session_yaml_mtime_ns: Optional[int] = None
+            self._dataset_running_dry_run = False
             self._mesh_keypoint_viewer_windows: list[Any] = []
 
             self._calibration_output_timer = QtCore.QTimer(self)
@@ -4612,6 +4640,291 @@ def build_main_window(qt: Any, project_root: Path) -> Any:
             annotation_layout.addLayout(annotation_options)
             annotation_layout.addLayout(annotation_body)
 
+            self._dataset_card = QtWidgets.QFrame()
+            self._dataset_card.setObjectName("ActionCard")
+            dataset_layout = QtWidgets.QVBoxLayout(self._dataset_card)
+            dataset_layout.setContentsMargins(14, 12, 14, 12)
+            dataset_layout.setSpacing(9)
+
+            self._dataset_session = QtWidgets.QLineEdit(DEFAULT_DATASET_SESSION)
+            self._dataset_session.setPlaceholderText("run01")
+            self._dataset_session.textChanged.connect(
+                self._update_dataset_collection_flow
+            )
+
+            self._dataset_source = QtWidgets.QComboBox()
+            for source in COLLECT_SOURCE_CHOICES:
+                self._dataset_source.addItem(COLLECT_SOURCE_LABELS[source], source)
+            self._dataset_source.setCurrentText(COLLECT_SOURCE_LABELS[DATASET_SOURCE_OPENCV])
+            self._dataset_source.currentIndexChanged.connect(
+                lambda _index: self._update_dataset_collection_flow()
+            )
+
+            self._dataset_camera_index = _make_int_spin(
+                0,
+                99,
+                DEFAULT_DATASET_CAMERA_INDEX,
+            )
+            self._dataset_camera_index.valueChanged.connect(
+                self._update_dataset_collection_flow
+            )
+
+            self._dataset_video_path = QtWidgets.QLineEdit()
+            self._dataset_video_path.setPlaceholderText("Video path for source=video")
+            dataset_video_browse_button = QtWidgets.QPushButton("Browse")
+            dataset_video_browse_button.clicked.connect(self._browse_dataset_video)
+            self._dataset_video_browse_button = dataset_video_browse_button
+            dataset_video_row = QtWidgets.QHBoxLayout()
+            dataset_video_row.setContentsMargins(0, 0, 0, 0)
+            dataset_video_row.addWidget(self._dataset_video_path, 1)
+            dataset_video_row.addWidget(dataset_video_browse_button)
+            dataset_video_widget = QtWidgets.QWidget()
+            dataset_video_widget.setLayout(dataset_video_row)
+
+            self._dataset_bag_path = QtWidgets.QLineEdit()
+            self._dataset_bag_path.setPlaceholderText("RealSense .bag path")
+            dataset_bag_browse_button = QtWidgets.QPushButton("Browse")
+            dataset_bag_browse_button.clicked.connect(self._browse_dataset_bag)
+            self._dataset_bag_browse_button = dataset_bag_browse_button
+            dataset_bag_row = QtWidgets.QHBoxLayout()
+            dataset_bag_row.setContentsMargins(0, 0, 0, 0)
+            dataset_bag_row.addWidget(self._dataset_bag_path, 1)
+            dataset_bag_row.addWidget(dataset_bag_browse_button)
+            dataset_bag_widget = QtWidgets.QWidget()
+            dataset_bag_widget.setLayout(dataset_bag_row)
+
+            self._dataset_calibration_path = QtWidgets.QLineEdit()
+            self._dataset_calibration_path.setPlaceholderText(
+                "Default: <project_root>/calib/calib_color.yaml"
+            )
+            dataset_calib_browse_button = QtWidgets.QPushButton("Browse")
+            dataset_calib_browse_button.clicked.connect(
+                self._browse_dataset_calibration
+            )
+            dataset_calib_row = QtWidgets.QHBoxLayout()
+            dataset_calib_row.setContentsMargins(0, 0, 0, 0)
+            dataset_calib_row.addWidget(self._dataset_calibration_path, 1)
+            dataset_calib_row.addWidget(dataset_calib_browse_button)
+            dataset_calib_widget = QtWidgets.QWidget()
+            dataset_calib_widget.setLayout(dataset_calib_row)
+
+            self._dataset_registry_path = QtWidgets.QLineEdit()
+            self._dataset_registry_path.setPlaceholderText(
+                "Default: <project_root>/boards/tag_registry.yaml"
+            )
+            self._dataset_face_manifest_path = QtWidgets.QLineEdit()
+            self._dataset_face_manifest_path.setPlaceholderText(
+                "Default: <project_root>/faces/face_manifest.csv"
+            )
+            self._dataset_family = QtWidgets.QLineEdit(DEFAULT_DATASET_FAMILY)
+            self._dataset_family.setPlaceholderText(DEFAULT_DATASET_FAMILY)
+            self._dataset_smart_auto = QtWidgets.QCheckBox("Smart auto-capture")
+            self._dataset_smart_auto.setChecked(True)
+            self._dataset_continuous = QtWidgets.QCheckBox("Continuous capture")
+            self._dataset_save_depth = QtWidgets.QCheckBox("Save depth")
+            self._dataset_max_frames = _make_int_spin(0, 1000000, 0)
+            self._dataset_max_frames.setSpecialValueText("unlimited")
+            self._dataset_auto_stable_frames = _make_int_spin(1, 120, 5)
+            self._dataset_auto_cooldown = _make_float_spin(0.0, 60.0, 1.0, " s")
+            self._dataset_auto_cooldown.setSingleStep(0.25)
+            for field in (
+                self._dataset_video_path,
+                self._dataset_bag_path,
+                self._dataset_calibration_path,
+                self._dataset_registry_path,
+                self._dataset_face_manifest_path,
+                self._dataset_family,
+            ):
+                field.textChanged.connect(self._update_dataset_collection_flow)
+            for checkbox in (
+                self._dataset_smart_auto,
+                self._dataset_continuous,
+                self._dataset_save_depth,
+            ):
+                checkbox.toggled.connect(
+                    lambda _checked: self._update_dataset_collection_flow()
+                )
+            self._dataset_max_frames.valueChanged.connect(
+                self._update_dataset_collection_flow
+            )
+            self._dataset_auto_stable_frames.valueChanged.connect(
+                self._update_dataset_collection_flow
+            )
+            self._dataset_auto_cooldown.valueChanged.connect(
+                self._update_dataset_collection_flow
+            )
+
+            dataset_title = QtWidgets.QLabel("Dataset collection")
+            dataset_title.setObjectName("CardTitle")
+            self._dataset_dry_run_button = QtWidgets.QPushButton("Dry Run")
+            self._dataset_dry_run_button.setObjectName("SecondaryActionButton")
+            self._dataset_dry_run_button.clicked.connect(
+                lambda: self._run_dataset_collection(dry_run=True)
+            )
+            self._dataset_run_button = QtWidgets.QPushButton("Start Collection")
+            self._dataset_run_button.setObjectName("PrimaryActionButton")
+            self._dataset_run_button.clicked.connect(
+                lambda: self._run_dataset_collection(dry_run=False)
+            )
+            dataset_refresh_button = QtWidgets.QPushButton("Refresh Status")
+            dataset_refresh_button.setObjectName("SecondaryActionButton")
+            dataset_refresh_button.clicked.connect(self._refresh)
+            dataset_title_row = QtWidgets.QHBoxLayout()
+            dataset_title_row.setContentsMargins(0, 0, 0, 0)
+            dataset_title_row.setSpacing(8)
+            dataset_title_row.addWidget(dataset_title)
+            dataset_title_row.addStretch(1)
+            dataset_title_row.addWidget(self._dataset_dry_run_button)
+            dataset_title_row.addWidget(self._dataset_run_button)
+            dataset_title_row.addWidget(dataset_refresh_button)
+
+            dataset_note = QtWidgets.QLabel(
+                "Run the existing posetag-collect workflow to detect visible "
+                "boards, select object faces, compose T_cam_object, and save "
+                "pose-labelled dataset frames."
+            )
+            dataset_note.setObjectName("MutedText")
+            dataset_note.setWordWrap(True)
+
+            dataset_grid = QtWidgets.QGridLayout()
+            dataset_grid.setContentsMargins(0, 0, 0, 0)
+            dataset_grid.setHorizontalSpacing(10)
+            dataset_grid.setVerticalSpacing(8)
+            dataset_grid.addWidget(_make_field("Session", self._dataset_session), 0, 0)
+            dataset_grid.addWidget(_make_field("Source", self._dataset_source), 0, 1)
+            self._dataset_camera_field = _make_field(
+                "Camera index",
+                self._dataset_camera_index,
+            )
+            self._dataset_video_field = _make_field("Video path", dataset_video_widget)
+            self._dataset_bag_field = _make_field("Bag path", dataset_bag_widget)
+            dataset_grid.addWidget(self._dataset_camera_field, 1, 0)
+            dataset_grid.addWidget(self._dataset_video_field, 1, 0, 1, 2)
+            dataset_grid.addWidget(self._dataset_bag_field, 1, 0, 1, 2)
+            dataset_grid.addWidget(
+                _make_field("Calibration YAML", dataset_calib_widget),
+                2,
+                0,
+                1,
+                2,
+            )
+            dataset_grid.setColumnStretch(0, 1)
+            dataset_grid.setColumnStretch(1, 1)
+
+            dataset_advanced_widget = QtWidgets.QWidget()
+            dataset_advanced_grid = QtWidgets.QGridLayout(dataset_advanced_widget)
+            dataset_advanced_grid.setContentsMargins(0, 0, 0, 0)
+            dataset_advanced_grid.setHorizontalSpacing(10)
+            dataset_advanced_grid.setVerticalSpacing(8)
+            dataset_advanced_grid.addWidget(
+                _make_field("Tag registry", self._dataset_registry_path),
+                0,
+                0,
+                1,
+                2,
+            )
+            dataset_advanced_grid.addWidget(
+                _make_field("Face manifest", self._dataset_face_manifest_path),
+                1,
+                0,
+                1,
+                2,
+            )
+            dataset_advanced_grid.addWidget(
+                _make_field("AprilTag family", self._dataset_family),
+                2,
+                0,
+            )
+            dataset_advanced_grid.addWidget(
+                _make_field("Max frames", self._dataset_max_frames),
+                2,
+                1,
+            )
+            dataset_advanced_grid.addWidget(self._dataset_smart_auto, 3, 0)
+            dataset_advanced_grid.addWidget(self._dataset_continuous, 3, 1)
+            dataset_advanced_grid.addWidget(
+                _make_field("Auto stable frames", self._dataset_auto_stable_frames),
+                4,
+                0,
+            )
+            dataset_advanced_grid.addWidget(
+                _make_field("Auto cooldown", self._dataset_auto_cooldown),
+                4,
+                1,
+            )
+            dataset_advanced_grid.addWidget(self._dataset_save_depth, 5, 0)
+            dataset_advanced_grid.setColumnStretch(0, 1)
+            dataset_advanced_grid.setColumnStretch(1, 1)
+            dataset_advanced_group = _make_collapsible_group(
+                "Advanced Inputs And Capture",
+                dataset_advanced_widget,
+                checked=False,
+            )
+
+            self._dataset_readiness = QtWidgets.QLabel()
+            self._dataset_readiness.setObjectName("OutputText")
+            self._dataset_readiness.setWordWrap(True)
+            self._dataset_readiness.setTextInteractionFlags(
+                QtCore.Qt.TextInteractionFlag.TextSelectableByMouse
+            )
+            self._dataset_outputs = QtWidgets.QLabel()
+            self._dataset_outputs.setObjectName("OutputText")
+            self._dataset_outputs.setWordWrap(True)
+            self._dataset_outputs.setTextInteractionFlags(
+                QtCore.Qt.TextInteractionFlag.TextSelectableByMouse
+            )
+            self._dataset_process_state_label = QtWidgets.QLabel()
+            self._dataset_process_state_label.setObjectName("OutputText")
+            self._dataset_process_state_label.setWordWrap(True)
+            self._dataset_process_state_label.setTextInteractionFlags(
+                QtCore.Qt.TextInteractionFlag.TextSelectableByMouse
+            )
+            self._dataset_log = QtWidgets.QPlainTextEdit()
+            self._dataset_log.setObjectName("CalibrationLog")
+            self._dataset_log.setReadOnly(True)
+            self._dataset_log.setMaximumHeight(92)
+            self._dataset_log.setPlaceholderText(
+                "Dataset collection stdout/stderr will appear here after launch."
+            )
+            self._dataset_log.document().setMaximumBlockCount(250)
+
+            dataset_summary_grid = QtWidgets.QGridLayout()
+            dataset_summary_grid.setContentsMargins(0, 0, 0, 0)
+            dataset_summary_grid.setHorizontalSpacing(10)
+            dataset_summary_grid.setVerticalSpacing(8)
+            dataset_summary_grid.addWidget(
+                _make_field("Readiness", self._dataset_readiness),
+                0,
+                0,
+            )
+            dataset_summary_grid.addWidget(
+                _make_field("Expected outputs", self._dataset_outputs),
+                0,
+                1,
+            )
+            dataset_summary_grid.addWidget(
+                _make_field("Process state", self._dataset_process_state_label),
+                1,
+                0,
+                1,
+                2,
+            )
+            dataset_summary_grid.addWidget(
+                _make_field("Process log", self._dataset_log),
+                2,
+                0,
+                1,
+                2,
+            )
+            dataset_summary_grid.setColumnStretch(0, 1)
+            dataset_summary_grid.setColumnStretch(1, 1)
+
+            dataset_layout.addLayout(dataset_title_row)
+            dataset_layout.addWidget(dataset_note)
+            dataset_layout.addLayout(dataset_grid)
+            dataset_layout.addWidget(dataset_advanced_group)
+            dataset_layout.addLayout(dataset_summary_grid)
+
             detail_content = QtWidgets.QWidget()
             detail_content_layout = QtWidgets.QVBoxLayout(detail_content)
             detail_content_layout.setContentsMargins(0, 0, 0, 0)
@@ -4619,6 +4932,7 @@ def build_main_window(qt: Any, project_root: Path) -> Any:
             detail_content_layout.addLayout(title_row)
             detail_content_layout.addWidget(self._message_label)
             detail_content_layout.addWidget(self._annotation_card)
+            detail_content_layout.addWidget(self._dataset_card)
             detail_content_layout.addLayout(cards_grid)
             detail_content_layout.addWidget(self._charuco_card)
             detail_content_layout.addWidget(self._calibration_card)
@@ -4945,6 +5259,44 @@ def build_main_window(qt: Any, project_root: Path) -> Any:
             )
             if selected:
                 self._capture_face_video_path.setText(selected)
+
+        def _browse_dataset_calibration(self) -> None:
+            current = self._dataset_calibration_path.text().strip()
+            start_path = current or str(
+                self._current_project_root() / "calib" / "calib_color.yaml"
+            )
+            selected, _ = QtWidgets.QFileDialog.getOpenFileName(
+                self,
+                "Select dataset calibration YAML",
+                start_path,
+                "YAML files (*.yaml *.yml);;All files (*)",
+            )
+            if selected:
+                self._dataset_calibration_path.setText(selected)
+
+        def _browse_dataset_video(self) -> None:
+            current = self._dataset_video_path.text().strip()
+            start_path = current or str(self._current_project_root())
+            selected, _ = QtWidgets.QFileDialog.getOpenFileName(
+                self,
+                "Select dataset video",
+                start_path,
+                "Video files (*.mp4 *.mov *.avi *.mkv);;All files (*)",
+            )
+            if selected:
+                self._dataset_video_path.setText(selected)
+
+        def _browse_dataset_bag(self) -> None:
+            current = self._dataset_bag_path.text().strip()
+            start_path = current or str(self._current_project_root())
+            selected, _ = QtWidgets.QFileDialog.getOpenFileName(
+                self,
+                "Select RealSense bag",
+                start_path,
+                "RealSense bag files (*.bag);;All files (*)",
+            )
+            if selected:
+                self._dataset_bag_path.setText(selected)
 
         def _browse_capture_face_output_dir(self) -> None:
             current = self._capture_face_out_dir.text().strip()
@@ -5685,6 +6037,7 @@ def build_main_window(qt: Any, project_root: Path) -> Any:
             self._capture_face_card.setVisible(model.stage_id == 5)
             self._mesh_keypoints_card.setVisible(model.stage_id == 6)
             self._annotation_card.setVisible(model.stage_id == 7)
+            self._dataset_card.setVisible(model.stage_id == 8)
             if model.stage_id == 2:
                 self._sync_calibration_from_project_metadata()
                 self._update_calibration_flow()
@@ -5699,6 +6052,8 @@ def build_main_window(qt: Any, project_root: Path) -> Any:
                 self._update_mesh_keypoint_flow()
             if model.stage_id == 7:
                 self._update_annotation_flow()
+            if model.stage_id == 8:
+                self._update_dataset_collection_flow()
             self._render_side_panel_calibration_result()
             self._render_stage_rail_selection()
 
@@ -5803,6 +6158,7 @@ def build_main_window(qt: Any, project_root: Path) -> Any:
             self._capture_face_card.setVisible(False)
             self._mesh_keypoints_card.setVisible(False)
             self._annotation_card.setVisible(False)
+            self._dataset_card.setVisible(False)
             self._render_health()
 
         def _render_stage_rail_selection(self) -> None:
@@ -6201,6 +6557,60 @@ def build_main_window(qt: Any, project_root: Path) -> Any:
             )
             self._copy_feedback.setText(
                 _annotation_command_ready_message(
+                    readiness,
+                    stage_complete=model.status == "complete",
+                )
+            )
+
+        def _update_dataset_collection_flow(self) -> None:
+            if not hasattr(self, "_dataset_readiness"):
+                return
+
+            self._render_dataset_source_fields()
+            readiness = inspect_dataset_collection_readiness(
+                self._dataset_collection_config()
+            )
+            self._dataset_readiness.setText(
+                _format_dataset_collection_readiness(readiness)
+            )
+            self._dataset_outputs.setText(
+                _format_dataset_collection_outputs(readiness)
+            )
+            if (
+                self._dataset_process_state.state
+                == COLLECT_PROCESS_NOT_STARTED
+            ):
+                self._set_dataset_collection_process_state(
+                    collect_dataset_process_not_started(
+                        readiness.expected_session_dir,
+                    )
+                )
+            process_running = self._dataset_collection_process_is_running()
+            self._dataset_dry_run_button.setEnabled(
+                readiness.ready and not process_running
+            )
+            self._dataset_run_button.setEnabled(
+                readiness.ready and not process_running
+            )
+            self._dataset_run_button.setText(
+                _dataset_collection_run_button_label(
+                    self._dataset_process_state
+                )
+            )
+
+            model = self._model_by_stage_id(self._selected_stage_id)
+            if model is None or model.stage_id != 8:
+                return
+
+            command_preview = readiness.command_preview
+            self._command_preview.setText(command_preview)
+            self._command_preview.setCursorPosition(0)
+            self._copy_button.setEnabled(bool(command_preview))
+            self._command_note.setText(
+                _dataset_collection_command_card_note(readiness, model)
+            )
+            self._copy_feedback.setText(
+                _dataset_collection_command_ready_message(
                     readiness,
                     stage_complete=model.status == "complete",
                 )
@@ -7726,6 +8136,196 @@ def build_main_window(qt: Any, project_root: Path) -> Any:
                 return False
             return process.state() != QtCore.QProcess.ProcessState.NotRunning
 
+        def _run_dataset_collection(self, *, dry_run: bool = False) -> None:
+            if self._dataset_collection_process_is_running():
+                message = "Dataset collection is already running."
+                self.statusBar().showMessage(message, 3000)
+                return
+
+            config = self._dataset_collection_config()
+            readiness = inspect_dataset_collection_readiness(config)
+            if not readiness.ready:
+                message = (
+                    "Resolve dataset collection readiness messages before "
+                    "running."
+                )
+                self._copy_feedback.setText(message)
+                self.statusBar().showMessage(message, 5000)
+                self._update_dataset_collection_flow()
+                return
+
+            try:
+                launch = build_dataset_collection_launch(config, dry_run=dry_run)
+            except Exception as exc:
+                message = f"Could not prepare dataset collection launch: {exc}"
+                self._set_dataset_collection_process_state(
+                    collect_dataset_process_failed(
+                        message,
+                        expected_session_dir=readiness.expected_session_dir,
+                        dry_run=dry_run,
+                    )
+                )
+                self._append_dataset_collection_log(f"[gui] {message}")
+                self.statusBar().showMessage(message, 6000)
+                self._update_dataset_collection_flow()
+                return
+
+            process = QtCore.QProcess(self)
+            process.setProgram(launch.program)
+            process.setArguments(list(launch.arguments))
+            process.setProcessChannelMode(
+                QtCore.QProcess.ProcessChannelMode.SeparateChannels
+            )
+            if hasattr(QtCore, "QProcessEnvironment"):
+                env = QtCore.QProcessEnvironment.systemEnvironment()
+                env.insert("PYTHONUNBUFFERED", "1")
+                env.insert("POSETAG_PROJECT", str(launch.project_root))
+                process.setProcessEnvironment(env)
+            process.readyReadStandardOutput.connect(
+                self._read_dataset_collection_stdout
+            )
+            process.readyReadStandardError.connect(
+                self._read_dataset_collection_stderr
+            )
+            process.finished.connect(self._dataset_collection_process_finished)
+            process.errorOccurred.connect(self._dataset_collection_process_error)
+
+            self._dataset_process = process
+            self._dataset_running_expected_session_dir = (
+                launch.expected_session_dir
+            )
+            self._dataset_running_previous_session_yaml_mtime_ns = _path_mtime_ns(
+                launch.expected_session_dir / "session.yaml"
+            )
+            self._dataset_running_dry_run = bool(dry_run)
+            self._dataset_log.clear()
+            self._append_dataset_collection_log(f"$ {launch.display_command}")
+            self._append_dataset_collection_log(
+                "[gui] Launching with the current Python interpreter."
+            )
+            if dry_run:
+                self._append_dataset_collection_log(
+                    "[gui] Dry-run validates inputs and exits without opening "
+                    "a camera or writing dataset outputs."
+                )
+            else:
+                self._append_dataset_collection_log(
+                    "[gui] Use the GT Capture OpenCV window to review and "
+                    "accept frames. ENTER/y/s saves, q or ESC skips, Q exits."
+                )
+            self._set_dataset_collection_process_state(
+                collect_dataset_process_running(
+                    launch.expected_session_dir,
+                    dry_run=dry_run,
+                )
+            )
+            self._update_dataset_collection_flow()
+            process.start()
+            message = (
+                "Dataset collection dry-run started."
+                if dry_run
+                else "Dataset collection process started."
+            )
+            self.statusBar().showMessage(message, 4000)
+
+        def _read_dataset_collection_stdout(self) -> None:
+            process = self._dataset_process
+            if process is None:
+                return
+            self._append_dataset_collection_output(
+                process.readAllStandardOutput(),
+                "",
+            )
+
+        def _read_dataset_collection_stderr(self) -> None:
+            process = self._dataset_process
+            if process is None:
+                return
+            self._append_dataset_collection_output(
+                process.readAllStandardError(),
+                "stderr",
+            )
+
+        def _dataset_collection_process_finished(
+            self,
+            exit_code: int,
+            exit_status: Any,
+        ) -> None:
+            self._read_dataset_collection_stdout()
+            self._read_dataset_collection_stderr()
+            crashed = exit_status == QtCore.QProcess.ExitStatus.CrashExit
+            state = summarize_dataset_collection_process_result(
+                exit_code=int(exit_code),
+                crashed=crashed,
+                expected_session_dir=self._dataset_running_expected_session_dir,
+                previous_session_yaml_mtime_ns=(
+                    self._dataset_running_previous_session_yaml_mtime_ns
+                ),
+                require_output_update=not self._dataset_running_dry_run,
+                dry_run=self._dataset_running_dry_run,
+            )
+            self._dataset_process = None
+            self._set_dataset_collection_process_state(state)
+            self._append_dataset_collection_log(f"[gui] {state.message}")
+            self._refresh()
+            self.statusBar().showMessage(state.message, 7000)
+
+        def _dataset_collection_process_error(self, error: Any) -> None:
+            process = self._dataset_process
+            error_name = _qt_enum_name(error)
+            detail = process.errorString() if process is not None else error_name
+            self._append_dataset_collection_log(f"[gui] Process error: {detail}")
+            failed_to_start = QtCore.QProcess.ProcessError.FailedToStart
+            if error != failed_to_start:
+                return
+
+            state = collect_dataset_process_failed(
+                f"Dataset collection process failed to start: {detail}",
+                expected_session_dir=self._dataset_running_expected_session_dir,
+                dry_run=self._dataset_running_dry_run,
+            )
+            self._dataset_process = None
+            self._set_dataset_collection_process_state(state)
+            self._update_dataset_collection_flow()
+            self.statusBar().showMessage(state.message, 7000)
+
+        def _append_dataset_collection_output(self, data: Any, prefix: str) -> None:
+            text = bytes(data).decode("utf-8", errors="replace")
+            if not text:
+                return
+            if prefix:
+                for line in text.rstrip().splitlines():
+                    self._append_dataset_collection_log(f"[{prefix}] {line}")
+            else:
+                self._append_dataset_collection_log(text.rstrip())
+
+        def _append_dataset_collection_log(self, text: str) -> None:
+            if not text:
+                return
+            self._dataset_log.appendPlainText(text)
+            scrollbar = self._dataset_log.verticalScrollBar()
+            scrollbar.setValue(scrollbar.maximum())
+
+        def _set_dataset_collection_process_state(
+            self,
+            state: DatasetCollectionProcessState,
+        ) -> None:
+            self._dataset_process_state = state
+            if hasattr(self, "_dataset_process_state_label"):
+                self._dataset_process_state_label.setText(
+                    _format_dataset_collection_process_state(state)
+                )
+            if hasattr(self, "_dataset_run_button"):
+                self._dataset_run_button.setText(
+                    _dataset_collection_run_button_label(state)
+                )
+
+        def _dataset_collection_process_is_running(self) -> bool:
+            process = self._dataset_process
+            if process is None:
+                return False
+            return process.state() != QtCore.QProcess.ProcessState.NotRunning
+
         def _run_calibration(self) -> None:
             if self._calibration_process_is_running():
                 message = "Calibration is already running."
@@ -7959,6 +8559,19 @@ def build_main_window(qt: Any, project_root: Path) -> Any:
             ):
                 field.setEnabled(uses_capture_size)
 
+        def _render_dataset_source_fields(self) -> None:
+            source = self._dataset_source_value()
+            is_webcam = source == DATASET_SOURCE_OPENCV
+            is_video = source == DATASET_SOURCE_VIDEO
+            is_bag = source == DATASET_SOURCE_BAG
+            self._dataset_camera_field.setVisible(is_webcam)
+            self._dataset_video_field.setVisible(is_video)
+            self._dataset_bag_field.setVisible(is_bag)
+            self._dataset_video_path.setEnabled(is_video)
+            self._dataset_video_browse_button.setEnabled(is_video)
+            self._dataset_bag_path.setEnabled(is_bag)
+            self._dataset_bag_browse_button.setEnabled(is_bag)
+
         def _render_board_save_shot_fields(self) -> None:
             save_shot = bool(self._board_save_shot.isChecked())
             self._board_shots_field.setVisible(save_shot)
@@ -8107,6 +8720,35 @@ def build_main_window(qt: Any, project_root: Path) -> Any:
                 exit_when_complete=capture_all or bool(queue_faces),
             )
 
+        def _dataset_collection_config(self) -> DatasetCollectionConfig:
+            calib_text = self._dataset_calibration_path.text().strip()
+            registry_text = self._dataset_registry_path.text().strip()
+            face_manifest_text = self._dataset_face_manifest_path.text().strip()
+            video_text = self._dataset_video_path.text().strip()
+            bag_text = self._dataset_bag_path.text().strip()
+            return DatasetCollectionConfig(
+                project_root=self._current_project_root(),
+                session=self._dataset_session.text().strip(),
+                mode=self._dataset_source_value(),
+                camera_index=int(self._dataset_camera_index.value()),
+                video_path=Path(video_text).expanduser() if video_text else None,
+                bag_path=Path(bag_text).expanduser() if bag_text else None,
+                calib_path=Path(calib_text).expanduser() if calib_text else None,
+                registry_path=Path(registry_text).expanduser()
+                if registry_text
+                else None,
+                face_manifest_path=Path(face_manifest_text).expanduser()
+                if face_manifest_text
+                else None,
+                family=self._dataset_family.text().strip() or DEFAULT_DATASET_FAMILY,
+                continuous=bool(self._dataset_continuous.isChecked()),
+                auto_capture=bool(self._dataset_smart_auto.isChecked()),
+                auto_stable_frames=int(self._dataset_auto_stable_frames.value()),
+                auto_cooldown_sec=float(self._dataset_auto_cooldown.value()),
+                max_frames=int(self._dataset_max_frames.value()),
+                save_depth=bool(self._dataset_save_depth.isChecked()),
+            )
+
         def _object_tag_id_mode_value(self) -> str:
             data = self._object_tags_id_mode.currentData()
             raw = str(data if data is not None else self._object_tags_id_mode.currentText())
@@ -8133,6 +8775,18 @@ def build_main_window(qt: Any, project_root: Path) -> Any:
                 return normalize_capture_source(raw)
             except Exception:
                 return CAPTURE_SOURCE_OPENCV
+
+        def _dataset_source_value(self) -> str:
+            data = self._dataset_source.currentData()
+            raw = str(
+                data
+                if data is not None
+                else self._dataset_source.currentText()
+            )
+            try:
+                return normalize_dataset_source(raw)
+            except Exception:
+                return DATASET_SOURCE_OPENCV
 
         def _model_by_stage_id(self, stage_id: int) -> Optional[StageViewModel]:
             for model in self._models:
@@ -8624,6 +9278,76 @@ def _format_annotation_process_state(
     return "\n".join(lines)
 
 
+def _format_dataset_collection_readiness(
+    readiness: DatasetCollectionReadiness,
+) -> str:
+    lines = [
+        (
+            "Ready to collect pose-labelled dataset frames."
+            if readiness.ready
+            else "Not ready yet."
+        )
+    ]
+    summary = readiness.input_summary
+    if summary is not None:
+        lines.extend(["", f"Annotation inputs: {len(summary.annotations)}"])
+        if summary.missing_keypoints:
+            lines.append(
+                f"Optional keypoints missing: {len(summary.missing_keypoints)}"
+            )
+    if readiness.errors:
+        lines.extend(["", "Errors", *_format_items(readiness.errors)])
+    if readiness.warnings:
+        lines.extend(["", "Warnings", *_format_items(readiness.warnings)])
+    return "\n".join(lines)
+
+
+def _format_dataset_collection_outputs(
+    readiness: DatasetCollectionReadiness,
+) -> str:
+    session = readiness.expected_session_dir
+    annotation_dir = session / "annotations"
+    lines = [
+        "Calibration YAML",
+        _display_path(readiness.calibration_path),
+        f"Status: {'present' if readiness.calibration_path.exists() else 'missing'}",
+        "",
+        "Tag registry",
+        _display_path(readiness.registry_path),
+        f"Status: {'present' if readiness.registry_path.exists() else 'missing'}",
+        "",
+        "Face manifest",
+        _display_path(readiness.face_manifest_path),
+        f"Status: {'present' if readiness.face_manifest_path.exists() else 'missing'}",
+        "",
+        "Expected session",
+        _display_path(session),
+        f"Session metadata: {'present' if (session / 'session.yaml').exists() else 'missing'}",
+    ]
+    if annotation_dir.exists():
+        count = len(tuple(annotation_dir.glob("*.json")))
+        lines.append(f"Pose annotation JSON files: {count}")
+    return "\n".join(lines)
+
+
+def _format_dataset_collection_process_state(
+    state: DatasetCollectionProcessState,
+) -> str:
+    lines = [state.label, "", state.message]
+    if state.expected_session_dir is not None:
+        lines.extend(
+            [
+                "",
+                f"Expected session: {_display_path(state.expected_session_dir)}",
+            ]
+        )
+    if state.dry_run:
+        lines.append("Mode: dry-run")
+    if state.exit_code is not None:
+        lines.append(f"Exit code: {state.exit_code}")
+    return "\n".join(lines)
+
+
 def _annotation_queue_item_label(label: str, *, annotated: bool) -> str:
     marker = "[x]" if annotated else "[ ]"
     status = "annotated" if annotated else "missing"
@@ -8894,6 +9618,16 @@ def _annotation_run_button_label(state: AnnotationProcessState) -> str:
     if state.success:
         return "Open Annotator Again"
     return "Open Annotator"
+
+
+def _dataset_collection_run_button_label(
+    state: DatasetCollectionProcessState,
+) -> str:
+    if state.running:
+        return "Collection Running..."
+    if state.success:
+        return "Start Collection Again"
+    return "Start Collection"
 
 
 def _qt_enum_name(value: Any) -> str:
@@ -9294,6 +10028,41 @@ def _annotation_command_ready_message(
     return "Ready to open the annotator, dry-run, run batch, or copy the command."
 
 
+def _dataset_collection_command_card_note(
+    readiness: DatasetCollectionReadiness,
+    model: StageViewModel,
+) -> str:
+    if not readiness.ready:
+        return (
+            "Resolve the dataset collection readiness messages above before "
+            "running posetag-collect."
+        )
+    if model.status == "complete":
+        return (
+            "Dataset session outputs already pass the current checks. Start "
+            "collection again only if you need another pose-labelled session."
+        )
+    return (
+        "Dry Run validates collection inputs without opening a camera. Start "
+        "Collection launches the existing posetag-collect workflow with the "
+        "selected review, smart auto-capture, or continuous policy and "
+        "POSETAG_PROJECT set for this project; Copy Command keeps the terminal "
+        "fallback."
+    )
+
+
+def _dataset_collection_command_ready_message(
+    readiness: DatasetCollectionReadiness,
+    *,
+    stage_complete: bool = False,
+) -> str:
+    if not readiness.ready:
+        return "No runnable dataset collection command is available yet."
+    if stage_complete:
+        return "Dataset outputs exist. Copy only if you need to run another session."
+    return "Ready to dry-run, start collection, or copy the command."
+
+
 def _project_root_hint(root: Path) -> str:
     if root.is_dir():
         return (
@@ -9302,7 +10071,8 @@ def _project_root_hint(root: Path) -> str:
             "3 object tag generation. Stage 4 can launch the existing "
             "board-building workflow, and Stage 5 can open guided face-shot "
             "capture. Stage 6 can stage OBJ mesh inputs and preview "
-            "mesh-keypoint generation before Stage 7 launches annotation."
+            "mesh-keypoint generation before Stage 7 launches annotation. "
+            "Stage 8 can launch dataset collection."
         )
     if root.exists():
         return "Selected path exists but is not a folder."

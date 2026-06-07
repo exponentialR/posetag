@@ -162,7 +162,11 @@ coverage, such as moving the board toward missing frame edges/corners or
 changing distance. Guided auto-capture saves good frames as the board covers
 the grid, while `SPACE` remains available as a manual override. The GUI does
 not reimplement AprilTag rendering, calibration solving, board-frame math,
-board YAML schemas, registry writing, annotation, or dataset workflows.
+board YAML schemas, registry writing, annotation, or dataset writing. In Stage
+8 it can dry-run and launch the existing `posetag-collect` workflow with a
+session name and OpenCV/RealSense/video/bag source settings; the separate
+capture/review window still owns frame acceptance and pose-labelled output
+writing.
 
 ## Scientific Contract
 
@@ -855,40 +859,72 @@ Detailed Step 5 notes: `docs/workflows/step5_annotate_faces.md`.
 
 ### 6) Collect a ground-truth dataset (multi-object / multi-face)
 
-Live RealSense, RealSense `.bag`, or any OpenCV-readable video. For each frame:
+OpenCV webcam, live RealSense, RealSense `.bag`, or any OpenCV-readable video.
+For each frame:
 
 - detect tags once, even when faces use mixed tag sizes
 - choose the best visible face per object
 - compose `T_cam_object = T_cam_board @ T_board_object`
-- review annotated, reprojection, and status panels before saving
+- save either by manual review, quality-gated smart auto-capture, or the crude
+  legacy continuous mode
 
-**Live (RGB, optional aligned depth)**
+Preflight without opening a camera or writing dataset outputs:
 
 ```bash
-posetag-collect --mode live --session run01 --calib calib_color.yaml --rs_w 640 --rs_h 480 --rs_fps 30
+posetag-collect --project_root my_project --mode opencv --session run01 --dry-run
+```
+
+In the GUI, open Stage 8 and use **Dry Run** for the same input/schema
+preflight, then **Start Collection** to launch the existing `posetag-collect`
+workflow. The dashboard defaults to smart auto-capture, streams process output,
+and refreshes project status after the process exits; it does not reimplement
+pose estimation or dataset writing.
+
+Required inputs are `calib/calib_color.yaml`, `boards/tag_registry.yaml`, board
+YAMLs referenced by the registry, `faces/face_manifest.csv`, and annotation
+YAMLs containing `T_board_object`. `objects/<object>/keypoints.json` is
+optional; when present it improves bounding boxes and review metadata.
+
+**OpenCV webcam**
+
+```bash
+posetag-collect --mode opencv --cam 0 --session run01 --calib calib_color.yaml --auto-capture
+```
+
+Smart auto-capture waits for stable object pose, minimum detection quality,
+cooldown, and a useful new view before saving. It considers visible tag count,
+bbox area, optional tag-scale diagnostics, image coverage grid cells, distance
+bins, and pose deltas. `ENTER` / `y` / `s` still force-save the current frame.
+Use `--continuous` only when you explicitly want the old save-every-frame
+behavior.
+
+**Live RealSense (RGB, optional aligned depth)**
+
+```bash
+posetag-collect --mode live --session run02 --calib calib_color.yaml --rs_w 640 --rs_h 480 --rs_fps 30
 # add --save_depth to save aligned depth .npy per accepted frame
 ```
 
 **Playback from `.bag`**
 
 ```bash
-posetag-collect --mode bag --bag path/to/rec.bag --session run02 --calib calib_color.yaml
+posetag-collect --mode bag --bag path/to/rec.bag --session run03 --calib calib_color.yaml
 ```
 
 **Any video**
 
 ```bash
-posetag-collect --mode video --video sample.mp4 --session run03 --calib calib_color.yaml
+posetag-collect --mode video --video sample.mp4 --session run04 --calib calib_color.yaml
 ```
 
 **Keys**
 
-- `ENTER` / `y` / `s`: accept and save current view
+- `ENTER` / `y` / `s`: accept and save current view, or force-save in smart mode
 - `SPACE` / `p`: pause or resume
 - `r` / `n` / `BACKSPACE`: reject or skip frame
 - `h`: toggle help
-- `ESC` / `q`: abort current frame
-- `Q` / `X`: quit all
+- `ESC` / `q` / `Q`: close capture cleanly
+- `x` / `X`: close capture cleanly
 
 Important: the stream resolution must match `calib_color.yaml`
 (`image_width` / `image_height`). Use `--rs_w` / `--rs_h` or recalibrate.
@@ -930,6 +966,11 @@ saved objects.
   "annotated_image": "Run_<tag>_annotated_frame_<idx>.png",
   "reproj_image": "Run_<tag>_reproj_frame_<idx>.png",
   "depth": "Run_<tag>_depth_frame_<idx>.npy",
+  "capture": {
+    "mode": "smart_auto",
+    "reason": "coverage_cell",
+    "trigger_object": "connection_plate_white"
+  },
   "camera_intrinsics": {
     "fx": 594.97,
     "fy": 601.72,
@@ -943,13 +984,34 @@ saved objects.
     "orientation": [x, y, z, w],
     "rpy_deg": [roll, pitch, yaw]
   },
+  "pose_convention": {
+    "composition": "T_cam_object = T_cam_board @ T_board_object",
+    "translation_units": "meters",
+    "quaternion_order": "x, y, z, w",
+    "rpy_order": "roll, pitch, yaw",
+    "angle_units": "degrees"
+  },
   "objects": [
     {
+      "object_name": "connection_plate_white",
+      "selected_face": "connection_plate_white_sideA",
+      "selected_board": "boards/connection_plate_white_sideA.yaml",
       "class_id": 2,
       "class_name": "connection_plate",
       "2D_center": [cx, cy],
       "width": 0.25,
       "height": 0.18,
+      "transforms": {
+        "T_cam_board": {"matrix": [[...]]},
+        "T_board_object": {"matrix": [[...]]},
+        "T_cam_object": {"matrix": [[...]]}
+      },
+      "quality": {
+        "tag_used": 52,
+        "num_tags_visible": 2,
+        "score": 2500.0,
+        "bbox_source": "face_kps"
+      },
       "6DOF_pose": {
         "position": [tx, ty, tz],
         "orientation": [roll, pitch, yaw],
@@ -967,12 +1029,23 @@ Notes on interpretation:
 - `camera_extrinsics.orientation` is a quaternion in `[x, y, z, w]` order
 - `objects[].6DOF_pose.orientation` is roll, pitch, yaw in degrees
 - `objects[].6DOF_pose.rotation` is a quaternion in `[x, y, z, w]` order
+- `objects[].transforms.T_cam_object` must equal
+  `T_cam_board @ T_board_object`
 - 2D centers and box sizes are normalized by image width and height
 - the raw image saved in `images/` is tag-covered to suppress AprilTags visually
+- if present, `capture` records acceptance provenance such as `manual_review`,
+  `smart_auto`, or `continuous`; it does not change pose semantics
+
+Detailed Step 6 notes: `docs/workflows/step6_collect_dataset.md`.
 
 Common options include:
 
 - `--continuous`
+- `--auto-capture`
+- `--auto-stable-frames N`
+- `--auto-cooldown-sec SEC`
+- `--auto-grid ROWSxCOLS`
+- `--auto-distance-bin-m M`
 - `--max_frames N`
 - `--save_depth`
 - `--axes {both,board,object,none}`
@@ -1085,7 +1158,7 @@ are:
 - `posetag-collect` -> dataset capture
 - `posetag-gui` -> optional workflow dashboard for status, ChArUco board
   setup, guided calibration launch, object AprilTag generation, and
-  board-building guidance
+  board-building, face-shot, annotation, and dataset-collection guidance
 - `python3 -m gen_keypoints` -> legacy mesh-keypoint browser
 - `python3 -m generate_canonical_keypoints` -> experimental sampled keypoint
   files under `canonical_keypoints/` (not annotation-ready)

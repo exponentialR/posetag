@@ -17,7 +17,17 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping, Optional, Union
 
 import yaml
+import numpy as np
 
+from posetag.pipelines.collect_dataset import (
+    CollectDatasetError,
+    POSE_COMPOSITION,
+    resolve_calibration_path as resolve_collection_calibration_path,
+    resolve_dataset_root,
+    resolve_face_manifest_path,
+    resolve_registry_path as resolve_collection_registry_path,
+    validate_collection_inputs,
+)
 from posetag.pipelines.make_board import (
     MakeBoardError,
     load_calibration_yaml,
@@ -130,6 +140,14 @@ def inspect_project(project_root: Union[Path, str]) -> list[StageSummary]:
         root,
         face_shots_complete=face_shots.status == WorkflowStatus.COMPLETE,
     )
+    face_annotations = inspect_face_annotations(
+        root,
+        mesh_keypoints_complete=mesh_keypoints.status == WorkflowStatus.COMPLETE,
+    )
+    dataset_collection = inspect_dataset_collection(
+        root,
+        annotations_complete=face_annotations.status == WorkflowStatus.COMPLETE,
+    )
     summaries = [
         project_setup,
         charuco_board,
@@ -138,15 +156,14 @@ def inspect_project(project_root: Union[Path, str]) -> list[StageSummary]:
         board_definitions,
         face_shots,
         mesh_keypoints,
-        inspect_face_annotations(
+        face_annotations,
+        dataset_collection,
+        inspect_review_export(
             root,
-            mesh_keypoints_complete=mesh_keypoints.status == WorkflowStatus.COMPLETE,
+            dataset_collection_complete=dataset_collection.status
+            == WorkflowStatus.COMPLETE,
         ),
     ]
-    summaries.extend(
-        _placeholder_summaries(
-        )
-    )
     return summaries
 
 
@@ -818,26 +835,388 @@ def inspect_face_annotations(
     )
 
 
-def _placeholder_summaries() -> list[StageSummary]:
-    return [
-        _stage(
+def inspect_dataset_collection(
+    project_root: Union[Path, str],
+    *,
+    annotations_complete: bool = False,
+) -> StageSummary:
+    """Inspect Stage 8 dataset sessions and pose-label outputs."""
+
+    root = Path(project_root).expanduser()
+    calib_path = resolve_collection_calibration_path(root, "calib_color.yaml")
+    registry_path = resolve_collection_registry_path(root)
+    manifest_path = resolve_face_manifest_path(root)
+    datasets_root = resolve_dataset_root(root)
+    checked_paths: list[Path] = [
+        calib_path,
+        registry_path,
+        manifest_path,
+        datasets_root,
+    ]
+
+    if not annotations_complete:
+        return _stage(
             stage_id=8,
             status=WorkflowStatus.NOT_APPLICABLE,
             message=(
                 "Dataset collection depends on calibration, boards, and "
                 "annotations."
             ),
-            checked_paths=(),
+            checked_paths=checked_paths,
             next_action="Complete Stages 2-7 before checking Stage 8.",
+        )
+
+    try:
+        input_summary = validate_collection_inputs(
+            project_root=root,
+            calib_path=calib_path,
+            registry_path=registry_path,
+            face_manifest_path=manifest_path,
+        )
+    except CollectDatasetError as exc:
+        return _stage(
+            stage_id=8,
+            status=WorkflowStatus.NEEDS_ATTENTION,
+            message="Dataset collection inputs need attention.",
+            checked_paths=checked_paths,
+            errors=tuple(str(exc).splitlines()),
+            next_action=(
+                "Repair the collection inputs, then run "
+                "posetag-collect --dry-run."
+            ),
+        )
+
+    for annotation in input_summary.annotations:
+        checked_paths.extend([annotation.yaml_path, annotation.board_yaml])
+        if annotation.keypoints_path is not None:
+            checked_paths.append(annotation.keypoints_path)
+
+    session_dirs = _dataset_session_dirs(datasets_root)
+    checked_paths.extend(session_dirs)
+    if not session_dirs:
+        warnings = tuple(
+            f"Optional keypoints are missing: {path}"
+            for path in input_summary.missing_keypoints
+        )
+        return _stage(
+            stage_id=8,
+            status=WorkflowStatus.MISSING,
+            message=(
+                "Dataset collection inputs are ready, but no dataset sessions "
+                "were found."
+            ),
+            checked_paths=_path_tuple(checked_paths),
+            warnings=warnings,
+            next_action=(
+                "Run posetag-collect --dry-run, then collect a dataset session "
+                "with OpenCV, RealSense, bag, or video input."
+            ),
+        )
+
+    errors: list[str] = []
+    warnings: list[str] = []
+    valid_sessions = 0
+    valid_frames = 0
+    for session_dir in session_dirs:
+        session_valid, session_frames, session_checked, session_warnings, session_errors = (
+            _validate_dataset_session(session_dir, root)
+        )
+        checked_paths.extend(session_checked)
+        warnings.extend(session_warnings)
+        if session_valid:
+            valid_sessions += 1
+            valid_frames += session_frames
+        errors.extend(session_errors)
+
+    if errors:
+        return _stage(
+            stage_id=8,
+            status=WorkflowStatus.NEEDS_ATTENTION,
+            message="Dataset session outputs exist but need attention.",
+            checked_paths=_path_tuple(checked_paths),
+            warnings=tuple(warnings),
+            errors=tuple(errors),
+            next_action=(
+                "Repair malformed dataset annotations or rerun "
+                "posetag-collect for the affected session."
+            ),
+        )
+
+    if valid_sessions == 0:
+        return _stage(
+            stage_id=8,
+            status=WorkflowStatus.MISSING,
+            message="No valid dataset pose-label frames were found.",
+            checked_paths=_path_tuple(checked_paths),
+            warnings=tuple(warnings),
+            next_action="Collect at least one valid pose-labelled dataset frame.",
+        )
+
+    return _stage(
+        stage_id=8,
+        status=WorkflowStatus.COMPLETE,
+        message=(
+            f"Found {valid_frames} valid pose-labelled frame"
+            f"{'s' if valid_frames != 1 else ''} across {valid_sessions} "
+            f"dataset session{'s' if valid_sessions != 1 else ''}."
         ),
-        _stage(
+        checked_paths=_path_tuple(checked_paths),
+        warnings=tuple(warnings),
+        next_action="Proceed to Stage 9 review and export.",
+    )
+
+
+def inspect_review_export(
+    project_root: Union[Path, str],
+    *,
+    dataset_collection_complete: bool = False,
+) -> StageSummary:
+    """Inspect Stage 9 review/export readiness placeholder."""
+
+    root = Path(project_root).expanduser()
+    datasets_root = resolve_dataset_root(root)
+    if not dataset_collection_complete:
+        return _stage(
             stage_id=9,
             status=WorkflowStatus.NOT_APPLICABLE,
             message="Review and export depends on generated dataset outputs.",
-            checked_paths=(),
+            checked_paths=[datasets_root],
             next_action="Complete Stage 8 before checking Stage 9.",
+        )
+
+    return _stage(
+        stage_id=9,
+        status=WorkflowStatus.MISSING,
+        message="Dataset outputs are ready for manual review/export tooling.",
+        checked_paths=[datasets_root],
+        next_action=(
+            "Review annotated images, reprojection views, session metadata, "
+            "and pose-label JSON before export."
         ),
+    )
+
+
+def _dataset_session_dirs(datasets_root: Path) -> tuple[Path, ...]:
+    if not datasets_root.is_dir():
+        return ()
+    return tuple(
+        sorted(path for path in datasets_root.iterdir() if path.is_dir() and not path.name.startswith("."))
+    )
+
+
+def _validate_dataset_session(
+    session_dir: Path,
+    project_root: Path,
+) -> tuple[bool, int, list[Path], list[str], list[str]]:
+    checked_paths = [
+        session_dir / "session.yaml",
+        session_dir / f"{session_dir.name}.jsonl",
+        session_dir / "annotations",
+        session_dir / "images",
+        session_dir / "annotated",
+        session_dir / "reproj",
     ]
+    warnings: list[str] = []
+    errors: list[str] = []
+
+    session_yaml = session_dir / "session.yaml"
+    if not session_yaml.exists():
+        errors.append(f"{session_dir.name}: session.yaml was not found.")
+    else:
+        session_errors = _validate_dataset_session_yaml(session_yaml)
+        errors.extend(f"{session_dir.name}: {error}" for error in session_errors)
+
+    jsonl_path = session_dir / f"{session_dir.name}.jsonl"
+    if not jsonl_path.exists():
+        errors.append(f"{session_dir.name}: rolling JSONL log was not found.")
+    elif jsonl_path.stat().st_size == 0:
+        warnings.append(f"{session_dir.name}: rolling JSONL log is empty.")
+
+    annotations_dir = session_dir / "annotations"
+    annotation_paths = tuple(sorted(annotations_dir.glob("*.json"))) if annotations_dir.is_dir() else ()
+    checked_paths.extend(annotation_paths)
+    if not annotation_paths:
+        errors.append(f"{session_dir.name}: no per-frame annotation JSON files were found.")
+        return False, 0, checked_paths, warnings, errors
+
+    valid_frames = 0
+    for annotation_path in annotation_paths:
+        frame_errors = _validate_dataset_annotation_json(annotation_path, session_dir, project_root)
+        if frame_errors:
+            errors.extend(f"{session_dir.name}/{annotation_path.name}: {error}" for error in frame_errors)
+        else:
+            valid_frames += 1
+
+    return valid_frames > 0 and not errors, valid_frames, checked_paths, warnings, errors
+
+
+def _validate_dataset_session_yaml(path: Path) -> tuple[str, ...]:
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            data = yaml.safe_load(handle)
+    except yaml.YAMLError as exc:
+        return (f"Malformed session.yaml: {exc}",)
+    except OSError as exc:
+        return (f"Could not read session.yaml: {exc}",)
+
+    if not isinstance(data, Mapping):
+        return ("session.yaml must contain a mapping.",)
+
+    errors: list[str] = []
+    if str(data.get("version", "")).strip() != "1.0":
+        errors.append("session.yaml version must be '1.0'.")
+    if not str(data.get("name", "")).strip():
+        errors.append("session.yaml is missing name.")
+    if "camera" not in data or not isinstance(data["camera"], Mapping):
+        errors.append("session.yaml is missing camera metadata.")
+    if "pose_convention" not in data or not isinstance(data["pose_convention"], Mapping):
+        errors.append("session.yaml is missing pose_convention metadata.")
+    else:
+        composition = str(data["pose_convention"].get("composition", "")).strip()
+        if composition != POSE_COMPOSITION:
+            errors.append(f"session.yaml pose convention must be {POSE_COMPOSITION}.")
+    frames = _parse_int(data.get("frames_captured"))
+    if frames is None:
+        errors.append("session.yaml frames_captured must be an integer.")
+    elif frames <= 0:
+        errors.append("session.yaml frames_captured must be positive.")
+    return tuple(errors)
+
+
+def _validate_dataset_annotation_json(
+    path: Path,
+    session_dir: Path,
+    project_root: Path,
+) -> tuple[str, ...]:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        return (f"Malformed annotation JSON: {exc}",)
+    except OSError as exc:
+        return (f"Could not read annotation JSON: {exc}",)
+
+    if not isinstance(data, Mapping):
+        return ("Annotation JSON must contain a mapping.",)
+
+    errors: list[str] = []
+    if str(data.get("version", "")).strip() != "1.0":
+        errors.append("Annotation JSON version must be '1.0'.")
+    metadata = data.get("metadata")
+    if not isinstance(metadata, Mapping):
+        errors.append("Annotation JSON is missing metadata.")
+    else:
+        for field in ("dataset_name", "frame_index", "timestamp", "tag_family"):
+            if field not in metadata:
+                errors.append(f"Annotation metadata is missing field {field!r}.")
+
+    pose_convention = data.get("pose_convention")
+    if not isinstance(pose_convention, Mapping):
+        errors.append("Annotation JSON is missing pose_convention.")
+    elif str(pose_convention.get("composition", "")).strip() != POSE_COMPOSITION:
+        errors.append(f"Annotation pose convention must be {POSE_COMPOSITION}.")
+
+    image_filename = str(data.get("image_filename", "")).strip()
+    if not image_filename:
+        errors.append("Annotation JSON is missing image_filename.")
+    elif not (session_dir / "images" / image_filename).exists():
+        errors.append(f"Raw image was not found: {session_dir / 'images' / image_filename}")
+
+    for field, folder in (("annotated_image", "annotated"), ("reproj_image", "reproj")):
+        filename = data.get(field)
+        if filename:
+            candidate = session_dir / folder / str(filename)
+            if not candidate.exists():
+                errors.append(f"{field} was not found: {candidate}")
+
+    depth_filename = data.get("depth")
+    if depth_filename:
+        candidate = session_dir / "depth" / str(depth_filename)
+        if not candidate.exists():
+            errors.append(f"Depth file was not found: {candidate}")
+
+    intrinsics = data.get("camera_intrinsics")
+    if not isinstance(intrinsics, Mapping):
+        errors.append("Annotation JSON is missing camera_intrinsics.")
+    else:
+        for field in ("fx", "fy", "cx", "cy"):
+            _require_number(intrinsics, field, errors, prefix="camera_intrinsics")
+        _require_positive_int(intrinsics, "width", errors, prefix="camera_intrinsics")
+        _require_positive_int(intrinsics, "height", errors, prefix="camera_intrinsics")
+
+    objects = data.get("objects")
+    if not isinstance(objects, list) or not objects:
+        errors.append("Annotation JSON objects must be a non-empty list.")
+    else:
+        for index, obj in enumerate(objects):
+            if not isinstance(obj, Mapping):
+                errors.append(f"objects[{index}] must be a mapping.")
+                continue
+            errors.extend(_validate_dataset_object(obj, index, project_root))
+
+    return tuple(errors)
+
+
+def _validate_dataset_object(
+    obj: Mapping[str, Any],
+    index: int,
+    project_root: Path,
+) -> tuple[str, ...]:
+    errors: list[str] = []
+    label = f"objects[{index}]"
+    for field in ("object_name", "selected_face", "selected_board", "transforms", "quality", "6DOF_pose"):
+        if field not in obj:
+            errors.append(f"{label} is missing field {field!r}.")
+
+    selected_board = obj.get("selected_board")
+    if isinstance(selected_board, str) and selected_board.strip():
+        board_path = _resolve_artifact_path(project_root, selected_board)
+        if not board_path.exists():
+            errors.append(f"{label} selected_board was not found: {board_path}")
+
+    transforms = obj.get("transforms")
+    if isinstance(transforms, Mapping):
+        matrices: dict[str, np.ndarray] = {}
+        for name in ("T_cam_board", "T_board_object", "T_cam_object"):
+            item = transforms.get(name)
+            if not isinstance(item, Mapping) or "matrix" not in item:
+                errors.append(f"{label}.transforms.{name}.matrix is required.")
+                continue
+            matrix_errors = _matrix_errors(item["matrix"], f"{label}.transforms.{name}.matrix")
+            errors.extend(matrix_errors)
+            if not matrix_errors:
+                matrices[name] = np.asarray(item["matrix"], dtype=float)
+        if set(matrices) == {"T_cam_board", "T_board_object", "T_cam_object"}:
+            composed = matrices["T_cam_board"] @ matrices["T_board_object"]
+            if not np.allclose(composed, matrices["T_cam_object"], rtol=1e-9, atol=1e-9):
+                errors.append(f"{label} does not preserve {POSE_COMPOSITION}.")
+    elif "transforms" in obj:
+        errors.append(f"{label}.transforms must be a mapping.")
+
+    pose = obj.get("6DOF_pose")
+    if isinstance(pose, Mapping):
+        _require_vector(pose.get("position"), 3, f"{label}.6DOF_pose.position", errors)
+        _require_vector(pose.get("orientation"), 3, f"{label}.6DOF_pose.orientation", errors)
+        _require_vector(pose.get("rotation"), 4, f"{label}.6DOF_pose.rotation", errors)
+        if pose.get("translation_units") != "meters":
+            errors.append(f"{label}.6DOF_pose.translation_units must be 'meters'.")
+        if pose.get("orientation_order") != "roll, pitch, yaw":
+            errors.append(f"{label}.6DOF_pose.orientation_order must be 'roll, pitch, yaw'.")
+        if pose.get("orientation_units") != "degrees":
+            errors.append(f"{label}.6DOF_pose.orientation_units must be 'degrees'.")
+        if pose.get("rotation_quaternion_order") != "x, y, z, w":
+            errors.append(f"{label}.6DOF_pose.rotation_quaternion_order must be 'x, y, z, w'.")
+    elif "6DOF_pose" in obj:
+        errors.append(f"{label}.6DOF_pose must be a mapping.")
+
+    quality = obj.get("quality")
+    if isinstance(quality, Mapping):
+        for field in ("tag_used", "num_tags_visible", "score"):
+            if field not in quality:
+                errors.append(f"{label}.quality is missing field {field!r}.")
+    elif "quality" in obj:
+        errors.append(f"{label}.quality must be a mapping.")
+
+    return tuple(errors)
 
 
 def _expected_annotation_yaml_paths(project_root: Path) -> tuple[Path, ...]:
@@ -1174,6 +1553,37 @@ def _sorted_registry_entries(tags: Mapping[Any, Any]) -> Iterable[tuple[str, Any
         ((str(tag_id), entry) for tag_id, entry in tags.items()),
         key=lambda item: item[0],
     )
+
+
+def _matrix_errors(value: Any, label: str) -> tuple[str, ...]:
+    errors: list[str] = []
+    _require_numeric_matrix(value, label, rows=4, cols=4, errors=errors)
+    if not errors and _is_numeric_matrix(value, rows=4, cols=4):
+        last_row = [float(item) for item in value[3]]
+        if any(
+            abs(actual - expected) > 1e-9
+            for actual, expected in zip(last_row, (0.0, 0.0, 0.0, 1.0))
+        ):
+            errors.append(f"{label} must have last row [0, 0, 0, 1].")
+    return tuple(errors)
+
+
+def _require_vector(value: Any, length: int, label: str, errors: list[str]) -> None:
+    if not isinstance(value, list) or len(value) != length:
+        errors.append(f"{label} must be a length-{length} numeric list.")
+        return
+    for item in value:
+        if isinstance(item, bool):
+            errors.append(f"{label} must contain only numeric values.")
+            return
+        try:
+            numeric = float(item)
+        except (TypeError, ValueError):
+            errors.append(f"{label} must contain only numeric values.")
+            return
+        if not math.isfinite(numeric):
+            errors.append(f"{label} must contain only finite values.")
+            return
 
 
 def _stage(

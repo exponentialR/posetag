@@ -21,6 +21,11 @@ from posetag.pipelines.capture_face import (
     build_shot_paths,
 )
 from posetag.pipelines.make_board import build_board_yaml, write_board_yaml
+from posetag.pipelines.collect_dataset import (
+    Intrinsics,
+    build_frame_annotation_record,
+    compose_T_cam_object,
+)
 from posetag.workflows.status import WorkflowStatus, inspect_project
 
 
@@ -269,6 +274,171 @@ def _write_face_manifest(project_root: Path, annotation_paths: list[Path]) -> Pa
                 }
             )
     return path
+
+
+def _write_object_tag_pattern(project_root: Path) -> Path:
+    pattern_path = project_root / "boards" / "patterns" / "apriltag_sheet.png"
+    pattern_path.parent.mkdir(parents=True, exist_ok=True)
+    pattern_path.write_bytes(b"synthetic pattern")
+    return pattern_path
+
+
+def _write_collection_ready_project(project_root: Path) -> dict[str, Path]:
+    _write_valid_calibration(project_root / "calib" / "calib_color.yaml")
+    _write_object_tag_pattern(project_root)
+    board_paths, registry_path = _write_two_face_board_and_registry(project_root)
+    _write_face_capture(
+        project_root,
+        board_paths["sideA"],
+        timestamp="20260530_120000",
+    )
+    _write_face_capture(
+        project_root,
+        board_paths["sideB"],
+        timestamp="20260530_120100",
+    )
+    _write_valid_keypoints(project_root, "connection_plate_white")
+    side_a_image = (
+        project_root
+        / "shots"
+        / "connection_plate_white"
+        / "sideA"
+        / "connection_plate_white_sideA_20260530_120000_raw.png"
+    )
+    side_b_image = (
+        project_root
+        / "shots"
+        / "connection_plate_white"
+        / "sideB"
+        / "connection_plate_white_sideB_20260530_120100_raw.png"
+    )
+    annotation_paths = [
+        _write_face_annotation(
+            project_root,
+            object_name="connection_plate_white",
+            side="sideA",
+            board_path=board_paths["sideA"],
+            image_path=side_a_image,
+        ),
+        _write_face_annotation(
+            project_root,
+            object_name="connection_plate_white",
+            side="sideB",
+            board_path=board_paths["sideB"],
+            image_path=side_b_image,
+        ),
+    ]
+    manifest_path = _write_face_manifest(project_root, annotation_paths)
+    return {
+        "manifest": manifest_path,
+        "registry": registry_path,
+        "sideA_board": board_paths["sideA"],
+        "sideB_board": board_paths["sideB"],
+    }
+
+
+def _write_dataset_session(
+    project_root: Path,
+    board_path: Path,
+    *,
+    break_composition: bool = False,
+) -> Path:
+    session_dir = project_root / "datasets" / "run01"
+    for folder in ("images", "annotated", "reproj", "annotations"):
+        (session_dir / folder).mkdir(parents=True, exist_ok=True)
+
+    image_name = "Run_20260607-120000_rgb_frame_000000.png"
+    annotated_name = "Run_20260607-120000_annotated_frame_000000.png"
+    reproj_name = "Run_20260607-120000_reproj_frame_000000.png"
+    (session_dir / "images" / image_name).write_bytes(b"raw")
+    (session_dir / "annotated" / annotated_name).write_bytes(b"annotated")
+    (session_dir / "reproj" / reproj_name).write_bytes(b"reproj")
+
+    intrinsics = Intrinsics(
+        path=project_root / "calib" / "calib_color.yaml",
+        fx=600.0,
+        fy=610.0,
+        cx=320.0,
+        cy=240.0,
+        width=640,
+        height=480,
+        dist=np.zeros((1, 5), dtype=float),
+    )
+    T_cam_board = np.eye(4)
+    T_cam_board[:3, 3] = [0.2, -0.1, 1.5]
+    T_board_object = np.eye(4)
+    T_board_object[:3, 3] = [0.03, 0.02, 0.01]
+    T_cam_object = compose_T_cam_object(T_cam_board, T_board_object)
+    result = {
+        "object": "connection_plate_white",
+        "face_key": "connection_plate_white_sideA",
+        "board_yaml": str(board_path),
+        "tag_used": 52,
+        "num_tags_visible": 2,
+        "score": 2500.0,
+        "score_tags": 2,
+        "score_area_px": 500,
+        "bbox_xywh": [64.0, 48.0, 128.0, 96.0],
+        "bbox_source": "face_kps",
+        "T_cam_board": {"matrix": T_cam_board.tolist()},
+        "T_board_object": {"matrix": T_board_object.tolist()},
+        "T_cam_object": {"matrix": T_cam_object.tolist()},
+        "diagnostics": {
+            "tag_scale_ratio": 1.0,
+            "tag_scale_pairs": 1,
+            "tag_scale_mad": 0.0,
+            "tag_scale_auto_corrected": False,
+        },
+    }
+    record = build_frame_annotation_record(
+        dataset_name="run01",
+        frame_index=0,
+        timestamp=123.456,
+        tag_family="tag36h11",
+        image_filename=image_name,
+        annotated_image=annotated_name,
+        reproj_image=reproj_name,
+        depth=None,
+        intrinsics=intrinsics,
+        results={"connection_plate_white_sideA": result},
+    )
+    if break_composition:
+        record["objects"][0]["transforms"]["T_cam_object"]["matrix"][0][3] += 1.0
+    (session_dir / "annotations" / "Run_20260607-120000_frame_000000.json").write_text(
+        json.dumps(record),
+        encoding="utf-8",
+    )
+    (session_dir / "run01.jsonl").write_text(
+        json.dumps({"idx": 0, "image": image_name, "objects": ["connection_plate_white"]}) + "\n",
+        encoding="utf-8",
+    )
+    (session_dir / "session.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "version": "1.0",
+                "name": "run01",
+                "camera": {
+                    "kind": "opencv_webcam",
+                    "fx": 600.0,
+                    "fy": 610.0,
+                    "cx": 320.0,
+                    "cy": 240.0,
+                    "width": 640,
+                    "height": 480,
+                },
+                "pose_convention": {
+                    "composition": "T_cam_object = T_cam_board @ T_board_object",
+                    "translation_units": "meters",
+                    "quaternion_order": "x, y, z, w",
+                    "rpy_order": "roll, pitch, yaw",
+                    "angle_units": "degrees",
+                },
+                "frames_captured": 1,
+            }
+        ),
+        encoding="utf-8",
+    )
+    return session_dir
 
 
 class WorkflowStatusTests(unittest.TestCase):
@@ -649,6 +819,56 @@ class WorkflowStatusTests(unittest.TestCase):
             self.assertEqual(stage7.status, WorkflowStatus.COMPLETE)
             self.assertIn("valid board-to-object annotations for 2 faces", stage7.message)
             self.assertIn(str(manifest_path), stage7.checked_paths)
+
+    def test_collection_ready_project_marks_stage8_missing_not_not_applicable(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            project_root = Path(tmpdir) / "project"
+            paths = _write_collection_ready_project(project_root)
+
+            stage8 = _stage_by_id(project_root, 8)
+
+            self.assertEqual(stage8.status, WorkflowStatus.MISSING)
+            self.assertIn("inputs are ready", stage8.message)
+            self.assertIn(str(paths["manifest"].resolve()), stage8.checked_paths)
+            self.assertIn(str(paths["registry"].resolve()), stage8.checked_paths)
+            self.assertIn("posetag-collect --dry-run", stage8.next_action)
+
+    def test_valid_dataset_session_marks_stage8_complete(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            project_root = Path(tmpdir) / "project"
+            paths = _write_collection_ready_project(project_root)
+            session_dir = _write_dataset_session(project_root, paths["sideA_board"])
+
+            stage8 = _stage_by_id(project_root, 8)
+            stage9 = _stage_by_id(project_root, 9)
+
+            self.assertEqual(stage8.status, WorkflowStatus.COMPLETE)
+            self.assertIn("valid pose-labelled frame", stage8.message)
+            self.assertIn(str((session_dir / "session.yaml").resolve()), stage8.checked_paths)
+            self.assertIn(
+                str((session_dir / "annotations" / "Run_20260607-120000_frame_000000.json").resolve()),
+                stage8.checked_paths,
+            )
+            self.assertEqual(stage9.status, WorkflowStatus.MISSING)
+            self.assertIn("manual review/export", stage9.message)
+
+    def test_dataset_session_with_bad_pose_composition_needs_attention(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            project_root = Path(tmpdir) / "project"
+            paths = _write_collection_ready_project(project_root)
+            _write_dataset_session(
+                project_root,
+                paths["sideA_board"],
+                break_composition=True,
+            )
+
+            stage8 = _stage_by_id(project_root, 8)
+
+            self.assertEqual(stage8.status, WorkflowStatus.NEEDS_ATTENTION)
+            self.assertTrue(
+                any("T_cam_object = T_cam_board @ T_board_object" in error for error in stage8.errors),
+                stage8.errors,
+            )
 
     def test_stale_face_manifest_row_needs_attention(self) -> None:
         with TemporaryDirectory() as tmpdir:
