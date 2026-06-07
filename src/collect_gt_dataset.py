@@ -133,7 +133,7 @@ Common options
   --registry PATH                Tag registry (default boards/tag_registry.yaml)
   --face_manifest PATH           Face manifest (default faces/face_manifest.csv)
   --dry-run                      Validate inputs without capture/output writes
-  --continuous                   Save every frame automatically (crude legacy mode)
+  --continuous                   Save every pose-labelled frame automatically
   --auto-capture                 Quality-gated smart auto-capture
   --auto-stable-frames N         Stable frames before smart save (default 5)
   --auto-cooldown-sec FLOAT      Delay between smart saves (default 1.0)
@@ -162,7 +162,7 @@ Keys
   r / n / BACKSPACE reject / skip frame
   ESC / q / Q       close capture window cleanly
   x / X             close capture window cleanly
-  SPACE or p        pause/resume stream (continuous keeps saving)
+  SPACE or p        pause/resume stream
   h                 toggle help panel
 """
 
@@ -840,6 +840,11 @@ def save_frame(
         anno_img: Optional[np.ndarray] = None,  # <- NEW: annotated image
         capture_metadata: Optional[dict] = None,
 ):
+    if not results:
+        raise CollectDatasetError(
+            "Cannot save a dataset frame without at least one pose-labelled object."
+        )
+
     # --- folder layout ---
     images_dir = out_dir / "images"  # raw rgb only
     reproj_dir = out_dir / "reproj"  # reprojection / tag debug
@@ -939,7 +944,7 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Validate inputs and print a summary without opening a camera or writing outputs.")
     parser.add_argument("--family", default="tag36h11")
     parser.add_argument("--continuous", action="store_true",
-                        help="Do not prompt per frame; save all automatically")
+                        help="Do not prompt per frame; save each frame that has at least one pose-labelled object.")
     parser.add_argument("--auto-capture", action="store_true",
                         help="Quality-gated smart auto-capture; saves stable, useful views automatically.")
     parser.add_argument("--auto-stable-frames", type=int, default=5,
@@ -1312,6 +1317,10 @@ def main(argv=None):
             def _capture_now(capture_metadata: Optional[dict] = None) -> bool:
                 nonlocal idx, capture_msg, capture_msg_until, objects_seen_counts
                 if last_bgr is None or last_ts is None or last_cov is None:
+                    return False
+                if not best_by_object:
+                    capture_msg = "No pose-labelled object visible; frame not saved"
+                    capture_msg_until = time.time() + 2.0
                     return False
                 save_frame(
                     out_dir, idx, last_ts,

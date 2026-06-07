@@ -113,8 +113,8 @@ For each frame, PoseTag:
 5. Scores visible faces and keeps the best face per object.
 6. Shows annotation review, reprojection/debug, and structured status panels.
 7. Saves the accepted frame and pose label when the user accepts it, when
-   smart auto-capture accepts it, or every frame when `--continuous` is
-   enabled.
+   smart auto-capture accepts it, or each pose-labelled frame when
+   `--continuous` is enabled.
 
 The best-face score prioritizes visible tag count, then image-space area.
 When the origin tag is visible, it is used for `T_cam_board`; otherwise PoseTag
@@ -149,8 +149,9 @@ posetag-collect --mode opencv --session run01 --auto-capture \
   --auto-min-rotation-delta-deg 8.0
 ```
 
-`--continuous` remains available as the old crude save-every-frame mode, but it
-is mutually exclusive with `--auto-capture`.
+`--continuous` remains available as the old crude mode that saves every frame
+with at least one pose-labelled object, but it is mutually exclusive with
+`--auto-capture`.
 
 ## Controls
 

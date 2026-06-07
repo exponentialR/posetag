@@ -42,7 +42,9 @@ T_cam_object = T_cam_board @ T_board_object
   - add `--auto-capture` as a quality-gated smart collection policy over the
     existing pose results
   - keep manual review as a force-save path and keep `--continuous` as the
-    legacy save-every-frame mode
+    legacy save-every-pose-labelled-frame mode
+  - reject accepted saves when no object pose was estimated, so frame-only
+    captures do not masquerade as pose-labelled dataset annotations
   - keep the existing interactive capture loop and best-face selection logic
 - Added smart auto-capture helpers and tests for stability gates, cooldown,
   image-grid coverage, distance/pose diversity, candidate quality rejection,
@@ -159,21 +161,21 @@ python3 -m posetag.cli.collect --project_root my_project --mode opencv --session
 Focused collection tests:
 
 ```text
-Ran 16 tests in 0.170s
+Ran 17 tests in 0.138s
 OK
 ```
 
 Focused Stage 8 / GUI / status tests:
 
 ```text
-Ran 90 tests in 0.750s
+Ran 91 tests in 0.736s
 OK
 ```
 
 Full test suite:
 
 ```text
-Ran 307 tests in 3.523s
+Ran 308 tests in 3.219s
 OK
 ```
 

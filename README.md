@@ -865,8 +865,8 @@ For each frame:
 - detect tags once, even when faces use mixed tag sizes
 - choose the best visible face per object
 - compose `T_cam_object = T_cam_board @ T_board_object`
-- save either by manual review, quality-gated smart auto-capture, or the crude
-  legacy continuous mode
+- save pose-labelled frames by manual review, quality-gated smart auto-capture,
+  or the crude legacy continuous mode
 
 Preflight without opening a camera or writing dataset outputs:
 
@@ -895,8 +895,8 @@ Smart auto-capture waits for stable object pose, minimum detection quality,
 cooldown, and a useful new view before saving. It considers visible tag count,
 bbox area, optional tag-scale diagnostics, image coverage grid cells, distance
 bins, and pose deltas. `ENTER` / `y` / `s` still force-save the current frame.
-Use `--continuous` only when you explicitly want the old save-every-frame
-behavior.
+Use `--continuous` only when you explicitly want the old crude behavior of
+saving every frame that has at least one pose-labelled object.
 
 **Live RealSense (RGB, optional aligned depth)**
 

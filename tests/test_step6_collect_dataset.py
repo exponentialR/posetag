@@ -35,6 +35,7 @@ from posetag.pipelines.collect_dataset import (
     validate_collection_inputs,
     validate_source_args,
 )
+from collect_gt_dataset import save_frame
 from utils.collect_gt_utils import (
     _capture_key_requests_quit,
     _capture_status_panel,
@@ -637,6 +638,28 @@ class CollectDatasetStep6Tests(unittest.TestCase):
             )
 
         self.assertIn("Pose composition mismatch", str(ctx.exception))
+
+    def test_save_frame_rejects_empty_pose_results_without_outputs(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            out_dir = Path(tmpdir) / "datasets" / "run01"
+
+            with self.assertRaises(CollectDatasetError) as ctx:
+                save_frame(
+                    out_dir=out_dir,
+                    idx=0,
+                    ts=123.456,
+                    bgr_raw=np.zeros((16, 16, 3), dtype=np.uint8),
+                    depth=None,
+                    intr=_intrinsics(),
+                    family="tag36h11",
+                    results={},
+                    reproj_img=None,
+                    save_depth=False,
+                    dataset_name="run01",
+                )
+
+            self.assertIn("without at least one pose-labelled object", str(ctx.exception))
+            self.assertFalse(out_dir.exists())
 
     def test_capture_review_dashboard_renders_structured_status_panel(self) -> None:
         left = np.full((240, 320, 3), 180, dtype=np.uint8)
