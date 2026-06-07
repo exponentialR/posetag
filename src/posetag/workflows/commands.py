@@ -130,11 +130,13 @@ _COMMAND_TEMPLATES = {
         "POSETAG_PROJECT={project_root}",
         "posetag-collect",
         "--mode",
-        "live",
+        "opencv",
         "--session",
         "SESSION",
         "--calib",
         "calib_color.yaml",
+        "--auto-capture",
+        "--dry-run",
     ),
 }
 

@@ -50,6 +50,9 @@ from posetag.gui.main_window import (
     _format_capture_face_readiness,
     _format_capture_face_saved_shot_group_details,
     _format_capture_face_saved_shot_details,
+    _format_dataset_collection_outputs,
+    _format_dataset_collection_process_state,
+    _format_dataset_collection_readiness,
     _format_annotation_outputs,
     _format_annotation_process_state,
     _format_annotation_readiness,
@@ -68,6 +71,9 @@ from posetag.gui.main_window import (
     _annotation_command_ready_message,
     _annotation_queue_item_label,
     _annotation_run_button_label,
+    _dataset_collection_command_card_note,
+    _dataset_collection_command_ready_message,
+    _dataset_collection_run_button_label,
     _project_root_hint,
     _stage_list_label,
     _stage_rail_dot_style,
@@ -111,6 +117,17 @@ from posetag.workflows.annotation import (
     annotation_process_running,
     build_annotation_launch,
     remove_annotation_output,
+)
+from posetag.workflows.collect_dataset import (
+    SOURCE_VIDEO as DATASET_SOURCE_VIDEO,
+    DatasetCollectionConfig,
+    DatasetCollectionProcessState,
+    DatasetCollectionReadiness,
+    build_dataset_collection_launch,
+    collect_dataset_process_not_started,
+    collect_dataset_process_running,
+    inspect_dataset_collection_readiness,
+    summarize_dataset_collection_process_result,
 )
 from posetag.workflows.object_tags import (
     ObjectTagGenerationReadiness,
@@ -310,7 +327,8 @@ class WorkflowGuiTests(unittest.TestCase):
         self.assertIn("env 'POSETAG_PROJECT=/tmp/PoseTag project'", annotate_preview)
         self.assertIn("posetag-annotate --browse", annotate_preview)
         self.assertIn("env 'POSETAG_PROJECT=/tmp/PoseTag project'", collect_preview)
-        self.assertIn("posetag-collect --mode live", collect_preview)
+        self.assertIn("posetag-collect --mode opencv", collect_preview)
+        self.assertIn("--dry-run", collect_preview)
 
     def test_annotation_launch_uses_project_environment(self) -> None:
         project_root = Path("/tmp/PoseTag project")
@@ -365,6 +383,88 @@ class WorkflowGuiTests(unittest.TestCase):
         self.assertIn("--check-tag-scale", launch.display_command)
         self.assertIn("--auto-correct-scale", launch.display_command)
         self.assertIn("--force", launch.display_command)
+
+    def test_dataset_collection_launch_uses_project_environment(self) -> None:
+        project_root = Path("/tmp/PoseTag project")
+        resolved_root = project_root.expanduser().resolve()
+        config = DatasetCollectionConfig(
+            project_root=project_root,
+            session="run01",
+        )
+
+        launch = build_dataset_collection_launch(config, dry_run=True)
+
+        self.assertIn("python", Path(launch.program).name)
+        self.assertEqual(
+            launch.arguments[:4],
+            ("-m", "posetag.cli.collect", "--project_root", str(resolved_root)),
+        )
+        self.assertIn("--mode", launch.arguments)
+        self.assertIn("opencv", launch.arguments)
+        self.assertIn("--dry-run", launch.arguments)
+        self.assertIn(
+            f"env 'POSETAG_PROJECT={resolved_root}'",
+            launch.display_command,
+        )
+        self.assertIn("posetag-collect --project_root", launch.display_command)
+        self.assertEqual(
+            launch.expected_session_dir,
+            resolved_root / "datasets" / "run01",
+        )
+        self.assertTrue(launch.dry_run)
+
+    def test_dataset_collection_video_launch_requires_video_path(self) -> None:
+        config = DatasetCollectionConfig(
+            project_root=Path("/tmp/project"),
+            session="run01",
+            mode=DATASET_SOURCE_VIDEO,
+        )
+
+        with self.assertRaisesRegex(ValueError, "--video is required"):
+            build_dataset_collection_launch(config, dry_run=True)
+
+    def test_dataset_collection_launch_can_enable_smart_auto_capture(self) -> None:
+        config = DatasetCollectionConfig(
+            project_root=Path("/tmp/project"),
+            session="run01",
+            auto_capture=True,
+            auto_stable_frames=4,
+            auto_cooldown_sec=0.5,
+        )
+
+        launch = build_dataset_collection_launch(config, dry_run=False)
+
+        self.assertIn("--auto-capture", launch.arguments)
+        self.assertIn("--auto-stable-frames", launch.arguments)
+        self.assertIn("4", launch.arguments)
+        self.assertIn("--auto-cooldown-sec", launch.arguments)
+        self.assertIn("0.5", launch.arguments)
+        self.assertIn("--auto-capture", launch.display_command)
+
+    def test_dataset_collection_launch_rejects_continuous_smart_mix(self) -> None:
+        config = DatasetCollectionConfig(
+            project_root=Path("/tmp/project"),
+            session="run01",
+            continuous=True,
+            auto_capture=True,
+        )
+
+        with self.assertRaisesRegex(ValueError, "cannot both be enabled"):
+            build_dataset_collection_launch(config, dry_run=False)
+
+    def test_dataset_collection_readiness_reports_invalid_source(self) -> None:
+        readiness = inspect_dataset_collection_readiness(
+            DatasetCollectionConfig(
+                project_root=Path("/tmp/project"),
+                session="run01",
+                mode="invalid-source",
+            )
+        )
+
+        self.assertFalse(readiness.ready)
+        self.assertTrue(
+            any("Unsupported dataset source" in error for error in readiness.errors)
+        )
 
     def test_remove_annotation_output_refreshes_face_manifest(self) -> None:
         with TemporaryDirectory() as tmpdir:
@@ -1171,6 +1271,102 @@ class WorkflowGuiTests(unittest.TestCase):
         self.assertIn("not started", _format_annotation_process_state(idle))
         self.assertIn("Expected manifest:", _format_annotation_process_state(idle))
         self.assertIn("OpenCV browser", _format_annotation_process_state(running))
+
+    def test_dataset_collection_command_note_and_process_state(self) -> None:
+        project_root = Path("/tmp/project")
+        readiness = DatasetCollectionReadiness(
+            ready=True,
+            command_preview=(
+                "env POSETAG_PROJECT=/tmp/project posetag-collect "
+                "--mode opencv --session run01"
+            ),
+            dry_run_command_preview=(
+                "env POSETAG_PROJECT=/tmp/project posetag-collect "
+                "--mode opencv --session run01 --dry-run"
+            ),
+            project_root=project_root,
+            calibration_path=project_root / "calib" / "calib_color.yaml",
+            registry_path=project_root / "boards" / "tag_registry.yaml",
+            face_manifest_path=project_root / "faces" / "face_manifest.csv",
+            dataset_root=project_root / "datasets",
+            expected_session_dir=project_root / "datasets" / "run01",
+            input_summary=None,
+            checked_paths=(),
+        )
+        active = SimpleNamespace(status="missing")
+        complete = SimpleNamespace(status="complete")
+        idle = collect_dataset_process_not_started(readiness.expected_session_dir)
+        running = collect_dataset_process_running(readiness.expected_session_dir)
+        success = DatasetCollectionProcessState(
+            state="finished",
+            label="finished",
+            message="Dataset collection exited cleanly.",
+            success=True,
+            expected_session_dir=readiness.expected_session_dir,
+            exit_code=0,
+        )
+
+        note = _dataset_collection_command_card_note(readiness, active)
+        complete_note = _dataset_collection_command_card_note(readiness, complete)
+        outputs = _format_dataset_collection_outputs(readiness)
+
+        self.assertIn("Dry Run", note)
+        self.assertIn("Start Collection", note)
+        self.assertIn("POSETAG_PROJECT", note)
+        self.assertIn("another pose-labelled session", complete_note)
+        self.assertEqual(
+            _dataset_collection_command_ready_message(readiness),
+            "Ready to dry-run, start collection, or copy the command.",
+        )
+        self.assertIn(
+            "Ready to collect pose-labelled",
+            _format_dataset_collection_readiness(readiness),
+        )
+        self.assertIn("Expected session", outputs)
+        self.assertEqual(
+            _dataset_collection_run_button_label(idle),
+            "Start Collection",
+        )
+        self.assertEqual(
+            _dataset_collection_run_button_label(running),
+            "Collection Running...",
+        )
+        self.assertEqual(
+            _dataset_collection_run_button_label(success),
+            "Start Collection Again",
+        )
+        self.assertIn("not started", _format_dataset_collection_process_state(idle))
+        self.assertIn("Expected session:", _format_dataset_collection_process_state(idle))
+        self.assertIn("review window", _format_dataset_collection_process_state(running))
+
+    def test_dataset_collection_process_summary_checks_session_outputs(self) -> None:
+        dry_run = summarize_dataset_collection_process_result(
+            exit_code=0,
+            dry_run=True,
+        )
+        self.assertTrue(dry_run.success)
+        self.assertIn("dry-run completed", dry_run.message)
+
+        with TemporaryDirectory() as tmpdir:
+            session_dir = Path(tmpdir) / "datasets" / "run01"
+            missing_output = summarize_dataset_collection_process_result(
+                exit_code=0,
+                expected_session_dir=session_dir,
+            )
+            self.assertFalse(missing_output.success)
+            self.assertIn("without writing session.yaml", missing_output.message)
+
+            session_dir.mkdir(parents=True)
+            (session_dir / "session.yaml").write_text(
+                "session_name: run01\n",
+                encoding="utf-8",
+            )
+            real_run = summarize_dataset_collection_process_result(
+                exit_code=0,
+                expected_session_dir=session_dir,
+            )
+            self.assertTrue(real_run.success)
+            self.assertIn("exited cleanly", real_run.message)
 
     def test_capture_face_process_state_text_and_run_button_labels(self) -> None:
         manifest = Path("/tmp/project/shots/manifest.csv")
