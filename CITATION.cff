@@ -1,0 +1,18 @@
+cff-version: 1.2.0
+message: "If you use PoseTag, please cite it as below."
+type: software
+title: "PoseTag: End-to-End Pipeline for Ground-Truth 6-DoF Pose Collection from RGB"
+authors:
+  - family-names: "Adebayo"
+    given-names: "Samuel"
+repository-code: "https://github.com/exponentialR/posetag"
+url: "https://github.com/exponentialR/posetag"
+abstract: "PoseTag is scientific Python software for generating reproducible ground-truth 6-DoF object poses from RGB using AprilTags, camera calibration, per-face board definitions, and Intel RealSense, webcam, or video capture."
+keywords:
+  - 6-DoF pose estimation
+  - AprilTags
+  - computer vision
+  - ground-truth annotation
+  - robotics
+  - camera calibration
+  - scientific software

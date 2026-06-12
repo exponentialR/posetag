@@ -1186,3 +1186,9 @@ are:
 
 See [MIGRATION.md](MIGRATION.md) for the old-to-new naming map and the
 compatibility aliases intentionally retained during Phase 0.
+
+## Citation
+
+If you use PoseTag, please cite the software using the metadata in
+[CITATION.cff](CITATION.cff). A JOSS citation will be added here after
+publication.
